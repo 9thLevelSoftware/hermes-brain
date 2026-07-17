@@ -1,0 +1,13 @@
+name: brain
+version: 0.1.0
+description: "Hermes-Brain — global memory & continual learning for Hermes Agent (persistent recall, active forgetting, sleep-time consolidation)."
+# P1 has zero required pip dependencies: stdlib + sqlite only.
+# P2 adds optional tiers (onnxruntime, tokenizers, sqlite-vec) via extras —
+# lazy-installed, never required for the FTS floor tier.
+pip_dependencies: []
+requires_env: []
+hooks:
+  - on_session_end
+  - on_pre_compress
+  - on_memory_write
+  - on_delegation

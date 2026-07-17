@@ -1,0 +1,54 @@
+{
+  "session_id": "fix-001",
+  "platform": "cli",
+  "turns": [
+    {
+      "user": "Hey, I'm back on the payments service today. Where did we leave off with the webhook retries?",
+      "assistant": "Last session we added exponential backoff to the webhook worker. Still open: the dead-letter queue drain job and the idempotency keys on replays."
+    },
+    {
+      "user": "Something is slow in get_user_by_id — it seems to fire a query per role. Can you check fetch_roles_for_user too?",
+      "assistant": "Confirmed: get_user_by_id calls fetch_roles_for_user inside a loop, a classic N+1. Batch it with one IN (...) query keyed by user_id and hydrate the roles in memory."
+    },
+    {
+      "user": "Show me the batched version.",
+      "assistant": "```python\ndef get_users_by_ids(user_ids):\n    rows = db.execute(\n        \"SELECT u.*, r.role_id FROM users u LEFT JOIN user_roles r ON r.user_id = u.id \"\n        \"WHERE u.id IN (%s)\" % \",\".join(\"?\" * len(user_ids)),\n        user_ids,\n    )\n    return group_roles(rows)\n```\nSwap get_user_by_id to call this with a single-element list, then delete fetch_roles_for_user."
+    },
+    {
+      "user": "It blew up when I ran the worker:\nTraceback (most recent call last):\n  File \"api/users.py\", line 42, in get_user_by_id\n    roles = cached[\"role_ids\"]\nKeyError: 'role_ids'",
+      "assistant": "That cache entry predates the schema change — old payloads have no role_ids key. Invalidate the user:* cache keys before deploying, and guard with cached.get(\"role_ids\", []) so stale entries degrade instead of raising."
+    },
+    {
+      "user": "Cache flushed and the guard is in. Worker runs clean now.",
+      "assistant": "Good. The N+1 fix plus the stale-cache guard should also drop the p95 on /users/{id} noticeably — worth checking the dashboard after deploy."
+    },
+    {
+      "user": "No, that's wrong — the session cache is Redis, not Memcached. Don't touch the memcached config, it belongs to the legacy search service.",
+      "assistant": "You're right, my mistake: user session caching is Redis (db 2), and the memcached pool is legacy-search-only. I'll keep the memcached config untouched."
+    },
+    {
+      "user": "Also, I prefer pytest fixtures over unittest setUp classes — remember that for any new tests you write here.",
+      "assistant": "Noted: new tests in this repo use pytest fixtures, not unittest-style setUp/tearDown classes."
+    },
+    {
+      "user": "For the plugin's local store, let's go with SQLite in WAL mode instead of Postgres. One less service to run.",
+      "assistant": "Decided: SQLite with WAL journaling for the plugin store — single file, concurrent readers, no extra service. I'll keep transactions short so the writer never starves."
+    },
+    {
+      "user": "The webhook worker logs show a burst of 429s from the billing API around midnight. Retry storm?",
+      "assistant": "Looks like it: the backoff caps at 60s, so a midnight batch synchronizes retries. Add jitter (random 0-30s) to the backoff and the 429 burst should flatten out."
+    },
+    {
+      "user": "Where are the runbook docs for the payments deploy checklist?",
+      "assistant": "docs/runbooks/payments-deploy.md — steps: run migrations, flush the user:* cache keys, deploy workers before web, then verify webhook replay on staging."
+    },
+    {
+      "user": "thanks!",
+      "assistant": "anytime."
+    },
+    {
+      "user": "Note that the deploy window is Friday morning — don't forget the cache invalidation step before the workers roll.",
+      "assistant": "Logged: Friday-morning deploy window, and cache invalidation (user:* keys) happens before the worker rollout, per the runbook."
+    }
+  ]
+}

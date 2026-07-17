@@ -1,0 +1,46 @@
+[project]
+name = "hermes-brain"
+version = "0.1.0"
+description = "Global memory & continual learning for Hermes Agent"
+requires-python = ">=3.11,<3.14"
+license = { text = "MIT" }
+# The floor tier is stdlib-only by design. Heavy tiers are extras,
+# lazy-installed by `hermes brain doctor --fix` / setup (P2+).
+dependencies = []
+
+[project.optional-dependencies]
+full = [
+    "onnxruntime>=1.20",
+    "tokenizers>=0.20",
+    "sqlite-vec>=0.1.6",
+    "numpy>=1.26",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.9.0",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "SIM"]
+# E402: root-level modules (cli.py, tools.py, __init__.py) MUST stay
+#       import-light — the Hermes loader eagerly imports them on every CLI
+#       invocation — so heavy sibling imports are deliberately deferred into
+#       function bodies.
+# B904: several `raise LLMUnavailable`/`_ToolError` sites intentionally drop
+#       the provider's original traceback from user-facing tool/LLM errors.
+ignore = [
+    "E501", "E402", "B904",
+    # SIM105: the `try/except sqlite3.Error: pass` rollback idiom is used
+    # deliberately and consistently; contextlib.suppress reads no clearer.
+    "SIM105",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B905"]  # zip(...) in tests doesn't need strict=
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

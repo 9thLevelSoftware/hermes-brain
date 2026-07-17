@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.db
+*.db-wal
+*.db-shm
+exports/
+dist/
+build/
+
+# Local Claude Code project state (permissions, saved workflows) — not the plugin
+.claude/
+
+# Models live in ~/.cache/hermes-brain, never in the repo, but guard anyway
+*.onnx
+.env
