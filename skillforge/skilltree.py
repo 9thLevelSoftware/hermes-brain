@@ -217,6 +217,57 @@ def write_usage_record(hermes_home: str | Path, name: str, record: dict) -> None
         os.replace(tmp, path)
 
 
+# ---------------------------------------------------------------------------
+# revision / retirement apply (the CLI-review side of skillforge/revise.py)
+# ---------------------------------------------------------------------------
+
+def _replace_section(text: str, heading: str, new_text: str) -> str:
+    """Replace one markdown section (its heading line through the next
+    same-or-higher-level heading) with `heading` + `new_text`; append it if the
+    heading is absent. Frontmatter is never a heading, so it is untouched."""
+    lines = text.splitlines()
+    level = len(heading) - len(heading.lstrip("#"))
+    block = [heading, "", new_text.strip(), ""]
+    hi = next((i for i, ln in enumerate(lines) if ln.strip() == heading), None)
+    if hi is None:
+        return text.rstrip() + "\n\n" + "\n".join(block).rstrip() + "\n"
+    ni = len(lines)
+    for j in range(hi + 1, len(lines)):
+        ln = lines[j]
+        lvl = len(ln) - len(ln.lstrip("#"))
+        if 0 < lvl <= level and (len(ln) == lvl or ln[lvl] == " "):
+            ni = j
+            break
+    return "\n".join(lines[:hi] + block + lines[ni:]).rstrip() + "\n"
+
+
+def apply_revision(md_path: str | Path, sections: list) -> bool:
+    """Apply a revision proposal: replace the named SKILL.md sections with the
+    corrected bodies. Never rewrites frontmatter. Returns True on success."""
+    try:
+        path = Path(md_path)
+        text = path.read_text(encoding="utf-8")
+        for sec in sections or []:
+            heading = str((sec or {}).get("heading") or "").strip()
+            new_text = str((sec or {}).get("new_text") or "")
+            if heading.startswith("#") and new_text.strip():
+                text = _replace_section(text, heading, new_text)
+        tmp = path.with_suffix(f".md.{os.getpid()}.tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+        return True
+    except (OSError, UnicodeDecodeError) as e:
+        logger.warning("apply_revision failed for %s: %s", md_path, e)
+        return False
+
+
+def mark_stale(hermes_home: str | Path, name: str) -> None:
+    """Retirement: flip the skill's telemetry to state='stale' so Hermes's
+    curator archives it. The brain never hard-deletes a skill (§2)."""
+    write_usage_record(hermes_home, name,
+                       {"state": "stale", "archived_at": _now_iso()})
+
+
 class _usage_lock:
     """Cross-process advisory lock via an O_EXCL sidecar (mirrors the host's
     _usage_file_lock). Best-effort with a short spin + stale takeover; the
@@ -259,6 +310,80 @@ class _usage_lock:
             except OSError:
                 pass
         return False
+
+
+# ---------------------------------------------------------------------------
+# brain-owned skill health (B5 readback: SKILL.md provenance + .usage.json)
+# ---------------------------------------------------------------------------
+
+def read_frontmatter(md_path: str | Path) -> dict[str, str]:
+    """Parse the flat scalar frontmatter of a SKILL.md into a str->str map.
+
+    Best-effort and forgiving (the runtime loader is too): a leading ``---``
+    block of ``key: value`` lines, quotes stripped. Returns {} if the file is
+    unreadable or has no frontmatter. Only used off the turn path.
+    """
+    try:
+        text = Path(md_path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return {}
+    if not text.startswith("---"):
+        return {}
+    fm: dict[str, str] = {}
+    for line in text.splitlines()[1:]:
+        if line.strip() == "---":
+            break
+        if ":" in line:
+            key, val = line.split(":", 1)
+            fm[key.strip()] = val.strip().strip('"').strip("'")
+    return fm
+
+
+def brain_owned_skills(hermes_home: str | Path) -> list[tuple[str, Path]]:
+    """(name, SKILL.md path) for every LIVE skill the brain forged — i.e. whose
+    frontmatter ``created_by == 'hermes-brain'`` (the honest provenance that
+    keeps it out of the curator's auto-walk; see the module docstring). Skips
+    the archive and hub trees. Empty when the tree is absent."""
+    root = skills_root(hermes_home)
+    out: list[tuple[str, Path]] = []
+    if not root.exists():
+        return out
+    try:
+        for md in root.rglob("SKILL.md"):
+            if ".archive" in md.parts or ".hub" in md.parts:
+                continue
+            if read_frontmatter(md).get("created_by") == "hermes-brain":
+                out.append((md.parent.name, md))
+    except OSError:
+        pass
+    return out
+
+
+def skill_outcomes(hermes_home: str | Path, name: str, *,
+                   usage: dict | None = None) -> dict:
+    """Per-skill outcome tally read back from ``<skills>/.usage.json`` (the
+    host's ``bump_outcome`` telemetry). Returns a normalized
+    {helped, hurt, neutral, total, outcome_counts} dict — zeros when the skill
+    has no record yet. ``usage`` lets a caller pass one already-read
+    .usage.json map so a whole-tree scan reads the file once."""
+    rec = (usage if usage is not None else read_usage(hermes_home)).get(name, {})
+    counts = rec.get("outcome_counts")
+    counts = counts if isinstance(counts, dict) else {}
+
+    def _pick(key: str) -> int:
+        # Prefer the explicit top-level counter; fall back to outcome_counts
+        # (older/other writers may only populate the nested map).
+        val = rec.get(key)
+        if val is None:
+            val = counts.get(key)
+        try:
+            return int(val or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    helped, hurt, neutral = _pick("helped"), _pick("hurt"), _pick("neutral")
+    return {"helped": helped, "hurt": hurt, "neutral": neutral,
+            "total": helped + hurt + neutral, "outcome_counts": counts}
 
 
 def brain_skill_record(*, evidence_count: int, success_rate: float,

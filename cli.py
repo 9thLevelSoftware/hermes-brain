@@ -259,6 +259,18 @@ def _resolve_uid(conn, prefix: str, *, current_only: bool = True):
     return rows[0]
 
 
+def _first_archive_ref(source_refs: str | None) -> str | None:
+    """The archive ref ('<YYYY-MM>.jsonl.gz:<uid>') a purge stored in
+    source_refs, or None. Used by 'why' to recover purged content."""
+    try:
+        for entry in json.loads(source_refs or "[]"):
+            if isinstance(entry, str) and entry.startswith("archive:"):
+                return entry[len("archive:"):]
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
 # ---------------------------------------------------------------------------
 # status
 # ---------------------------------------------------------------------------
@@ -388,6 +400,7 @@ def cmd_search(args: argparse.Namespace) -> int:
     from .recall import render as recall_render
     from .recall import search as recall_search
     from .recall.embed import get_embedder
+    from .recall.rerank import get_reranker
     from .store import db, sysinfo
     from .store import vec as vec_store
 
@@ -396,6 +409,7 @@ def cmd_search(args: argparse.Namespace) -> int:
     cfg = config.load_config(home)
     mode = sysinfo.resolve_mode(str(cfg.get("mode", "auto")))
     embedder = get_embedder(cfg, mode, allow_download=False)  # never surprise-download
+    reranker = get_reranker(cfg, mode, allow_download=False)
     try:
         conn = db.connect(home)
     except Exception as e:
@@ -405,7 +419,8 @@ def cmd_search(args: argparse.Namespace) -> int:
 
     try:
         vec_ok = embedder is not None and vec_store.vec_available(conn)
-        print(f"legs: {'fts+vec' if vec_ok else 'fts'}")
+        legs = "fts+vec" if vec_ok else "fts"
+        print(f"legs: {legs}{' +rerank' if reranker is not None else ''}")
         hits = recall_search.search(
             conn,
             query,
@@ -414,6 +429,7 @@ def cmd_search(args: argparse.Namespace) -> int:
             limit=args.limit,
             include_episodes=args.episodes,
             embedder=embedder,
+            reranker=reranker,
         )
         if not hits:
             print("(no matches)")
@@ -765,6 +781,10 @@ def cmd_forget(args: argparse.Namespace) -> int:
             for col in ("supersedes_id", "superseded_by", "invalidated_by"):
                 conn.execute(f"UPDATE memories SET {col}=NULL WHERE {col}=?", (mem_id,))
             conn.execute("DELETE FROM memories WHERE id=?", (mem_id,))
+            # Compliance also scrubs any archived copy of the raw text — a hard
+            # purge that left the content in the episodic archive would defeat it.
+            from .store import archive
+            archive.purge_uid(home, row["uid"])
             try:  # vec cleanup is best-effort: absent extension must not block a purge
                 if vec_store.vec_available(conn):
                     vec_store.delete(conn, "mem_vec", mem_id)
@@ -863,7 +883,17 @@ def cmd_why(args: argparse.Namespace) -> int:
             print(f"source_refs       {row['source_refs']}")
         if row["tags"] and row["tags"] != "[]":
             print(f"tags              {row['tags']}")
-        print(f"content           {(row['content'] or '(tombstone)')[:200]}")
+        if row["content"]:
+            print(f"content           {row['content'][:200]}")
+        elif (arch := _first_archive_ref(row["source_refs"])):
+            from .store import archive
+
+            recovered = archive.recover_content(_hermes_home(), arch)
+            print(f"content           (purged from live index; archived at {arch})")
+            if recovered:
+                print(f"archived          {recovered[:200]}")
+        else:
+            print("content           (tombstone)")
 
         for label, ref_col in (("supersedes", "supersedes_id"),
                                ("superseded by", "superseded_by")):
@@ -1139,37 +1169,57 @@ def cmd_reindex(args: argparse.Namespace) -> int:
 def cmd_models(args: argparse.Namespace) -> int:
     from . import config
     from .recall.embed import REGISTRY, ModelDownloadError, ensure_files, models_cache_dir
+    from .recall.rerank import RERANK_REGISTRY
 
     cache = models_cache_dir()
     cfg = config.load_config(_hermes_home())
     configured = str(cfg.get("embed_model") or "modernbert-embed-base")
-    for key, spec in REGISTRY.items():
+    rr_off = str(cfg.get("rerank", "auto")).strip().lower() in ("off", "false", "no", "0", "none")
+    rr_key = str(cfg.get("rerank_model") or "mxbai-edge-colbert-v0-32m").strip().lower()
+    if rr_key not in RERANK_REGISTRY:
+        rr_key = "mxbai-edge-colbert-v0-32m"
+
+    def _line(key: str, spec, extra: str) -> None:
         model_dir = cache / key
         have = all((model_dir / n).exists() and (model_dir / n).stat().st_size > 0
                    for n in spec.files)
         size_mb = sum((model_dir / n).stat().st_size for n in spec.files
                       if (model_dir / n).exists()) / (1024 * 1024)
         state = f"downloaded ({size_mb:.0f} MB)" if have else "not downloaded"
-        marks = (" [configured]" if key == configured else "") + \
-                (" [license-gated: needs HF_TOKEN]" if spec.gated else "")
-        print(f"{key:<24} {spec.repo:<44} {state}{marks}")
+        print(f"{key:<28} {spec.repo:<48} {state}{extra}")
+
+    for key, spec in REGISTRY.items():
+        _line(key, spec, (" [configured]" if key == configured else "")
+              + (" [license-gated: needs HF_TOKEN]" if spec.gated else ""))
+    for key, spec in RERANK_REGISTRY.items():
+        _line(key, spec, " [rerank]" + (" [configured]" if key == rr_key and not rr_off else ""))
     print(f"cache             {cache}")
 
     if not args.download:
         return 0
+    rc = 0
     spec = REGISTRY.get(configured)
     if spec is None:
         print(f"Configured embed_model '{configured}' is unknown.\n"
               f"  Remedy: set embed_model to one of {sorted(REGISTRY)} in brain.yaml.",
               file=sys.stderr)
-        return 1
-    try:
-        ensure_files(spec, download=True, progress=True)
-        print(f"downloaded        {spec.key} -> {cache / spec.key}")
-        return 0
-    except ModelDownloadError as e:
-        print(str(e), file=sys.stderr)  # already teaches (incl. gated-repo case)
-        return 1
+        rc = 1
+    else:
+        try:
+            ensure_files(spec, download=True, progress=True)
+            print(f"downloaded        {spec.key} -> {cache / spec.key}")
+        except ModelDownloadError as e:
+            print(str(e), file=sys.stderr)  # already teaches (incl. gated-repo case)
+            rc = 1
+    if not rr_off:
+        try:
+            rr_spec = RERANK_REGISTRY[rr_key]
+            ensure_files(rr_spec, download=True, progress=True)
+            print(f"downloaded        {rr_spec.key} -> {cache / rr_spec.key}")
+        except ModelDownloadError as e:
+            print(str(e), file=sys.stderr)
+            rc = 1
+    return rc
 
 
 # ---------------------------------------------------------------------------
@@ -1694,6 +1744,31 @@ def _review_decide(conn, args) -> int:
             print(f"could not promote: {res.get('reason') or res.get('error')}",
                   file=sys.stderr)
             return 1
+        if row["kind"] in ("skill_revision", "skill_retire"):
+            from .skillforge import skilltree
+
+            payload = json.loads(row["payload"] or "{}")
+            name = row["target"]
+            if row["kind"] == "skill_retire":
+                skilltree.mark_stale(home, name)
+                msg = f"retired skill '{name}' (marked stale; the curator archives it)"
+            else:
+                sections = (payload.get("revision") or {}).get("sections") or []
+                if not payload.get("path") or not skilltree.apply_revision(
+                        payload["path"], sections):
+                    print("could not apply revision (skill SKILL.md missing?)",
+                          file=sys.stderr)
+                    return 1
+                rec = skilltree.read_usage(home).get(name, {})
+                skilltree.write_usage_record(home, name, {
+                    "patch_count": int(rec.get("patch_count") or 0) + 1,
+                    "last_patched_at": db.iso_now()})
+                msg = f"revised skill '{name}' ({len(sections)} section(s) replaced)"
+            conn.execute("UPDATE proposals SET status='applied', decided_at=?, "
+                         "decided_by='cli' WHERE uid=?", (db.iso_now(), row["uid"]))
+            conn.commit()
+            print(f"approved: {msg}")
+            return 0
         conn.execute("UPDATE proposals SET status='approved', decided_at=?, "
                      "decided_by='cli' WHERE uid=?", (db.iso_now(), row["uid"]))
         conn.commit()

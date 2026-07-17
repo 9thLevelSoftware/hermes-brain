@@ -94,8 +94,10 @@ class BrainProvider(MemoryProvider):
         self._queue: queue.Queue[Any] = queue.Queue()
         self._worker: threading.Thread | None = None
         self._embedder = None  # set on the worker thread (never blocks a turn)
+        self._reranker = None  # optional full-tier rerank stage (worker thread)
         self._shutting_down = threading.Event()
         self._last_sweep = 0.0   # worker-thread-only cooldown clock
+        self._last_drain = 0.0   # work_queue drain cooldown (observer signals, B3)
         self._lock = threading.Lock()
 
     # -- identity ------------------------------------------------------------
@@ -441,10 +443,11 @@ class BrainProvider(MemoryProvider):
         NEVER downloaded here (embed.py download=False path) — that is
         setup/doctor's job; until then the vector legs are simply absent."""
         self._embedder = None
+        self._reranker = None
+        mode = sysinfo.resolve_mode(str(self._config.get("mode", "auto")))
         try:
             from .recall.embed import get_embedder
 
-            mode = sysinfo.resolve_mode(str(self._config.get("mode", "auto")))
             embedder = get_embedder(self._config, mode, allow_download=False)
             if embedder is not None and vec_store.ensure_tables(
                 conn, embedder.dim, embedder.name, allow_rebuild=False
@@ -459,6 +462,17 @@ class BrainProvider(MemoryProvider):
                             "FTS-only — 'hermes brain reindex' rebuilds", embedder.name)
         except Exception:
             logger.warning("brain: retrieval setup failed; FTS-only", exc_info=True)
+        # Rerank stage is independent of the vector legs (it reorders the fused
+        # FTS/vector candidates) and never downloads mid-turn. Absent on lite/
+        # fts-only, or when models/deps are missing — search() then no-ops it.
+        try:
+            from .recall.rerank import get_reranker
+
+            self._reranker = get_reranker(self._config, mode, allow_download=False)
+            if self._reranker is not None:
+                logger.info("brain: rerank stage via %s", self._reranker.name)
+        except Exception:
+            logger.warning("brain: rerank setup failed; skipping stage", exc_info=True)
 
     def _embed_row(self, conn, table: str, row_id: int | None, text: str) -> None:
         if self._embedder is None or row_id is None or not text.strip():
@@ -489,6 +503,7 @@ class BrainProvider(MemoryProvider):
                 # _maybe_sweep owns the cooldown clock, so a genuinely idle
                 # worker doesn't sweep every 90s (findings #6/#16).
                 self._maybe_sweep(conn)
+                self._maybe_drain_work_queue(conn)
                 continue
             if job is _SENTINEL:
                 break
@@ -576,6 +591,9 @@ class BrainProvider(MemoryProvider):
                     store_db.touch_activity(conn, f"provider:{self._session_id[:16]}")
                     conn.commit()
                     last_touch = now
+                # Drain companion-observer signals (B3): cheap, bounded, yields
+                # to any queued turn, never runs an LLM or blocks a turn.
+                self._maybe_drain_work_queue(conn)
             except Exception:
                 logger.warning("brain: worker job %s failed", job[0] if job else "?", exc_info=True)
 
@@ -621,6 +639,47 @@ class BrainProvider(MemoryProvider):
         except Exception:
             logger.warning("brain: sweep failed", exc_info=True)
 
+    _DRAIN_COOLDOWN_S = 20.0
+    _DRAIN_BATCH = 256
+
+    def _maybe_drain_work_queue(self, conn) -> None:
+        """Drain companion-observer signal rows from work_queue (task B3).
+
+        The out-of-tree ``brain_observer`` plugin reaches host hooks the
+        MemoryProvider contract cannot (``post_tool_call``, ``subagent_stop``,
+        ...) and enqueues lightweight rows into the shared ``work_queue`` table
+        with its own short-lived connection. This worker is the ONLY drainer,
+        and it runs on the single long-lived brain-bg connection — the
+        single-connection invariant holds.
+
+        Bounded and non-urgent: yields to any queued provider job (a turn is
+        waiting), self-throttles on a cooldown, and processes at most
+        ``_DRAIN_BATCH`` rows per pass into bookkeeping only (an audit_log
+        summary + an activity heartbeat — no new tables). Skipped for incognito
+        sessions so an incognito brain leaves no trace. Never raises into the
+        worker loop.
+        """
+        if not self._initialized or self._incognito:
+            return
+        if self._queue.qsize() > 0:
+            return  # a turn/marker is waiting — bookkeeping is never urgent
+        now = time.monotonic()
+        if self._last_drain and now - self._last_drain < self._DRAIN_COOLDOWN_S:
+            return
+        self._last_drain = now
+        try:
+            from .store import work_queue as wq
+
+            summary = wq.drain_observer_signals(conn, limit=self._DRAIN_BATCH)
+            if summary.get("count"):
+                logger.info(
+                    "brain: drained %d observer signal(s) tools=%s subagents=%d errors=%d",
+                    summary["count"], summary.get("tools"),
+                    summary.get("subagents", 0), summary.get("errors", 0),
+                )
+        except Exception:
+            logger.warning("brain: work_queue drain failed", exc_info=True)
+
     def _do_retrieve(self, conn, session_id: str, query_text: str) -> None:
         # Follow continuation renames; drop results for sessions that were
         # reset away while this job sat in the queue (review finding #5).
@@ -655,6 +714,7 @@ class BrainProvider(MemoryProvider):
             source_author=source_author,
             trust_tier=trust_tier,
             embedder=self._embedder,
+            reranker=self._reranker,
         )
         facts_block = lane2_block(hits, remaining)
         block = "\n".join(p for p in (gblock, facts_block) if p)

@@ -40,7 +40,8 @@ from datetime import UTC, datetime
 from ..capture.symbols import expand_query
 from ..store import db
 from ..store import vec as vec_store
-from . import fusion
+from . import fusion, rerank
+from . import graph as graph_leg
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +123,44 @@ def _modulate(row: sqlite3.Row, base: float, now: datetime) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Rerank stage (memory-engine.md §3.4)
+# ---------------------------------------------------------------------------
+
+def _cand_text(key: str, row: sqlite3.Row) -> str:
+    """The text a reranker scores for a fused candidate (length-bounded)."""
+    if key.startswith("m:"):
+        return (row["content"] or row["summary"] or "")[:2000]
+    return f"{row['user_content'] or ''} {row['assistant_content'] or ''}".strip()[:2000]
+
+
+def _rerank_bases(reranker, query: str, bases: dict[str, float],
+                  rows_by_key: dict, budget_s: float) -> dict[str, float]:
+    """Replace fused relevance with a reranked, floored band over the top slice.
+
+    The reranked slice is renormalized into [_NORM_FLOOR, 1]; the un-reranked
+    tail (fused rank beyond the rerank cap) is pushed strictly below the floor
+    so it can only surface if the slice underfills the caller's limit. Degrades
+    to the original bases on any skip — nothing to reorder, no score
+    separation, budget blown, or failure (rerank_scores never raises)."""
+    ordered = sorted(bases.items(), key=lambda kv: kv[1], reverse=True)
+    cands = [(k, _cand_text(k, rows_by_key[k])) for k, _ in ordered if k in rows_by_key]
+    scored = rerank.rerank_scores(reranker, query, cands, budget_s=budget_s)
+    if not scored:
+        return bases
+    lo, hi = min(scored.values()), max(scored.values())
+    if hi - lo < 1e-12:
+        return bases  # reranker saw no separation; keep the fused order
+    span = hi - lo
+    new = dict(bases)
+    for key, s in scored.items():
+        new[key] = _NORM_FLOOR + (1.0 - _NORM_FLOOR) * (s - lo) / span
+    for key in bases:
+        if key not in scored:
+            new[key] = _NORM_FLOOR * 0.5 * bases[key]  # demote the un-reranked tail
+    return new
+
+
+# ---------------------------------------------------------------------------
 # Search
 # ---------------------------------------------------------------------------
 
@@ -140,6 +179,9 @@ def search(
     source_author: str | None = None,
     trust_tier: str = "owner",
     embedder=None,
+    reranker=None,
+    rerank_budget_s: float = rerank.DEFAULT_BUDGET_S,
+    graph: bool = True,
 ) -> list[Hit]:
     """Ranked, access-scoped recall over memories (+episodes). Never raises.
 
@@ -211,13 +253,43 @@ def search(
             except Exception as e:
                 logger.warning("vector leg failed (%s); continuing with FTS only", e)
 
+        # -- graph leg: PPR over the entity co-mention + edges graph, seeded by
+        #    the memory candidates the FTS/vec legs surfaced. Discovers related
+        #    memories neither keyword nor vector found; empty when the seeds are
+        #    graph-isolated. Same access filters applied at row fetch. --
+        graph_keys: set = set()
+        if graph:
+            try:
+                seed_ids = [int(k[2:]) for k in rows_by_key if k.startswith("m:")]
+                ppr_ids = graph_leg.ppr_leg(conn, seed_ids, limit=limit * 3)
+                if ppr_ids:
+                    gvrows = _memories_by_ids(conn, ppr_ids, kinds, scope_project,
+                                              principal_id, trust_tier, exclude_kinds)
+                    rankings.append([f"m:{i}" for i in ppr_ids if i in gvrows])
+                    rows_by_key.update({f"m:{i}": r for i, r in gvrows.items()})
+                    graph_keys.update(f"m:{i}" for i in gvrows)
+            except Exception as e:
+                logger.warning("graph leg failed (%s); continuing", e)
+
         fts_keys = {f"m:{r['id']}" for r in mem_rows} | {f"e:{r['id']}" for r in epi_rows}
         bases = fusion.normalized(fusion.rrf(rankings), floor=_NORM_FLOOR)
+        # Late-interaction rerank of the fused relevance (memory-engine §3.4),
+        # BEFORE lifecycle modulation / the 0.6x episode factor. No-op unless a
+        # reranker was supplied (full tier + models present); degrades to the
+        # fused order on any skip.
+        if reranker is not None:
+            bases = _rerank_bases(reranker, query, bases, rows_by_key, rerank_budget_s)
 
         def _leg(key: str) -> str:
             """Honest provenance (finding #6): which leg(s) found this row."""
-            in_fts, in_vec = key in fts_keys, key in vec_keys
-            return "fts+vec" if (in_fts and in_vec) else ("vec" if in_vec else "fts")
+            parts = []
+            if key in fts_keys:
+                parts.append("fts")
+            if key in vec_keys:
+                parts.append("vec")
+            if key in graph_keys:
+                parts.append("ppr")
+            return "+".join(parts) or "fts"
 
         hits: list[Hit] = []
         episode_count = 0

@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 DEFAULTS: dict[str, Any] = {
     "mode": "auto",              # auto | full | lite | fts-only | stub (tests only)
     "embed_model": "modernbert-embed-base",  # or embeddinggemma-300m (gated; needs HF_TOKEN)
+    "rerank": "auto",            # auto | off — late-interaction ColBERT rerank (full tier)
+    "rerank_model": "",          # '' = mxbai-edge-colbert default (fallback answerai); 'stub' for tests
     "lane1_tokens": 1200,        # 800-1500; hard-truncated by the renderer
     "lane2_tokens": 600,         # 0 disables lane 2
     "dream_schedule": "auto",    # cron | on-idle | manual | auto
@@ -23,6 +25,8 @@ DEFAULTS: dict[str, Any] = {
     "dream_model": "",           # auxiliary override; empty = active model
     "extract_model": "",         # cheap tier override; empty = auxiliary default
     "extract_mode": "active",    # off | shadow | active — the P3 sweep
+    "extract_search_aids": True, # D2: fold LLM paraphrase aids into tags + embed text
+    "extract_max_aids": 4,       # per-item cap on search aids
     "bootstrap_import": True,
     "memories_tool": False,      # deferred past P3 (critique item 8)
     "night_budget_usd": 0.50,

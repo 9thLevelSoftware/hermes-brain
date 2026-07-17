@@ -120,6 +120,7 @@ def post_setup(hermes_home: str, config: dict[str, Any]) -> None:
         if conn is not None:
             conn.close()
 
+    _register_aux_slots(config)
     _activate_provider(config)
     print(_TRANSITION_MATRIX)
     print("  Gateway users: enroll yourself as owner or your messages can never\n"
@@ -224,6 +225,37 @@ def _materialize_lane1(conn, cfg: dict[str, Any]) -> None:
         print("  lane 1 index materialized.")
     except Exception as e:
         print(f"  lane 1 materialize failed: {e} — run 'hermes brain refresh-index' later.")
+
+
+# Auxiliary task slots the brain routes sleep-time LLM work through (mirrors
+# llm._TIER_TASK): 'extract' -> brain_extract, 'dream'/'consolidate' ->
+# brain_consolidate. Registering these blocks lets `hermes model → Configure
+# auxiliary models` and aux.call_llm("brain_extract"/"brain_consolidate") pin a
+# cheap/local model per task. An absent or empty block means "use the auxiliary
+# default": the host resolver (agent.auxiliary_client._get_auxiliary_task_config
+# + _resolve_provider_and_model) reads auxiliary.<task>, and an empty
+# provider/model resolves to the auto-detected main provider.
+_AUX_TASK_SLOTS = ("brain_extract", "brain_consolidate")
+
+
+def _register_aux_slots(config: dict[str, Any]) -> None:
+    """Idempotently seed auxiliary.<task> routing blocks for the brain's LLM
+    tiers into the Hermes config dict.
+
+    Writes an empty routing block (provider/model = '', i.e. inherit the
+    auxiliary default) for each brain task, but never clobbers a block the
+    user has already configured. Persisted by _activate_provider's
+    hermes_save_config(config) call (this must run before it)."""
+    if not isinstance(config, dict):
+        return
+    aux = config.setdefault("auxiliary", {})
+    if not isinstance(aux, dict):
+        return
+    for task in _AUX_TASK_SLOTS:
+        existing = aux.get(task)
+        if isinstance(existing, dict) and existing:
+            continue  # user-set (or previously seeded) — leave untouched
+        aux[task] = {"provider": "", "model": ""}
 
 
 def _activate_provider(config: dict[str, Any]) -> None:
