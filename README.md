@@ -49,9 +49,13 @@ file + append-only archive); per-profile isolation comes free via `HERMES_HOME`.
 - **Shares** across agents via a stdio **MCP server**: Claude Code can recall a memory the
   owner wrote from Telegram.
 
-Everything autonomous is **ship-inert** — modes `off | shadow | dry_run | active`, with
-mutating strategies defaulting to `dry_run`/`shadow` until you promote them. The dream
-runs on **cron + manual only**; the brain never spawns background processes on its own.
+The learning strategies are **active by default** — modes `off | shadow | dry_run | active`;
+the mutating strategies (`cases`/`distill`/`consolidate`/`contradict`/`forget`) learn live
+on every dream run. `tune` stays `shadow` (it only ever *proposes* retrieval-weight changes,
+never applies them). Roll any strategy back with `hermes brain dream --disable <strategy>`,
+or neutralize a whole run with `--dry-run`. The dream still runs on **cron + manual only**;
+the brain never spawns background processes on its own, so "active" only takes effect when
+you run a dream.
 
 ## CLI
 

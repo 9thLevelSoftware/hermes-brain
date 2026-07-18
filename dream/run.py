@@ -66,6 +66,46 @@ def _strategy_fn(name: str):
         from .contradict import run as fn
     elif name == "forget":
         from .forget import run as fn
+    elif name == "forge":
+        def fn(shift: Shift) -> dict:
+            mode = shift.config.get("_forced_mode") or shift.mode("forge")
+            if mode not in ("active", "dry_run"):
+                return {"skipped": mode}
+            from ..skillforge import forge_once
+
+            # dry_run drafts + validates but must NOT promote a skill into the
+            # tree — force auto-approve off so the proposal stays reviewable.
+            config = shift.config
+            if mode == "dry_run":
+                config = {**config, "skill_auto_approve": False}
+            return forge_once(shift.conn, config, embedder=shift.embedder,
+                              shift_id=shift.shift_id)
+    elif name == "revise":
+        def fn(shift: Shift) -> dict:
+            mode = shift.config.get("_forced_mode") or shift.mode("revise")
+            if mode not in ("active", "dry_run"):
+                return {"skipped": mode}
+            from ..skillforge import revise_once
+
+            # revise ONLY ever writes reviewable proposals — it never applies a
+            # revision or retirement (the CLI `hermes brain review` does). A
+            # proposal is the reversible, review-gated artifact, so dry_run and
+            # active behave identically here — exactly as forge's dry_run still
+            # writes its draft proposal and only withholds the live tree write.
+            return revise_once(shift.conn, shift.config, embedder=shift.embedder,
+                               shift_id=shift.shift_id)
+    elif name == "peers":
+        def fn(shift: Shift) -> dict:
+            # Theory-of-mind peer modeling (D3). Mode-gated like forge/revise;
+            # peers additionally supports `shadow` (silent compute). 'off' is
+            # already filtered upstream in run_dream before dispatch, so the
+            # only mode that reaches here and isn't meaningful is a stray one.
+            mode = shift.config.get("_forced_mode") or shift.mode("peers")
+            if mode not in ("active", "dry_run", "shadow"):
+                return {"skipped": mode}
+            from .peers import run as peers_run
+
+            return peers_run(shift)
     elif name == "tune":
         from .tune import run as fn
     elif name == "probes":

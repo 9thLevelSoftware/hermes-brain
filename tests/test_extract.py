@@ -107,7 +107,7 @@ def test_sweep_happy_path(conn):
     assert set(by_kind) == {"preference", "decision", "insight"}
     for row in rows:
         assert row["created_by"] == "extraction"
-        assert row["prompt_version"] == "extract-v1"
+        assert row["prompt_version"] == "extract-v2"
         assert row["epistemic"] == "observation"
         assert row["memory_type"] == "semantic"
         assert row["status"] == "active" and row["live"] == 1

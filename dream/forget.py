@@ -26,16 +26,31 @@ the same counts and audit 'would_*' rows, mutating nothing.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import sqlite3
 import time
 from calendar import timegm
 
-from ..store import db
+from ..store import archive, db
 from .shift import Shift
 
 logger = logging.getLogger(__name__)
+
+
+def _append_source_ref(source_refs: str | None, ref: str) -> str:
+    """Append an 'archive:<ref>' entry to a memory's source_refs JSON array
+    (schema.sql documents source_refs as the home for archive refs). Tolerant
+    of a malformed/absent value."""
+    try:
+        refs = json.loads(source_refs or "[]")
+        if not isinstance(refs, list):
+            refs = []
+    except (ValueError, TypeError):
+        refs = []
+    refs.append(f"archive:{ref}")
+    return json.dumps(refs)
 
 _MAX_SCORED = 5000       # value-scoring pass cap per run
 _MAX_DEMOTE = 200        # tier moves per run (each tier)
@@ -117,7 +132,7 @@ def _run(shift: Shift) -> dict:
     # -- grace purge: tombstones past grace lose their content (stub stays) -
     purge: list[sqlite3.Row] = []
     t_rows = shift.conn.execute(
-        "SELECT id, uid, content, summary, recorded_at FROM memories"
+        "SELECT id, uid, content, summary, recorded_at, source_refs FROM memories"
         " WHERE status='tombstone' AND content IS NOT NULL ORDER BY id LIMIT ?",
         (_MAX_PURGE,),
     ).fetchall()
@@ -148,15 +163,32 @@ def _run(shift: Shift) -> dict:
             shift.audit("forget_tombstone", row["uid"],
                         {"score": round(score, 4), "from": "summarized",
                          "to": "tombstone"})
-        for row in purge:
-            stub = (row["summary"] or (row["content"] or "")[:_STUB_CHARS]).strip()
-            shift.conn.execute(
-                "UPDATE memories SET content=NULL, summary=? WHERE id=?",
-                (stub or None, row["id"]))
-            shift.audit("forget_purge", row["uid"],
-                        {"stub_kept": bool(stub),
-                         "note": "content distilled; raw text in episodic archive"})
-        if demote or tombstone or purge:
+        home = shift.config.get("hermes_home")
+        purged_n = 0
+        # Correctness gate: preserve the raw text in the episodic archive BEFORE
+        # nulling live content, so demotion is non-destructive. Archive ALL
+        # purge candidates in ONE batch (one gzip open, not one per row); any
+        # row whose archiving failed comes back as ref=None and is left a
+        # tombstone to retry next run, so raw text is never lost.
+        if home and purge:
+            records = [{"uid": r["uid"], "kind": "memory", "content": r["content"],
+                        "summary": r["summary"], "recorded_at": r["recorded_at"]}
+                       for r in purge]
+            for row, ref in zip(purge, archive.append_batch(home, records),
+                                strict=True):
+                if ref is None:
+                    continue
+                stub = (row["summary"] or (row["content"] or "")[:_STUB_CHARS]).strip()
+                refs = _append_source_ref(row["source_refs"], ref)
+                shift.conn.execute(
+                    "UPDATE memories SET content=NULL, summary=?, source_refs=?"
+                    " WHERE id=?", (stub or None, refs, row["id"]))
+                shift.audit("forget_purge", row["uid"],
+                            {"stub_kept": bool(stub), "archive_ref": ref,
+                             "note": "content archived (batched) before purge"})
+                purged_n += 1
+        counts["purged"] = purged_n
+        if demote or tombstone or purged_n:
             db.bump_generation(shift.conn)
     elif mode == "dry_run":                            # shadow is audit-silent (#8)
         for row, score in demote:

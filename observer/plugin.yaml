@@ -1,0 +1,10 @@
+name: brain_observer
+version: "0.1.0"
+description: "Companion observer for Hermes-Brain. Reaches host hooks the MemoryProvider contract cannot (post_tool_call, subagent_stop, ...) and enqueues lightweight signal rows into brain.db's work_queue for the brain's background worker to drain. Standalone, stdlib-only, non-blocking, opt-in via plugins.enabled."
+author: "NousResearch (Hermes-Brain)"
+kind: standalone
+pip_dependencies: []
+requires_env: []
+hooks:
+  - post_tool_call
+  - subagent_stop

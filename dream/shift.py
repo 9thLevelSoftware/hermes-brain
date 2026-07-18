@@ -27,14 +27,23 @@ logger = logging.getLogger(__name__)
 # Default per-strategy modes for THIS release (ship-inert): read-only
 # strategies run active; anything that mutates memory ships dry_run until
 # the user promotes it via `hermes brain dream --enable <strategy>`.
+# Active-by-default (user decision 2026-07-17): the learning flywheel mutates
+# live memory on every `hermes brain dream` run. The dream is still cron/manual
+# only (never auto-spawned), and `hermes brain dream --disable <strategy>` is
+# the one-command rollback to dry_run. `tune` remains shadow (never auto-applies
+# retrieval weights — a hard v1 invariant); `forget` is safe to run active only
+# because it now archives raw text before any purge (store/archive.py).
 DEFAULT_MODES = {
     "flush": "active",          # extraction already reviewed in P3
     "mine": "active",           # only updates helpful/harmful counters + edges
-    "cases": "dry_run",         # writes episodic case rows (P5)
-    "distill": "dry_run",       # writes procedural strategy/guardrail items (P5)
-    "consolidate": "dry_run",   # writes new semantic patterns
-    "contradict": "dry_run",    # invalidates contradicted rows
-    "forget": "dry_run",        # demotes/tombstones
+    "cases": "active",          # writes episodic case rows (P5)
+    "distill": "active",        # writes procedural strategy/guardrail items (P5)
+    "consolidate": "active",    # writes new semantic patterns
+    "peers": "active",          # theory-of-mind peer cards from group chats (D3)
+    "contradict": "active",     # invalidates contradicted rows
+    "forget": "active",         # demotes/tombstones (archives raw text first)
+    "forge": "active",          # drafts + auto-approves skills from the case bank
+    "revise": "active",         # proposes revisions/retirements for harmful skills
     "tune": "shadow",           # retrieval-weight tuning — NEVER active in v1;
                                 # only ever proposes (design §2: shadow-logged,
                                 # reviewed before activation)
@@ -43,13 +52,17 @@ DEFAULT_MODES = {
 }
 
 # Ordered pipeline (learning-system.md §1.2): facts -> outcome credit ->
-# case bank -> strategy distillation -> semantic consolidation -> contradiction
-# -> forgetting -> weight tuning -> post-shift probes -> index re-render.
-# cases runs before distill so the case bank the skill-forge reads is fresh;
+# case bank -> strategy distillation -> skill forge -> skill revision ->
+# semantic consolidation -> peer modeling -> contradiction -> forgetting ->
+# weight tuning -> post-shift probes -> index re-render. cases runs before
+# forge so the case bank the skill-forge reads is fresh; revise runs right
+# after forge so a freshly-read .usage.json health signal drives revision/
+# retirement proposals in the same shift; peers runs after consolidate (both
+# are episodic->semantic distillation passes over the settled working set);
 # probes runs last so it checks the shift's net effect; tune runs after
 # forgetting so it sees the settled working set.
-PIPELINE = ("flush", "mine", "cases", "distill", "consolidate", "contradict",
-            "forget", "tune", "probes", "lane1")
+PIPELINE = ("flush", "mine", "cases", "distill", "forge", "revise",
+            "consolidate", "peers", "contradict", "forget", "tune", "probes", "lane1")
 
 _PREEMPT_CHECK_EVERY = 8  # work units between activity re-checks
 

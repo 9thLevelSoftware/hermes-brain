@@ -156,13 +156,14 @@ def test_forget_summarized_within_grace_untouched(conn):
     assert mem_row(conn, mem)["status"] == "summarized"
 
 
-def test_forget_purges_tombstone_past_grace_keeping_provenance(conn):
+def test_forget_purges_tombstone_past_grace_keeping_provenance(conn, tmp_home):
     mem = seed_stale(conn, "tombstoned row whose grace has fully lapsed",
                      status="tombstone")
     before = mem_row(conn, mem)
     stamp_audit(conn, "forget_tombstone", before["uid"], iso_days_ago(40))
 
-    result = forget_run(make_shift(conn, ACTIVE))
+    # A purge now archives the raw text first, so it needs a home to write to.
+    result = forget_run(make_shift(conn, {**ACTIVE, "hermes_home": str(tmp_home)}))
 
     assert result["purged"] == 1
     row = mem_row(conn, mem)
@@ -170,7 +171,10 @@ def test_forget_purges_tombstone_past_grace_keeping_provenance(conn):
     assert row["status"] == "tombstone"          # ...but the row remains
     assert row["uid"] == before["uid"]           # provenance intact
     assert row["created_by"] == before["created_by"]
-    assert row["source_refs"] == before["source_refs"]
+    # source_refs GAINS an archive ref (where the raw text went) — enhanced
+    # provenance, not lost provenance.
+    refs = json.loads(row["source_refs"] or "[]")
+    assert any(r.startswith("archive:") for r in refs)
     assert row["summary"]                        # distilled stub kept
     assert audit_actions(conn, "forget_purge")[0]["target"] == before["uid"]
 

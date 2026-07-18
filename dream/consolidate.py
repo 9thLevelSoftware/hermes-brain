@@ -27,7 +27,7 @@ import struct
 
 from .. import llm
 from ..capture.symbols import symbols_field
-from ..store import db
+from ..store import db, entities
 from ..store import vec as vec_store
 from .shift import Shift
 
@@ -321,6 +321,7 @@ def _insert_pattern(shift: Shift, lesson: dict, members: list[sqlite3.Row]) -> s
         ),
     )
     new_id = cur.lastrowid
+    entity = lesson["entity"]
     for m in members:
         conn.execute(
             "INSERT OR IGNORE INTO edges (src_id, dst_id, edge_type, confidence,"
@@ -333,7 +334,13 @@ def _insert_pattern(shift: Shift, lesson: dict, members: list[sqlite3.Row]) -> s
             " WHERE id=?",
             (_DEMOTE_FACTOR, m["id"]),
         )
+        # Populate the PPR substrate: the lesson's concrete entity co-mentions
+        # the pattern AND every member, so recall/graph.py can propagate
+        # relevance across this cluster (and to other memories about the same
+        # entity). This is also what finally feeds the specificity gate above.
+        entities.link(conn, entity, m["id"], scope_project=m["scope_project"], ts=now)
         shift.audit("consolidated", m["uid"], {"pattern": uid})
+    entities.link(conn, entity, new_id, scope_project=None, ts=now)
     _embed(shift, new_id, content)
     shift.audit("consolidate_insert", uid, {
         "members": [m["uid"] for m in members],

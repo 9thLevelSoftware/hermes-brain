@@ -78,6 +78,15 @@ _GUARDRAIL = json.dumps({
     "scope": "migration", "actionable": True,
 })
 
+# Deterministic case summary: the three attempts are the SAME task, so a fixed
+# summary makes their (stub) embeddings identical and they cluster — the test
+# must not depend on whether a real LLM is reachable to paraphrase each turn
+# (a real embedder would cluster the paraphrases; the stub embedder can't).
+_CASE = json.dumps({
+    "summary": "deploy the payments service to staging with a schema migration",
+    "plan": "1. dry-run the migration 2. deploy 3. smoke test",
+})
+
 
 def _skill_draft(prompt, *, system=None, tier=None):
     # Draft from the cluster text so the replay gate (embed vs cluster) passes.
@@ -122,8 +131,12 @@ def test_one_concrete_week(week):
                      started_at=db.iso_now(),
                      activity_baseline="9999-12-31T00:00:00.000Z", holder="wk")
 
-    # -- night: bank the cases --
-    cases_result = cases_mod.run(shift("active"))
+    # -- night: bank the cases (deterministic summary so the run is hermetic) --
+    brain_llm.set_llm_for_tests(lambda p, *, system=None, max_tokens=0: _CASE)
+    try:
+        cases_result = cases_mod.run(shift("active"))
+    finally:
+        brain_llm.set_llm_for_tests(None)
     assert cases_result["written"] == 3, cases_result
     n_cases = conn.execute("SELECT count(*) AS n FROM memories WHERE kind='case'"
                           ).fetchone()["n"]

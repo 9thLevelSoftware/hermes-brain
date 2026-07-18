@@ -37,8 +37,10 @@ from ..store import vec as vec_store
 logger = logging.getLogger(__name__)
 
 _STRATEGY_KINDS = ("strategy", "guardrail")
+_PEER_KIND = "peer_card"
 _MIN_SIM = 0.35              # below this, "similar" is a lie
 _CASE_MIN_SIM = 0.45
+_PEER_MIN_SIM = 0.35        # surface a peer card when the turn is about them
 _DEPRECATE_MIN_N = 5         # harmful>helpful only deprecates with evidence
 _KNN_K = 16
 
@@ -75,10 +77,17 @@ def retrieve_guidance(
     embedder=None,
     limit_strategies: int = 3,
     limit_cases: int = 2,
+    limit_peers: int = 2,
     scope_user: str | None = None,
     trust_tier: str = "owner",
 ) -> list[Guidance]:
-    """Top learned-guidance items for a query. [] when vectors are absent."""
+    """Top learned-guidance items for a query. [] when vectors are absent.
+
+    Peer cards (theory-of-mind of a group-chat peer, D3) surface here for the
+    OWNER only — they are the owner's private read of a peer and must NEVER
+    reach a non-owner caller, not even the very peer they describe. The scope
+    gate lives in ``_fetch``.
+    """
     try:
         if embedder is None or not vec_store.vec_available(conn):
             return []
@@ -100,6 +109,8 @@ def retrieve_guidance(
                 g = _score_strategy(row, sim)
             elif kind == "case":
                 g = _score_case(row, sim)
+            elif kind == _PEER_KIND:
+                g = _score_peer_card(row, sim)
             else:
                 g = None
             if g is not None:
@@ -107,11 +118,14 @@ def retrieve_guidance(
 
         strategies = sorted((g for g in out if g.kind in _STRATEGY_KINDS),
                             key=lambda g: g.score, reverse=True)[:limit_strategies]
+        # Peer cards are already owner-gated at fetch time; sort + cap here.
+        peers = sorted((g for g in out if g.kind == _PEER_KIND),
+                       key=lambda g: g.score, reverse=True)[:limit_peers]
         cases = []
         if is_task_like(query):
             cases = sorted((g for g in out if g.kind == "case"),
                            key=lambda g: g.score, reverse=True)[:limit_cases]
-        return strategies + cases
+        return strategies + peers + cases
     except Exception as e:
         logger.warning("guidance retrieval failed for %r: %s", query, e)
         return []
@@ -120,17 +134,24 @@ def retrieve_guidance(
 def _fetch(conn, ids, scope_user, trust_tier) -> list[sqlite3.Row]:
     if not ids:
         return []
+    # Strategy/guardrail/case guidance is agent-owned and (for non-owners)
+    # scoped like search. Peer cards are the OWNER's private theory-of-mind of
+    # a peer: they enter the candidate set for OWNER callers only and are never
+    # returned to any non-owner — not even the peer they describe, whose
+    # principal would otherwise satisfy the `scope_user = ?` clause below.
+    kinds = ["strategy", "guardrail", "case"]
+    if trust_tier == "owner":
+        kinds.append(_PEER_KIND)
+    kind_ph = ",".join("?" * len(kinds))
     sql = (
         f"SELECT m.id, m.uid, m.kind, m.summary, m.content, m.helpful_count,"
         f" m.harmful_count, m.importance, m.meta, v.emb"
         f" FROM memories m LEFT JOIN mem_vec v ON v.id = m.id"
         f" WHERE m.id IN ({','.join('?' * len(ids))})"
         " AND m.valid_to IS NULL AND m.status='active' AND m.live=1"
-        " AND m.kind IN ('strategy','guardrail','case')"
+        f" AND m.kind IN ({kind_ph})"
     )
-    params: list = list(ids)
-    # Guidance is agent-owned, but honor scoping symmetrically with search:
-    # a non-owner session never sees another principal's scoped items.
+    params: list = list(ids) + kinds
     if trust_tier != "owner":
         sql += " AND (m.scope_user IS NULL OR m.scope_user = ?)"
         params.append(scope_user or "")
@@ -164,6 +185,17 @@ def _score_case(row: sqlite3.Row, sim: float) -> Guidance | None:
     return Guidance(uid=row["uid"], id=row["id"], kind="case",
                     title=(row["summary"] or row["content"] or "").strip(),
                     verdict=verdict, score=sim * bonus)
+
+
+def _score_peer_card(row: sqlite3.Row, sim: float) -> Guidance | None:
+    """A group-chat peer's theory-of-mind card, ranked by pure similarity — no
+    outcome counters (a peer card is a descriptive profile, not a proven
+    tactic). Owner-gated already at fetch time."""
+    if sim < _PEER_MIN_SIM:
+        return None
+    return Guidance(uid=row["uid"], id=row["id"], kind=_PEER_KIND,
+                    title=(row["summary"] or row["content"] or "").strip(),
+                    verdict=None, score=sim)
 
 
 def _quantize(vec) -> bytes:

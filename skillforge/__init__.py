@@ -11,5 +11,6 @@ eagerly import it — the filesystem + LLM machinery loads only when a
 from __future__ import annotations
 
 from .forge import forge_once, promote_draft
+from .revise import revise_once
 
-__all__ = ["forge_once", "promote_draft"]
+__all__ = ["forge_once", "promote_draft", "revise_once"]

@@ -467,18 +467,45 @@ def _recall(conn: sqlite3.Connection, args: dict, ctx: ToolContext) -> dict:
     )
 
     if depth == "deep":
+        from .recall.search import _memories_by_ids
+        from .store import entities
+
         results: list = []
+        seed_ids: list[int] = []
         for i, hit in enumerate(hits):
             entry: dict[str, Any] = {"line": index_line(hit)}
             if i < _DEEP_FULL_TEXT_TOP and hit.text:
                 entry["text"] = hit.text
             results.append(entry)
+            if hit.kind == "memory":
+                seed_ids.append(hit.id)
+
+        # Graph traversal: memories sharing an entity with the results, scoped
+        # exactly like the search legs (co_mentioned returns ids; the row fetch
+        # applies the caller's access filters).
+        seen = {h.uid for h in hits}
+        neighbors: list[dict[str, Any]] = []
+        nbr_ids = entities.co_mentioned(conn, seed_ids, limit=6)
+        nbr_rows = _memories_by_ids(conn, nbr_ids, [kind] if kind else None,
+                                    project, ctx.principal_id, ctx.trust_tier, ())
+        for mid in nbr_ids:
+            row = nbr_rows.get(mid)
+            if row is None or row["uid"] in seen:
+                continue
+            neighbors.append({
+                "id": row["uid"][:8],
+                "kind": row["kind"],
+                "text": (row["content"] or row["summary"] or "")[:200],
+            })
+
         payload: dict[str, Any] = {
             "results": results,
             "total": len(hits),
-            "note": "depth=deep shows full text for the top 3; graph-neighbor "
-                    "traversal arrives in a later phase",
+            "note": "depth=deep shows full text for the top 3 and graph "
+                    "neighbors (memories sharing an entity with the results)",
         }
+        if neighbors:
+            payload["neighbors"] = neighbors
     else:
         payload = {"results": [index_line(h) for h in hits], "total": len(hits)}
 
