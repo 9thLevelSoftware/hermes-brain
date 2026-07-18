@@ -30,8 +30,6 @@ from __future__ import annotations
 import json
 from unittest import mock
 
-import pytest
-
 from conftest import iso_days_ago
 from faults import race
 
@@ -200,9 +198,9 @@ def test_release_only_by_holder(conn):
 def test_run_dream_skips_when_lease_already_held(tmp_home):
     """A second dream over one brain.db while the lease is live must not run —
     it reports lease_held and names the holder (run.py:144-147)."""
+    from brain import llm
     from brain.dream import lease, run
     from brain.store import db
-    from brain import llm
 
     llm.set_llm_for_tests(lambda *a, **k: "[]")
     holder_conn = db.connect(tmp_home)
@@ -229,10 +227,10 @@ def test_run_dream_aborts_when_lease_lost_midpipeline(tmp_home):
     TTL lapse), run_dream's post-strategy renew fails and it aborts with
     lease_lost (run.py:192-195) rather than continuing to mutate memory — and
     it must NOT release the new owner's lease (release is holder-scoped)."""
-    from brain.dream import run
-    from brain.capture import extract
-    from brain.store import db
     from brain import llm
+    from brain.capture import extract
+    from brain.dream import run
+    from brain.store import db
 
     llm.set_llm_for_tests(lambda *a, **k: "[]")
     main = db.connect(tmp_home)
