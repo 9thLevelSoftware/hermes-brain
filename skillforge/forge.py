@@ -496,9 +496,14 @@ def _validate(conn, config, cluster, draft, embedder) -> dict:
         and wl >= _WILSON_MIN,
         "success_rate": round(rate, 3), "wilson_lb": round(wl, 3), "n": n}
 
-    # 3. probes — the shift must not have regressed the brain.
+    # 3. probes — the shift must not have regressed the brain. report.summary()
+    # carries its OWN "passed" key (the integer count of passing probes), so it
+    # MUST be spread first and overwritten by the boolean report.ok() last —
+    # otherwise `all(g["passed"] ...)` below reads the truthy count and a PARTIAL
+    # probe failure (any regression) would not veto promotion, contradicting the
+    # probes contract that any failure is a hard veto.
     report = run_probes(conn, config, embedder=embedder)
-    gates["probes"] = {"passed": report.ok(), **report.summary()}
+    gates["probes"] = {**report.summary(), "passed": report.ok()}
 
     passed = all(g.get("passed") for g in gates.values())
     return {"passed": passed, "gates": gates}

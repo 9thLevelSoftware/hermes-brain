@@ -609,7 +609,12 @@ def _remember(conn: sqlite3.Connection, args: dict, ctx: ToolContext) -> dict:
     # is quarantined out of the active-recall lanes exactly as the
     # extraction path quarantines it.
     scoped = trust not in ("owner", "agent")
-    scope_user = ctx.principal_id if scoped else None
+    # A scoped write MUST NOT be global. If the caller's principal is
+    # unresolved, fall back to a non-null sentinel so the row can never match
+    # another principal's recall (scope_user=NULL would make a non-owner write
+    # a GLOBAL fact — the very leak lines 606-608 promise cannot happen).
+    scope_user = (ctx.principal_id or f"unresolved:{ctx.session_id or 'anon'}") \
+        if scoped else None
     quarantine = scoped and _looks_instruction_shaped(text)
     status = "quarantined" if quarantine else "active"
 
