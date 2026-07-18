@@ -33,7 +33,6 @@ from __future__ import annotations
 import io
 import json
 
-import pytest
 from brain import config as brain_config
 from brain import tools
 from brain.capture import extract

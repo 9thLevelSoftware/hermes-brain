@@ -17,7 +17,6 @@ from __future__ import annotations
 from unittest import mock
 
 import pytest
-
 from conftest import seed_memory
 from faults import simulate_no_fts5
 
