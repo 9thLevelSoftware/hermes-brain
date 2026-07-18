@@ -36,11 +36,11 @@ cp docker/Dockerfile.hermes-mock docker/mock_llm.py docker/hermes_turn_driver.py
 cd "$B"
 
 # Phase 1 — loads under real Hermes; `hermes brain` CLI + provider lifecycle.
-docker build -f Dockerfile -t hermes-brain-live:phase1 .          # (Dockerfile == Dockerfile.hermes)
+docker build -f Dockerfile.hermes -t hermes-brain-live:phase1 .
 
 # Phase 2 — a mock OpenAI-compatible LLM drives a REAL agent turn + dream,
 # fully offline (no API key), asserting the brain captures + learns.
-docker build -f Dockerfile.mock -t hermes-brain-mock:live .       # (== Dockerfile.hermes-mock)
+docker build -f Dockerfile.hermes-mock -t hermes-brain-mock:live .
 docker run --rm hermes-brain-mock:live                            # re-demonstrates capture+recall
 ```
 
