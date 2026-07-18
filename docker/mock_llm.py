@@ -61,18 +61,6 @@ def _approx_tokens(text: str) -> int:
     return max(1, len(text or "") // 4)
 
 
-def _messages_text(messages: list) -> str:
-    parts = []
-    for m in messages or []:
-        c = m.get("content") if isinstance(m, dict) else None
-        if isinstance(c, str):
-            parts.append(c)
-        elif isinstance(c, list):  # multimodal
-            parts.extend(p.get("text", "") for p in c
-                         if isinstance(p, dict) and p.get("type") == "text")
-    return "\n".join(p for p in parts if p)
-
-
 def _system_text(messages: list) -> str:
     return "\n".join(
         m.get("content", "") for m in (messages or [])

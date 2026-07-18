@@ -5,9 +5,8 @@
 # covers the round-trips).
 FROM python:3.12-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends git \
-    && rm -rf /var/lib/apt/lists/*
-
+# git is a build-HOST tool (the README's `git archive` staging) — not needed in
+# the image: hermes-agent installs from the copied tree and nothing runs git.
 WORKDIR /hermes
 COPY hermes/ /hermes/
 # hermes-agent core deps are all manylinux wheels for py3.12 (no compiler).

@@ -25,8 +25,8 @@
 # resolves those tasks to the mock and the extraction sweep writes real memories.
 FROM python:3.12-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends git \
-    && rm -rf /var/lib/apt/lists/*
+# git is a build-HOST tool (the README's `git archive` staging) — not needed in
+# the image: hermes-agent installs from the copied tree and nothing runs git.
 
 # --- hermes-agent -----------------------------------------------------------
 WORKDIR /hermes

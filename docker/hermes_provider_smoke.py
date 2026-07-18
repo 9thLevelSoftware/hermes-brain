@@ -44,7 +44,7 @@ def main() -> int:
         try:
             fn(*args)
         except TypeError:
-            fn(*args[:1]) if args else None  # signature tolerance
+            fn(*args[:1])  # signature tolerance (args is always non-empty here)
 
     prov.shutdown()   # joins the brain-bg worker (<=5s), LLM-free at shutdown
     print("PROVIDER LIFECYCLE SMOKE OK")
