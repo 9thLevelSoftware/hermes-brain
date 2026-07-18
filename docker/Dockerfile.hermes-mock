@@ -1,0 +1,170 @@
+# syntax=docker/dockerfile:1
+# Phase 2 live-integration: a REAL hermes-agent + the brain memory plugin +
+# a stdlib MOCK OpenAI-compatible LLM, wired together so an actual agent turn
+# and dream cycle round-trip fully OFFLINE (no API key). Proves the brain
+# captures a memory from a real turn and the dream *learns* it through the LLM.
+#
+#   mock_llm.py            OpenAI-compatible chat-completions server (stdlib)
+#   hermes_turn_driver.py  runs a real AIAgent turn (streamed from the mock),
+#                          falling back to the raw MemoryProvider hook sequence
+#   /opt/run_live.sh       orchestrates: start mock -> capture -> dream -> assert
+#
+# BUILD CONTEXT (must be staged — the brain repo root is NOT the context):
+#   <context>/
+#     hermes/   a clean hermes-agent tree (e.g. from `git archive`)
+#     brain/    this repo, minus .git/.pytest_cache/__pycache__/.ruff_cache
+#     mock_llm.py            (this repo's docker/mock_llm.py)
+#     hermes_turn_driver.py  (this repo's docker/hermes_turn_driver.py)
+# Then:  DOCKER_BUILDKIT=1 docker build -f Dockerfile.hermes-mock -t hermes-brain-mock .
+# A green build == the brain captured + learned a memory through the mock LLM.
+# `docker run --rm hermes-brain-mock` re-demonstrates the whole round-trip.
+#
+# The brain's auxiliary tasks (brain_extract / brain_consolidate) AND the main
+# model are pointed at the mock via $HERMES_HOME/config.yaml. `hermes brain
+# dream-now` runs inside the real Hermes runtime, so `agent.auxiliary_client`
+# resolves those tasks to the mock and the extraction sweep writes real memories.
+FROM python:3.12-slim
+
+# git is a build-HOST tool (the README's `git archive` staging) — not needed in
+# the image: hermes-agent installs from the copied tree and nothing runs git.
+
+# --- hermes-agent -----------------------------------------------------------
+WORKDIR /hermes
+COPY hermes/ /hermes/
+RUN pip install --no-cache-dir . 2>&1 | tail -8
+
+# --- brain plugin -----------------------------------------------------------
+ENV HERMES_HOME=/hermes-home
+RUN mkdir -p /hermes-home/plugins /hermes-home/brain
+COPY brain/ /hermes-home/plugins/brain/
+RUN cp -r /hermes-home/plugins/brain/observer /hermes-home/plugins/brain_observer
+
+# --- Hermes config: select the brain provider + point the aux tasks AND the
+#     main model at the mock (custom OpenAI-compatible endpoint, dummy key). ---
+COPY <<'EOF' /hermes-home/config.yaml
+memory:
+  provider: brain          # activates the brain plugin's MemoryProvider hooks
+
+# Main chat model -> the mock (custom OpenAI-compatible endpoint). Hermes reads
+# a named entry from custom_providers[] matched by model.provider; the inline
+# api_key needs no auth store (OPENAI_API_KEY is host-gated to openai.com and
+# ignored for 127.0.0.1). The headless driver ALSO passes base_url/api_key
+# explicitly to AIAgent, so a real turn works even without this stanza.
+model:
+  provider: mock
+  default: mock-main
+  context_length: 131072   # >= 64K (Hermes min); explicit -> no metadata autodetect
+
+custom_providers:
+  - name: mock
+    base_url: "http://127.0.0.1:8080/v1"
+    api_key: "sk-mock-local-000"
+    model: mock-main
+    context_length: 131072
+
+# The brain's two auxiliary task slots (brain/llm.py:_TIER_TASK). base_url +
+# api_key => the auxiliary client builds a `custom` OpenAI SDK client to the
+# mock (agent/auxiliary_client.py:_resolve_task_provider_model).
+auxiliary:
+  brain_extract:
+    provider: custom
+    base_url: http://127.0.0.1:8080/v1
+    api_key: sk-mock-local-000
+    model: mock-extract
+  brain_consolidate:
+    provider: custom
+    base_url: http://127.0.0.1:8080/v1
+    api_key: sk-mock-local-000
+    model: mock-consolidate
+EOF
+
+# (No API-key env var needed: the custom endpoint uses the inline config
+# api_key, and OPENAI_API_KEY is host-gated to openai.com — ignored for
+# 127.0.0.1. A local endpoint works even with no key at all.)
+
+# --- brain.yaml: extraction active, no first-run bootstrap job (keeps the
+#     brain-bg worker free to flush the turn+marker within shutdown's 5s join),
+#     generous daily budget so the mock's (unpriced) tokens never gate. --------
+COPY <<'EOF' /hermes-home/brain/brain.yaml
+# hermes-brain configuration (flat key: value)
+extract_mode: active
+bootstrap_import: false
+day_budget_usd: 25.0
+EOF
+
+# --- the mock + the capture driver -----------------------------------------
+COPY mock_llm.py /opt/mock_llm.py
+COPY hermes_turn_driver.py /opt/hermes_turn_driver.py
+
+# --- orchestration: start mock -> drive a real turn -> dream -> assert -------
+COPY <<'EOF' /opt/run_live.sh
+#!/usr/bin/env bash
+# Offline live-integration run. Exits non-zero (fails the build) unless the
+# brain captured a memory AND the dream learned it through the mock LLM.
+set -uo pipefail
+PORT="${MOCK_PORT:-8080}"
+cd /hermes
+
+echo "===== [1/6] start mock OpenAI-compatible LLM ====="
+python /opt/mock_llm.py --port "$PORT" &
+MOCK_PID=$!
+cleanup() { kill "$MOCK_PID" 2>/dev/null || true; }
+trap cleanup EXIT
+
+python - "$PORT" <<'PY'
+import sys, time, urllib.request
+url = "http://127.0.0.1:%s/health" % sys.argv[1]
+for _ in range(100):
+    try:
+        urllib.request.urlopen(url, timeout=1)
+        print("mock ready"); sys.exit(0)
+    except Exception:
+        time.sleep(0.2)
+print("mock did not become ready", file=sys.stderr); sys.exit(1)
+PY
+[ $? -eq 0 ] || { echo "FAIL: mock LLM not ready"; exit 1; }
+
+echo "===== [2/6] drive a REAL capture turn through the provider hooks ====="
+python /opt/hermes_turn_driver.py || { echo "FAIL: capture driver"; exit 1; }
+
+echo "===== [3/6] hermes brain status  (BEFORE extraction) ====="
+hermes brain status | tee /tmp/status_before.txt || true
+
+echo "===== [4/6] hermes brain dream-now  (flush=extraction via the mock LLM) ====="
+hermes brain dream-now | tee /tmp/dream.txt || true
+
+echo "===== [5/6] hermes brain status  (AFTER extraction) ====="
+hermes brain status | tee /tmp/status_after.txt || true
+
+echo "===== [6/6] hermes brain search --no-episodes 'staging database' ====="
+hermes brain search --no-episodes "staging database" | tee /tmp/search.txt || true
+
+echo "===== assertions ====="
+fail=0
+if ! grep -Eq '^memories\.[a-z]+ +[1-9]' /tmp/status_after.txt; then
+  echo "ASSERT FAIL: no active memory learned (no 'memories.<type> N' line in status)"; fail=1
+else
+  echo "ASSERT OK: brain status shows a learned memory"
+fi
+if grep -q '(no matches)' /tmp/search.txt; then
+  echo "ASSERT FAIL: memory search returned '(no matches)'"; fail=1
+fi
+if ! grep -Eiq 'staging|postgres|fly\.io' /tmp/search.txt; then
+  echo "ASSERT FAIL: search did not return the staging-db fact"; fail=1
+else
+  echo "ASSERT OK: search returned the staging-db fact from a real memory"
+fi
+if [ "$fail" -ne 0 ]; then
+  echo "================ LIVE INTEGRATION: FAILED ================"; exit 1
+fi
+echo "================ LIVE INTEGRATION: PASSED ================"
+echo "The brain captured a turn and the dream learned the staging-db fact"
+echo "through the mock LLM — offline, no API key."
+EOF
+RUN chmod +x /opt/run_live.sh
+
+# Build-time proof: fails the image build if capture+learning didn't happen.
+RUN /opt/run_live.sh
+
+# `docker run` re-demonstrates the whole round-trip.
+CMD ["/opt/run_live.sh"]

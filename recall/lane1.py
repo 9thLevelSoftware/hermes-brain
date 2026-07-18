@@ -33,11 +33,25 @@ import sqlite3
 from types import SimpleNamespace
 from typing import Any
 
-from .. import __version__
 from ..store import db
 from .render import index_line
 
 logger = logging.getLogger(__name__)
+
+# Plugin version for the lane-1 stats line, resolved defensively. On the
+# ``hermes brain dream-now`` CLI path the host registers the parent package
+# (``_hermes_user_memory.brain``) as an EMPTY synthetic shell — see
+# hermes-agent plugins/memory/__init__.py:_register_synthetic_package — whose
+# ``__init__.py`` is never executed, so the package exposes no ``__version__``
+# attribute and ``__file__ is None``. A hard ``from .. import __version__``
+# then raises ``ImportError: cannot import name '__version__' from
+# '_hermes_user_memory.brain' (unknown location)`` and kills the lane1
+# strategy. getattr-with-fallback works under BOTH the real synthetic package
+# and standalone ``brain`` (where ``__init__.py`` defines it).
+try:
+    from .. import __version__ as _BRAIN_VERSION
+except ImportError:  # synthetic-shell parent with no executed __init__
+    _BRAIN_VERSION = "0"
 
 # Live current-truth predicate — the only rows lane 1 may ever index.
 _CURRENT = "valid_to IS NULL AND status = 'active' AND live = 1"
@@ -121,7 +135,7 @@ def materialize(conn: sqlite3.Connection, config: dict[str, Any]) -> int:
     epi_count = conn.execute("SELECT COUNT(*) AS n FROM episodes").fetchone()["n"]
     rows.append((
         "stats", 0, None,
-        f"{mem_count} memories · {epi_count} episodes · brain v{__version__}",
+        f"{mem_count} memories · {epi_count} episodes · brain v{_BRAIN_VERSION}",
     ))
     rows.append(("stats", 1, None, _STATS_HINT))
 
