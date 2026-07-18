@@ -1,0 +1,16 @@
+# Shell scripts and Dockerfiles run in Linux containers (and host bash) — they
+# MUST have LF endings regardless of the checkout platform, or a CRLF shebang/
+# line breaks bash ("bad interpreter") and BuildKit heredocs embed \r into the
+# scripts they write. Force LF on checkout for these, everywhere.
+*.sh            text eol=lf
+Dockerfile*     text eol=lf
+*.Dockerfile    text eol=lf
+
+# Normalize Python/text to LF in the repo too (the working copy can be CRLF on
+# Windows; what ships in commits and images stays LF).
+*.py            text eol=lf
+*.yaml          text eol=lf
+*.yml           text eol=lf
+*.md            text eol=lf
+*.sql           text eol=lf
+*.json          text eol=lf
