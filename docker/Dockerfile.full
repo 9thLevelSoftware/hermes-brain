@@ -1,0 +1,28 @@
+# Full-tier smoke test: the optional retrieval stack (ONNX + tokenizers +
+# sqlite-vec + numpy) and the lite tier (model2vec) installed, still with NO
+# hermes-agent. With sqlite-vec present the vector/graph/rerank paths load and
+# the vec-gated tests run (models are NOT downloaded — embedders degrade and
+# the suite uses the stub embedder for determinism).
+FROM python:3.12-slim
+
+WORKDIR /plugin
+
+# Full + lite tier deps + dev tools. (build-essential is not needed — all of
+# these publish manylinux wheels.)
+RUN pip install --no-cache-dir \
+        pytest ruff \
+        onnxruntime tokenizers sqlite-vec numpy model2vec
+
+COPY . /plugin
+
+# Eager-import must still be clean with the heavy deps present.
+RUN python docker/smoke_imports.py
+
+# Full suite — now the sqlite-vec-gated tests actually run.
+RUN python -m pytest -p no:cacheprovider -q
+
+# Real hook sequence + CI invariants on the full tier.
+RUN python replay/run.py --fixture tests/fixtures/session_basic.json \
+        --assert-lane1-stable --budget-check
+
+CMD ["python", "-c", "print('hermes-brain full-tier smoke: OK')"]

@@ -19,6 +19,51 @@ def _clear_llm_override():
     llm.set_llm_for_tests(None)
 
 
+@pytest.fixture(autouse=True)
+def _fake_agent(monkeypatch):
+    """Make the B2 real-usage path hermetic: install fake agent.usage_pricing +
+    agent.auxiliary_client so these tests pass WITHOUT hermes-agent installed
+    (CLAUDE.md: the suite runs standalone). The fake pricing is deterministic
+    and IS what the assertions check — decoupling them from the mutable host
+    price snapshot. Tests that import agent.auxiliary_client / call _extract_usage
+    resolve to these fakes."""
+    import sys
+    import types
+
+    prices = {  # $ per token: (input, output)
+        "claude-haiku-4-5": (1.00 / 1e6, 5.00 / 1e6),
+        "gpt-4o-mini": (0.15 / 1e6, 0.60 / 1e6),
+    }
+
+    def normalize_usage(raw, provider=None):
+        return types.SimpleNamespace(
+            prompt_tokens=int(getattr(raw, "prompt_tokens", 0) or 0),
+            output_tokens=int(getattr(raw, "completion_tokens", 0) or 0),
+            reasoning_tokens=int(getattr(raw, "reasoning_tokens", 0) or 0))
+
+    def estimate_usage_cost(model, usage, provider=None):
+        p = prices.get(model)
+        amount = (usage.prompt_tokens * p[0] + usage.output_tokens * p[1]
+                  if p else None)
+        return types.SimpleNamespace(amount_usd=amount)
+
+    def call_llm(task, **kwargs):  # replaced per-test via monkeypatch
+        raise RuntimeError("call_llm must be patched by the test")
+
+    up = types.ModuleType("agent.usage_pricing")
+    up.normalize_usage = normalize_usage
+    up.estimate_usage_cost = estimate_usage_cost
+    ac = types.ModuleType("agent.auxiliary_client")
+    ac.call_llm = call_llm
+    ac.extract_content_or_reasoning = lambda r: (r.choices[0].message.content or "")
+    pkg = types.ModuleType("agent")
+    pkg.usage_pricing = up
+    pkg.auxiliary_client = ac
+    monkeypatch.setitem(sys.modules, "agent", pkg)
+    monkeypatch.setitem(sys.modules, "agent.usage_pricing", up)
+    monkeypatch.setitem(sys.modules, "agent.auxiliary_client", ac)
+
+
 def _cfg(**overrides):
     cfg = dict(DEFAULTS)
     cfg.update(overrides)
