@@ -1,0 +1,37 @@
+# Phase 1 live-integration smoke: a REAL hermes-agent with the brain plugin
+# installed. Proves the plugin loads under Hermes's own plugin loader, registers
+# the `hermes brain` CLI, and its provider hook lifecycle works in-process. No
+# LLM key: LLM-dependent paths degrade to LLMUnavailable (a mock-LLM Phase 2
+# covers the round-trips).
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /hermes
+COPY hermes/ /hermes/
+# hermes-agent core deps are all manylinux wheels for py3.12 (no compiler).
+RUN pip install --no-cache-dir . 2>&1 | tail -8
+
+ENV HERMES_HOME=/hermes-home
+RUN mkdir -p /hermes-home/plugins
+COPY brain/ /hermes-home/plugins/brain/
+# the companion observer installs as its OWN top-level plugin
+RUN cp -r /hermes-home/plugins/brain/observer /hermes-home/plugins/brain_observer
+# select the brain as the memory provider
+RUN printf 'memory:\n  provider: brain\n' > /hermes-home/config.yaml
+
+# 1. The `hermes` CLI eagerly loads the ACTIVE provider's cli.py through the real
+#    plugin loader — so `hermes brain <verb>` running at all proves the plugin
+#    (and every stdlib-only root module) loads inside a real Hermes process.
+RUN hermes brain --help 2>&1 | head -40
+RUN echo "=== doctor ===" && hermes brain doctor 2>&1 | tail -40 || echo "[doctor exit nonzero]"
+RUN echo "=== bootstrap ===" && hermes brain bootstrap 2>&1 | tail -15 || echo "[bootstrap exit nonzero]"
+RUN echo "=== status ===" && hermes brain status 2>&1 | tail -25 || echo "[status exit nonzero]"
+RUN echo "=== dream-now (LLM strategies degrade) ===" && hermes brain dream-now 2>&1 | tail -25 || echo "[dream exit nonzero]"
+
+# 2. Drive the MemoryProvider hook lifecycle through Hermes's OWN memory loader.
+COPY hermes_provider_smoke.py /hermes_provider_smoke.py
+RUN python /hermes_provider_smoke.py
+
+CMD ["hermes", "brain", "status"]
