@@ -60,6 +60,7 @@ EOF
 COPY mock_llm.py /opt/mock_llm.py
 COPY driver.py /opt/driver.py
 COPY mcp_client.py /opt/mcp_client.py
+COPY coexistence_check.py /opt/coexistence_check.py
 
 COPY <<'EOF' /opt/run_live_adv.sh
 #!/usr/bin/env bash
@@ -123,6 +124,11 @@ m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 sys.exit(0 if hasattr(m, "register") else 1)
 PY
 [ $? -eq 0 ] && note OK "observer plugin registers" || note FAIL "observer plugin"
+
+echo "===== [8] coexistence: provider isolation + curator survival ====="
+python /opt/coexistence_check.py \
+  && note OK "coexistence (honcho intact + selectable; brain skill survives curator)" \
+  || note FAIL "coexistence"
 
 echo "===== result ====="
 if [ "$fail" -ne 0 ]; then echo "======== LIVE ADVERSARIAL: FAILED ========"; exit 1; fi
