@@ -131,19 +131,21 @@ def held_write_lock(hermes_home):
 
 @contextlib.contextmanager
 def sqlite_write_error(conn: sqlite3.Connection):
-    """Fast alternative to held_write_lock: make the NEXT write on ``conn``
-    raise OperationalError, for unit tests that only need to prove the
-    swallow-and-no-op behavior without waiting on busy_timeout."""
-    real = conn.execute
+    """Fast alternative to held_write_lock: make every WRITE on ``conn`` raise
+    OperationalError for the duration, for unit tests that only need to prove
+    the swallow-and-no-op behavior without waiting on busy_timeout.
 
-    def _boom(sql, *a, **k):
-        stripped = sql.lstrip().upper()
-        if stripped.startswith(("INSERT", "UPDATE", "DELETE")):
-            raise sqlite3.OperationalError("database is locked (injected)")
-        return real(sql, *a, **k)
-
-    with mock.patch.object(conn, "execute", _boom):
+    Uses ``PRAGMA query_only`` rather than patching ``conn.execute`` —
+    ``sqlite3.Connection.execute`` is a read-only C slot that cannot be
+    monkeypatched (``AttributeError: attribute 'execute' is read-only``). Under
+    query_only, reads still work and any INSERT/UPDATE/DELETE raises "attempt to
+    write a readonly database"."""
+    conn.execute("PRAGMA query_only=ON")
+    try:
         yield
+    finally:
+        with contextlib.suppress(sqlite3.Error):
+            conn.execute("PRAGMA query_only=OFF")
 
 
 # ---------------------------------------------------------------------------

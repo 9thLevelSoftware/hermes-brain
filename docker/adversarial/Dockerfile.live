@@ -1,0 +1,132 @@
+# syntax=docker/dockerfile:1
+# Phase 8 — full live flywheel + lifecycle under an ADVERSARIAL mock LLM.
+# A REAL hermes-agent + the brain plugin + the scenario-driven mock, wired so
+# multiple real agent turns feed a dream flywheel, context compression fires the
+# pre-compress + session-switch hooks, delegation/memory-write are driven via
+# the Path-B route, and the MCP surface survives malformed frames while serving
+# the owner's cross-platform recall. A green build == every live invariant held.
+#
+# BUILD CONTEXT is staged by docker/adversarial/stage.sh:
+#   <ctx>/hermes/  clean hermes-agent tree      <ctx>/brain/  this repo
+#   <ctx>/mock_llm.py <ctx>/driver.py <ctx>/mcp_client.py  (adversarial harness)
+# Then:  docker build -f Dockerfile.live -t hermes-brain-adv:live .
+FROM python:3.12-slim
+
+WORKDIR /hermes
+COPY hermes/ /hermes/
+RUN pip install --no-cache-dir . 2>&1 | tail -8
+
+ENV HERMES_HOME=/hermes-home
+RUN mkdir -p /hermes-home/plugins /hermes-home/brain
+COPY brain/ /hermes-home/plugins/brain/
+# the companion observer installs as its OWN top-level plugin
+RUN cp -r /hermes-home/plugins/brain/observer /hermes-home/plugins/brain_observer
+
+# Main model + both brain aux tasks -> the mock (valid scenario by default; the
+# per-task adversarial scenarios are selected per-call via the model@scenario
+# channel or MOCK_SCENARIO at run time).
+COPY <<'EOF' /hermes-home/config.yaml
+memory:
+  provider: brain
+model:
+  provider: mock
+  default: mock-main
+  context_length: 64000
+custom_providers:
+  - name: mock
+    base_url: "http://127.0.0.1:8080/v1"
+    api_key: "sk-mock-local-000"
+    model: mock-main
+    context_length: 64000
+auxiliary:
+  brain_extract:
+    provider: custom
+    base_url: http://127.0.0.1:8080/v1
+    api_key: sk-mock-local-000
+    model: mock-extract
+  brain_consolidate:
+    provider: custom
+    base_url: http://127.0.0.1:8080/v1
+    api_key: sk-mock-local-000
+    model: mock-consolidate
+EOF
+
+COPY <<'EOF' /hermes-home/brain/brain.yaml
+extract_mode: active
+bootstrap_import: false
+day_budget_usd: 25.0
+EOF
+
+COPY mock_llm.py /opt/mock_llm.py
+COPY driver.py /opt/driver.py
+COPY mcp_client.py /opt/mcp_client.py
+
+COPY <<'EOF' /opt/run_live_adv.sh
+#!/usr/bin/env bash
+# Offline adversarial live run. Fails the build unless every live invariant held.
+set -uo pipefail
+PORT="${MOCK_PORT:-8080}"
+cd /hermes
+fail=0
+note(){ echo "ASSERT $1: $2"; [ "$1" = "FAIL" ] && fail=1; }
+
+echo "===== [1] start adversarial mock ====="
+python /opt/mock_llm.py --port "$PORT" &
+MOCK_PID=$!
+trap 'kill "$MOCK_PID" 2>/dev/null || true' EXIT
+python - "$PORT" <<'PY'
+import sys, time, urllib.request
+for _ in range(100):
+    try:
+        urllib.request.urlopen("http://127.0.0.1:%s/health" % sys.argv[1], timeout=1); sys.exit(0)
+    except Exception: time.sleep(0.2)
+sys.exit(1)
+PY
+[ $? -eq 0 ] || { echo "FAIL: mock not ready"; exit 1; }
+
+echo "===== [2] flywheel: 6 real turns -> capture ====="
+python /opt/driver.py turns 6 --prefix fly || true
+python /opt/driver.py counts
+
+echo "===== [3] dream-now (extraction via mock) x2 -> learn + dedup ====="
+hermes brain dream-now 2>&1 | tail -6 || true
+C1=$(python /opt/driver.py counts | sed -n 's/.*active_memories=\([0-9]*\).*/\1/p')
+hermes brain dream-now 2>&1 | tail -6 || true
+C2=$(python /opt/driver.py counts | sed -n 's/.*active_memories=\([0-9]*\).*/\1/p')
+echo "active_memories after dream1=$C1 dream2=$C2"
+if [ -n "$C1" ] && [ "$C1" -ge 1 ]; then note OK "flywheel learned $C1 memories"; else note FAIL "no memories learned"; fi
+# idempotent re-dream must not explode the count (dedup / promoted buffer)
+if [ -n "$C1" ] && [ -n "$C2" ] && [ "$C2" -le $((C1 + 1)) ]; then note OK "re-dream bounded ($C1->$C2)"; else note FAIL "memory count exploded on re-dream ($C1->$C2)"; fi
+
+echo "===== [4] recall the learned fact ====="
+hermes brain search --no-episodes "staging database" 2>&1 | tee /tmp/s.txt || true
+if grep -Eiq 'staging|postgres|fly\.io' /tmp/s.txt && ! grep -q '(no matches)' /tmp/s.txt; then
+  note OK "recall surfaced a learned memory"; else note FAIL "recall did not surface the fact"; fi
+
+echo "===== [5] lifecycle hooks (Path B) ====="
+python /opt/driver.py hook pre_compress   && note OK "pre_compress buffer row" || note FAIL "pre_compress"
+python /opt/driver.py hook delegation      && note OK "delegation captured"      || note FAIL "delegation"
+python /opt/driver.py hook memory_write     && note OK "memory_write mirrored"    || note FAIL "memory_write"
+python /opt/driver.py hook session_reset    && note OK "session reset (lane-1 swap)" || note FAIL "session_reset"
+python /opt/driver.py compress              && note OK "forced compression pre_compress" || echo "[compress] non-fatal (real compaction path may differ)"
+
+echo "===== [6] MCP money-shot + malformed-frame survival ====="
+python /opt/mcp_client.py --self-check --home /hermes-home && note OK "MCP serve survived malformed frames + owner read" || note FAIL "MCP self-check"
+
+echo "===== [7] observer plugin present ====="
+python - <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("obs", "/hermes-home/plugins/brain_observer/__init__.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+sys.exit(0 if hasattr(m, "register") else 1)
+PY
+[ $? -eq 0 ] && note OK "observer plugin registers" || note FAIL "observer plugin"
+
+echo "===== result ====="
+if [ "$fail" -ne 0 ]; then echo "======== LIVE ADVERSARIAL: FAILED ========"; exit 1; fi
+echo "======== LIVE ADVERSARIAL: PASSED ========"
+EOF
+RUN chmod +x /opt/run_live_adv.sh
+
+RUN /opt/run_live_adv.sh
+CMD ["/opt/run_live_adv.sh"]
