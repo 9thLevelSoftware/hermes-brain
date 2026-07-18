@@ -53,9 +53,11 @@ tar -C "$BRAIN_ROOT" \
     -cf - . | tar -C "$OUT/brain" -xf -
 
 echo "staging adversarial harness" >&2
-# Flatten the harness scripts to the context root so Dockerfiles COPY them by name.
+# Flatten the harness scripts + phase Dockerfiles to the context root so the
+# build can find them by name (docker build -f Dockerfile.live from $CTX).
 cp "$HERE"/*.py "$OUT"/ 2>/dev/null || true
 cp "$HERE"/*.sh "$OUT"/ 2>/dev/null || true
+cp "$HERE"/Dockerfile* "$OUT"/ 2>/dev/null || true
 # Also carry the base docker mock (some phases reuse the valid-only one).
 cp "$BRAIN_ROOT/docker/mock_llm.py" "$OUT/base_mock_llm.py" 2>/dev/null || true
 
