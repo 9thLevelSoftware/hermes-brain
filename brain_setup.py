@@ -46,6 +46,11 @@ def config_schema() -> list[dict[str, Any]]:
                         "needs HF_TOKEN)",
          "choices": sorted(REGISTRY),
          "default": DEFAULTS["embed_model"]},
+        {"key": "rerank",
+         "description": "Late-interaction ColBERT rerank of results "
+                        "(auto = on when the model is present; full tier only)",
+         "choices": ["auto", "off"],
+         "default": DEFAULTS["rerank"]},
         {"key": "dream_schedule",
          "description": "When the dream cycle runs (auto = cron if gateway detected)",
          "choices": ["auto", "cron", "on-idle", "manual"],
