@@ -95,8 +95,8 @@ def _insert(conn, content, **cols) -> int:
 def _ensure_vec(conn, emb) -> None:
     from brain.store import vec as vec_store
 
-    assert vec_store.ensure_tables(conn, dim=256, embedder_name=emb.name), \
-        "sqlite-vec unavailable — vector-gate tests require the vec extension"
+    if not vec_store.ensure_tables(conn, dim=256, embedder_name=emb.name):
+        pytest.skip("sqlite-vec unavailable — vector-gate tests need the vec extension")
 
 
 def _rows(conn, ids):
