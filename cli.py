@@ -1760,9 +1760,14 @@ def _review_decide(conn, args) -> int:
                           file=sys.stderr)
                     return 1
                 rec = skilltree.read_usage(home).get(name, {})
+                # Reset the health window on revision (P2): the old hurt/helped
+                # counters describe the PRE-revision skill; leaving them would
+                # let the next dream run re-propose a revision from stale
+                # failures. The host re-accumulates from real post-revision use.
                 skilltree.write_usage_record(home, name, {
                     "patch_count": int(rec.get("patch_count") or 0) + 1,
-                    "last_patched_at": db.iso_now()})
+                    "last_patched_at": db.iso_now(),
+                    "helped": 0, "hurt": 0, "neutral": 0, "outcome_counts": {}})
                 msg = f"revised skill '{name}' ({len(sections)} section(s) replaced)"
             conn.execute("UPDATE proposals SET status='applied', decided_at=?, "
                          "decided_by='cli' WHERE uid=?", (db.iso_now(), row["uid"]))

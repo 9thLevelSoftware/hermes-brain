@@ -255,31 +255,29 @@ def _span_from(text: str, start: int) -> str | None:
 
 def _budget_gate(conn: sqlite3.Connection, config: dict[str, Any]) -> None:
     day = db.iso_now()[:10]
-    spent_usd, used_tokens = conn.execute(
+    # Real priced spend (B2 est_usd) PLUS a token-proxy for the UNPRICED rows
+    # (est_usd=0: pre-B2 rows, unrecognised routes, and — the case that matters
+    # — no-usage/failure calls). Counting both in one budget means a wedged
+    # provider spewing unpriced failures still trips the gate even after a
+    # cheap priced success (mixed priced/unpriced). When NOTHING is priced this
+    # cleanly degrades to the pure token proxy (backward-compat).
+    spent_usd, unpriced_tokens = conn.execute(
         "SELECT COALESCE(SUM(est_usd), 0.0), "
-        "COALESCE(SUM(tokens_in + tokens_out), 0) FROM llm_ledger "
-        "WHERE ts LIKE ?",
+        "COALESCE(SUM(CASE WHEN est_usd > 0 THEN 0 "
+        "               ELSE tokens_in + tokens_out END), 0) "
+        "FROM llm_ledger WHERE ts LIKE ?",
         (day + "%",),
     ).fetchone()
     spent_usd = float(spent_usd or 0.0)
-    used_tokens = int(used_tokens or 0)
+    proxy_usd = int(unpriced_tokens or 0) / _TOKENS_PER_USD
     budget_usd = float(config.get("day_budget_usd", 1.5))
-    # Prefer the real priced spend when any row today carries an est_usd (B2).
-    # Pre-B2 rows and unpriced routes record est_usd=0.0, so when nothing is
-    # priced this cleanly degrades to the crude token proxy (backward-compat).
-    if spent_usd > 0.0:
-        if spent_usd > budget_usd:
-            raise LLMUnavailable(
-                f"daily brain LLM budget reached (${spent_usd:.4f} metered "
-                f"today > ${budget_usd:.2f}); calls resume tomorrow UTC — or "
-                "raise day_budget_usd in brain.yaml"
-            )
-        return
-    if used_tokens > budget_usd * _TOKENS_PER_USD:
+    total_usd = spent_usd + proxy_usd
+    if total_usd > budget_usd:
         raise LLMUnavailable(
-            f"daily brain LLM budget reached ({used_tokens} tokens today > "
-            f"${budget_usd:.2f} * {_TOKENS_PER_USD} tokens/USD proxy); calls "
-            "resume tomorrow UTC — or raise day_budget_usd in brain.yaml"
+            f"daily brain LLM budget reached (${spent_usd:.4f} priced + "
+            f"${proxy_usd:.4f} token-proxy = ${total_usd:.4f} today > "
+            f"${budget_usd:.2f}); calls resume tomorrow UTC — or raise "
+            "day_budget_usd in brain.yaml"
         )
 
 

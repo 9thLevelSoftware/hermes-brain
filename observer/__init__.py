@@ -67,6 +67,9 @@ _DISABLED = os.environ.get(
 # Bound on the in-memory hand-off queue: signals are best-effort telemetry, so
 # under sustained backpressure we drop rather than grow memory or slow a turn.
 _MAX_PENDING = 2048
+# Max signals drained into ONE connection + ONE commit. Batching turns a burst
+# of tool-call hooks into a single fsync instead of one open/commit per signal.
+_DRAIN_BATCH = 256
 
 
 # ---------------------------------------------------------------------------
@@ -142,28 +145,44 @@ class _SignalWriter:
                 continue
             if item is None:
                 return
-            task, payload = item
-            try:
-                self._write(task, payload)
-            except Exception:
-                logger.debug("brain-observer: signal write failed", exc_info=True)
+            batch = [item]
+            # Drain whatever else is already queued so a burst of hooks becomes
+            # ONE connection + ONE commit (one fsync) rather than one per signal.
+            while len(batch) < _DRAIN_BATCH:
+                try:
+                    nxt = self._q.get_nowait()
+                except queue.Empty:
+                    break
+                if nxt is None:
+                    self._flush(batch)
+                    return
+                batch.append(nxt)
+            self._flush(batch)
 
     @staticmethod
-    def _write(task: str, payload: dict[str, Any]) -> None:
+    def _flush(batch: list[tuple[str, dict[str, Any]]]) -> None:
+        # Honour the kill switch LIVE (re-read at write time, not just at
+        # import): BRAIN_OBSERVER_DISABLE=1 silences the writer even for signals
+        # already in flight. Never create the DB/schema — that is the brain's
+        # job; if the brain has never initialized, drop the signals.
+        if not batch or os.environ.get(
+                "BRAIN_OBSERVER_DISABLE", "").strip().lower() in {"1", "true", "yes", "on"}:
+            return
         db_path = _brain_db_path()
-        # Never create the DB or the schema — that is the brain's job. If the
-        # brain has never initialized, drop the signal.
         if db_path is None or not db_path.exists():
             return
         conn = None
         try:
             conn = sqlite3.connect(str(db_path), timeout=2.0)
             conn.execute("PRAGMA busy_timeout=2000")
-            conn.execute(
+            conn.executemany(
                 "INSERT INTO work_queue(task, payload, created_at) VALUES(?,?,?)",
-                (task, json.dumps(payload, separators=(",", ":")), _iso_now()),
+                [(task, json.dumps(payload, separators=(",", ":")), _iso_now())
+                 for task, payload in batch],
             )
             conn.commit()
+        except Exception:
+            logger.debug("brain-observer: batch signal write failed", exc_info=True)
         finally:
             if conn is not None:
                 try:

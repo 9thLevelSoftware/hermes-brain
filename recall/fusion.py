@@ -21,32 +21,6 @@ def rrf(rankings: Sequence[list[Hashable]], k: int = RRF_K) -> dict[Hashable, fl
     return scores
 
 
-def weighted_rrf(
-    rankings: Sequence[list[Hashable]],
-    weights: Sequence[float],
-    k: int = RRF_K,
-) -> dict[Hashable, float]:
-    """Per-leg-weighted RRF: score(item) = Σ_legs w_leg / (k + rank_in_leg).
-
-    ``weights`` is parallel to ``rankings`` — one convex multiplier per leg; a
-    leg past the end of ``weights`` defaults to 1.0. Plain ``rrf`` is exactly
-    this with every weight 1.0, so an approved fusion-weight proposal whose
-    weights are all 1.0 reproduces today's behavior.
-
-    DORMANT plumbing (memory-engine.md §3.7): live retrieval (recall/search.py)
-    still fuses with the unweighted ``rrf`` above, and the weight fit
-    (recall/fit_weights.py -> dream/tune.py) is shadow-only. This function
-    exists so a FUTURE, human-approved tuning proposal has a fusion path to
-    flow into. Nothing calls it yet.
-    """
-    scores: dict[Hashable, float] = {}
-    for leg, ranking in enumerate(rankings):
-        weight = weights[leg] if leg < len(weights) else 1.0
-        for rank, item in enumerate(ranking, start=1):
-            scores[item] = scores.get(item, 0.0) + weight / (k + rank)
-    return scores
-
-
 def normalized(scores: dict[Hashable, float], floor: float = 0.2) -> dict[Hashable, float]:
     """Min-max to [floor, 1] (same band discipline as the bm25 path)."""
     if not scores:

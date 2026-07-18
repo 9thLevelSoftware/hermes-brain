@@ -165,27 +165,28 @@ def _run(shift: Shift) -> dict:
                          "to": "tombstone"})
         home = shift.config.get("hermes_home")
         purged_n = 0
-        for row in purge:
-            # Correctness gate: preserve the raw text in the episodic archive
-            # BEFORE nulling the live content, so the demotion is truly
-            # non-destructive. If archiving fails (no home, I/O error), skip
-            # this row's purge — it stays a tombstone and retries next run
-            # rather than losing raw text.
-            ref = archive.append(home, {
-                "uid": row["uid"], "kind": "memory", "content": row["content"],
-                "summary": row["summary"], "recorded_at": row["recorded_at"],
-            }) if home else None
-            if ref is None:
-                continue
-            stub = (row["summary"] or (row["content"] or "")[:_STUB_CHARS]).strip()
-            refs = _append_source_ref(row["source_refs"], ref)
-            shift.conn.execute(
-                "UPDATE memories SET content=NULL, summary=?, source_refs=? WHERE id=?",
-                (stub or None, refs, row["id"]))
-            shift.audit("forget_purge", row["uid"],
-                        {"stub_kept": bool(stub), "archive_ref": ref,
-                         "note": "content archived to episodic archive before purge"})
-            purged_n += 1
+        # Correctness gate: preserve the raw text in the episodic archive BEFORE
+        # nulling live content, so demotion is non-destructive. Archive ALL
+        # purge candidates in ONE batch (one gzip open, not one per row); any
+        # row whose archiving failed comes back as ref=None and is left a
+        # tombstone to retry next run, so raw text is never lost.
+        if home and purge:
+            records = [{"uid": r["uid"], "kind": "memory", "content": r["content"],
+                        "summary": r["summary"], "recorded_at": r["recorded_at"]}
+                       for r in purge]
+            for row, ref in zip(purge, archive.append_batch(home, records),
+                                strict=True):
+                if ref is None:
+                    continue
+                stub = (row["summary"] or (row["content"] or "")[:_STUB_CHARS]).strip()
+                refs = _append_source_ref(row["source_refs"], ref)
+                shift.conn.execute(
+                    "UPDATE memories SET content=NULL, summary=?, source_refs=?"
+                    " WHERE id=?", (stub or None, refs, row["id"]))
+                shift.audit("forget_purge", row["uid"],
+                            {"stub_kept": bool(stub), "archive_ref": ref,
+                             "note": "content archived (batched) before purge"})
+                purged_n += 1
         counts["purged"] = purged_n
         if demote or tombstone or purged_n:
             db.bump_generation(shift.conn)

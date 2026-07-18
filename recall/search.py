@@ -365,7 +365,13 @@ def _scope_memories(sql: str, params: list, principal_id: str | None,
     """Non-owner callers see unscoped memories or their own (finding #17)."""
     if trust_tier == "owner":
         return sql
-    sql += " AND (m.scope_user IS NULL OR m.scope_user = ?)"
+    # A peer_card is the OWNER's private theory-of-mind of a person, stored
+    # scope_user=<that person> — so the plain scope rule would hand it to the
+    # very peer it describes. Peer cards surface ONLY via the owner-only
+    # guidance path; a non-owner must never retrieve one through generic recall
+    # (P1: peer_card scope leak). Central belt-and-braces for every call site.
+    sql += (" AND (m.scope_user IS NULL OR m.scope_user = ?)"
+            " AND (m.kind IS NULL OR m.kind != 'peer_card')")
     params.append(principal_id or "")
     return sql
 

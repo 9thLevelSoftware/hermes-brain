@@ -709,7 +709,7 @@ class BrainProvider(MemoryProvider):
         hits = search(
             conn, query_text, limit=8,
             exclude_session=session_id,
-            exclude_kinds=("strategy", "guardrail", "case"),
+            exclude_kinds=("strategy", "guardrail", "case", "peer_card"),
             principal_id=principal_id,
             source_author=source_author,
             trust_tier=trust_tier,

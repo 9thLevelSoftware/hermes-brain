@@ -24,7 +24,8 @@ s_rerank) vector would need a schema change that is out of scope for this
 slice). Per labeled candidate row: leg-membership indicators (fts / vec / ppr,
 parsed from the ``leg`` column) plus the standardized fused ``rank_score``.
 The learned coefficient on each leg-membership indicator IS that leg's proposed
-convex weight — which is exactly what recall/fusion.py:weighted_rrf consumes.
+convex weight (a future, human-approved tuning proposal would feed these into a
+weighted fusion path; live retrieval still fuses with the unweighted rrf).
 
 Label (helpful=1 / harmful=0): the injection -> outcome join the whole learning
 system rests on. A row is labeled by resolving ``resolved_turn_id`` (filled by
@@ -47,9 +48,9 @@ import sqlite3
 
 logger = logging.getLogger(__name__)
 
-# The three RRF fusion legs weighted_rrf can consume. `guidance` (separate
-# injection channel, rank_score NULL) and `like` (no-FTS5 degraded fallback)
-# are NOT fusion legs, so their rows are excluded from the fit.
+# The three RRF fusion legs a weighted fusion would consume. `guidance`
+# (separate injection channel, rank_score NULL) and `like` (no-FTS5 degraded
+# fallback) are NOT fusion legs, so their rows are excluded from the fit.
 _FUSED_LEGS = ("fts", "vec", "ppr")
 
 _MAX_ROWS = 20_000          # labeled rows scanned from retrieval_log (bounded)

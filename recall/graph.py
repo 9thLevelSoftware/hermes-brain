@@ -26,6 +26,10 @@ logger = logging.getLogger(__name__)
 
 _DAMPING = 0.5
 _ITERS = 25
+# Keep every dynamic IN-clause well under SQLite's default 999-variable limit,
+# so a hot seed/entity set can't raise and (via the outer except) silently drop
+# the whole graph leg. _edge_neighbors binds 2x the seeds, so seeds get half.
+_MAX_SQL_VARS = 900
 
 
 def ppr_leg(conn, seed_ids, *, limit: int = 24, max_nodes: int = 400,
@@ -41,10 +45,13 @@ def ppr_leg(conn, seed_ids, *, limit: int = 24, max_nodes: int = 400,
 
 
 def _ppr(conn, seed_ids, limit, max_nodes, per_entity_cap) -> list[int]:
-    seeds = [int(s) for s in dict.fromkeys(seed_ids) if s is not None]
+    seeds = [int(s) for s in dict.fromkeys(seed_ids)
+             if s is not None][:_MAX_SQL_VARS // 2]
     if not seeds:
         return []
     ent_ids = ent.entities_of(conn, seeds)
+    if len(ent_ids) > _MAX_SQL_VARS:
+        ent_ids = set(sorted(ent_ids)[:_MAX_SQL_VARS])  # deterministic bound
     edge_nbrs = _edge_neighbors(conn, seeds)
     if not ent_ids and not edge_nbrs:
         return []  # seeds are graph-isolated — nothing to propagate over

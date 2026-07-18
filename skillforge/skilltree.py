@@ -348,12 +348,20 @@ def brain_owned_skills(hermes_home: str | Path) -> list[tuple[str, Path]]:
     out: list[tuple[str, Path]] = []
     if not root.exists():
         return out
+    usage = read_usage(hermes_home)   # read once so we can skip retired records
     try:
         for md in root.rglob("SKILL.md"):
             if ".archive" in md.parts or ".hub" in md.parts:
                 continue
-            if read_frontmatter(md).get("created_by") == "hermes-brain":
-                out.append((md.parent.name, md))
+            if read_frontmatter(md).get("created_by") != "hermes-brain":
+                continue
+            # A retired skill is marked state='stale' (the curator archives it);
+            # skip it so `revise` never rediscovers the same on-disk file and
+            # emits another retirement proposal before the archiver moves it.
+            state = str(usage.get(md.parent.name, {}).get("state") or "").lower()
+            if state in ("stale", "archived"):
+                continue
+            out.append((md.parent.name, md))
     except OSError:
         pass
     return out

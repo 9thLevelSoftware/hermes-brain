@@ -144,6 +144,9 @@ def _revise_once(conn, config, shift_id) -> dict:
         if draft.get("skipped_llm"):
             summary["skipped_llm"] += 1        # LLM down -> retry next run
             continue
+        if draft.get("skipped"):
+            summary["skipped_empty"] = summary.get("skipped_empty", 0) + 1
+            continue                            # nothing usable to propose
         summary["revisions"] += 1
         revisions_left -= 1
 
@@ -165,7 +168,10 @@ def _harm_verdict(outcomes: dict) -> dict:
     helped, hurt, total = outcomes["helped"], outcomes["hurt"], outcomes["total"]
     decisive = helped + hurt
     base = {"harmful": False, "helped": helped, "hurt": hurt, "total": total}
-    if total < _MIN_SAMPLES or decisive == 0 or hurt <= helped:
+    # The sample floor applies to DECISIVE outcomes (helped+hurt), not the total
+    # — neutral traffic must not let a single decisive bad outcome (1 hurt + N
+    # neutral) clear the gate on a Wilson bound computed only over decisives.
+    if decisive < _MIN_SAMPLES or hurt <= helped:
         return base
     wl = wilson_lower_bound(hurt, decisive)
     base.update({"harmful": wl >= _HARM_WILSON_MIN,
@@ -199,6 +205,17 @@ def _draft_revision(conn, config, name, md_path, outcomes, verdict,
     delta = _call_revise_llm(conn, config, name, current, outcomes)
     if delta is None:
         return {"skipped_llm": True}
+    # Reject a draft with no USABLE section edit (P2): an empty/malformed delta
+    # ({"sections": []}, or sections lacking a heading/body) would otherwise
+    # become a pending proposal that "applies" as a no-op with a bumped
+    # patch_count. Keep only sections with a markdown heading + non-empty body.
+    sections = [s for s in (delta.get("sections") or [])
+                if isinstance(s, dict)
+                and str(s.get("heading") or "").strip().startswith("#")
+                and str(s.get("new_text") or "").strip()]
+    if not sections:
+        return {"skipped": "no_usable_sections"}
+    delta = {**delta, "sections": sections}
 
     uid = db.new_ulid()
     payload = {"name": name, "path": str(md_path), "outcomes": outcomes,

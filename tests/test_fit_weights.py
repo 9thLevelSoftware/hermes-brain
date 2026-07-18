@@ -21,7 +21,6 @@ from brain.dream import tune as tune_mod
 from brain.dream.mine_state import open_state_ro
 from brain.dream.shift import Shift
 from brain.recall import fit_weights
-from brain.recall.fusion import rrf, weighted_rrf
 from brain.store import db
 from conftest import seed_memory
 
@@ -184,23 +183,3 @@ def test_tune_without_fit_still_proposes_feature_contrast(conn, tmp_home):
     assert "fusion_weights" not in json.loads(prop["payload"])
 
 
-# ---------------------------------------------------------------------------
-# weighted_rrf(): dormant plumbing
-# ---------------------------------------------------------------------------
-
-def test_weighted_rrf_unit_weights_equal_rrf():
-    rankings = [["a", "b", "c"], ["b", "c", "d"]]
-    assert weighted_rrf(rankings, [1.0, 1.0]) == rrf(rankings)
-
-
-def test_weighted_rrf_upweights_a_leg():
-    # Leg 0 ranks x first; leg 1 ranks y first. Up-weighting leg 0 lifts x.
-    rankings = [["x", "y"], ["y", "x"]]
-    scores = weighted_rrf(rankings, [2.0, 0.5])
-    assert scores["x"] > scores["y"]
-
-
-def test_weighted_rrf_missing_weight_defaults_to_one():
-    rankings = [["a"], ["b"], ["c"]]
-    scores = weighted_rrf(rankings, [1.0])   # legs 1,2 default to 1.0
-    assert scores["b"] == scores["c"]

@@ -46,7 +46,10 @@ def append(home, record: dict) -> str | None:
             return None
         from .db import iso_now
 
-        now = str(record.get("archived_at") or iso_now())
+        # The filename is ALWAYS derived from a server-side timestamp — never
+        # the caller's record, whose fields may carry attacker-influenced text
+        # from a memories row; yyyymm[:7] must never become a '../' segment.
+        now = str(iso_now())
         record = {**record, "uid": uid, "archived_at": now}
         yyyymm = now[:7]  # 'YYYY-MM'
         path = archive_dir(home) / f"{yyyymm}.jsonl.gz"
@@ -58,6 +61,42 @@ def append(home, record: dict) -> str | None:
     except Exception as e:
         logger.warning("archive append failed for %r: %s", record.get("uid"), e)
         return None
+
+
+def append_batch(home, records) -> list[str | None]:
+    """Append many records opening each month's file ONCE — `forget` purges up
+    to ~100 rows/run, and a per-row append would gzip-open + fsync 100 times.
+    Returns one ref (or None) per input record, IN ORDER. A ref is set only
+    after that month's writes flush cleanly on close, so a mid-batch failure
+    leaves the affected rows at None and the caller preserves their raw text
+    (same non-destructive contract as append()). Never raises."""
+    from .db import iso_now
+
+    records = list(records)
+    refs: list[str | None] = [None] * len(records)
+    by_month: dict[str, list[tuple[int, str, bytes]]] = {}
+    for i, rec in enumerate(records):
+        uid = str((rec or {}).get("uid") or "").strip()
+        if not uid or not _UID_RE.match(uid):
+            continue
+        now = str(iso_now())  # server-side; never the caller's field (see append)
+        line = (json.dumps({**rec, "uid": uid, "archived_at": now},
+                           ensure_ascii=False) + "\n").encode("utf-8")
+        by_month.setdefault(now[:7], []).append((i, uid, line))
+
+    for yyyymm, items in by_month.items():
+        try:
+            path = archive_dir(home) / f"{yyyymm}.jsonl.gz"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with gzip.open(path, "ab") as f:
+                for _i, _uid, line in items:
+                    f.write(line)
+            # Only after a clean flush/close are the refs durable.
+            for i, uid, _line in items:
+                refs[i] = f"{yyyymm}.jsonl.gz:{uid}"
+        except Exception as e:
+            logger.warning("archive append_batch month %s failed: %s", yyyymm, e)
+    return refs
 
 
 def read(home, ref: str) -> dict | None:
