@@ -33,7 +33,7 @@ import sqlite3
 import time
 from calendar import timegm
 
-from ..store import archive, db
+from ..store import archive, db, events
 from .shift import Shift
 from .weibull import halflife_survival
 
@@ -199,12 +199,17 @@ def _run(shift: Shift) -> dict:
             shift.audit("forget_demote", row["uid"],
                         {"score": round(score, 4), "from": "active",
                          "to": "summarized"})
+        sync_events = bool(shift.config.get("sync_events", False))
         for row, score in tombstone:
             shift.conn.execute(
                 "UPDATE memories SET status='tombstone' WHERE id=?", (row["id"],))
             shift.audit("forget_tombstone", row["uid"],
                         {"score": round(score, 4), "from": "summarized",
                          "to": "tombstone"})
+            # Propagate the deletion to other devices (the engine gates on the
+            # row's scope at push time, so a private tombstone leaks nothing).
+            events.record_event(shift.conn, "tombstone", row["uid"],
+                                enabled=sync_events)
         home = shift.config.get("hermes_home")
         purged_n = 0
         # Correctness gate: preserve the raw text in the episodic archive BEFORE

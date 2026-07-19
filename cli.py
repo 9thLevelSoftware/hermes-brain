@@ -847,6 +847,14 @@ def cmd_forget(args: argparse.Namespace) -> int:
             # A tombstoned memory must leave lane 1 immediately, not at the
             # next dream-cycle rematerialization (mirrors the hard branch).
             conn.execute("DELETE FROM lane1_snapshot WHERE memory_id=?", (row["id"],))
+            # Propagate the deletion to other devices (off unless sync_events).
+            # The row stays present as a tombstone, so the sync engine gates on
+            # its scope at push time — a private forget leaks nothing.
+            from . import config as _config
+            from .store import events as _events
+            _events.record_event(
+                conn, "tombstone", row["uid"],
+                enabled=bool(_config.load_config(home).get("sync_events", False)))
             _audit_cli(conn, "cli_forget", row["uid"])
             db.bump_generation(conn, "mem")
             conn.commit()

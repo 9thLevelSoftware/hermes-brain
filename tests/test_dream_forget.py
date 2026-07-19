@@ -145,6 +145,28 @@ def test_forget_summarized_past_grace_becomes_tombstone(conn):
     assert audit_actions(conn, "forget_tombstone")[0]["target"] == uid
 
 
+def _events_for(conn, uid, op):
+    return conn.execute(
+        "SELECT count(*) FROM memory_events WHERE memory_uid=? AND op=?",
+        (uid, op)).fetchone()[0]
+
+
+def test_tombstone_emits_sync_event_only_when_sync_events_on(conn):
+    """A dream tombstone propagates deletions to other devices ONLY when
+    sync_events is enabled — off by default, no event is written."""
+    off = seed_stale(conn, "worthless row, sync off", status="summarized")
+    off_uid = mem_row(conn, off)["uid"]
+    stamp_audit(conn, "forget_demote", off_uid, iso_days_ago(40))
+    forget_run(make_shift(conn, ACTIVE))              # sync_events defaults off
+    assert _events_for(conn, off_uid, "tombstone") == 0
+
+    on = seed_stale(conn, "worthless row, sync on", status="summarized")
+    on_uid = mem_row(conn, on)["uid"]
+    stamp_audit(conn, "forget_demote", on_uid, iso_days_ago(40))
+    forget_run(make_shift(conn, {**ACTIVE, "sync_events": True}))
+    assert _events_for(conn, on_uid, "tombstone") == 1
+
+
 def test_forget_summarized_within_grace_untouched(conn):
     mem = seed_stale(conn, "recently demoted row still in its grace period",
                      status="summarized")
