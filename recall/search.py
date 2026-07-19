@@ -179,6 +179,8 @@ def search(
     source_author: str | None = None,
     trust_tier: str = "owner",
     epistemic: tuple[str, ...] | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
     embedder=None,
     reranker=None,
     rerank_budget_s: float = rerank.DEFAULT_BUDGET_S,
@@ -208,14 +210,16 @@ def search(
                 include_episodes=include_episodes, episode_limit=episode_limit,
                 exclude_session=exclude_session, principal_id=principal_id,
                 source_author=source_author, trust_tier=trust_tier,
-                epistemic=epistemic, diversify=diversify, mmr_lambda=mmr_lambda,
+                epistemic=epistemic, date_from=date_from, date_to=date_to,
+                diversify=diversify, mmr_lambda=mmr_lambda,
             )
         now = datetime.now(UTC)
         want_episodes = include_episodes and episode_limit > 0
 
         # -- FTS legs (rows arrive filtered and in bm25 order) --
         mem_rows = _memories_rows(conn, match, limit, kinds, scope_project,
-                                  principal_id, trust_tier, exclude_kinds, epistemic)
+                                  principal_id, trust_tier, exclude_kinds, epistemic,
+                                  date_from, date_to)
         epi_rows = _episodes_rows(conn, match, episode_limit * 3, exclude_session,
                                   principal_id, source_author, trust_tier) \
             if want_episodes else []
@@ -233,7 +237,8 @@ def search(
                 qvec = embedder.encode_query(query)
                 mem_knn = [i for i, _ in vec_store.knn(conn, "mem_vec", qvec, limit * 3)]
                 mvrows = _memories_by_ids(conn, mem_knn, kinds, scope_project,
-                                          principal_id, trust_tier, exclude_kinds, epistemic)
+                                          principal_id, trust_tier, exclude_kinds,
+                                          epistemic, date_from, date_to)
                 rankings.append([f"m:{i}" for i in mem_knn if i in mvrows])
                 rows_by_key.update({f"m:{i}": r for i, r in mvrows.items()})
                 vec_keys.update(f"m:{i}" for i in mvrows)
@@ -269,7 +274,8 @@ def search(
                 ppr_ids = graph_leg.ppr_leg(conn, seed_ids, limit=limit * 3)
                 if ppr_ids:
                     gvrows = _memories_by_ids(conn, ppr_ids, kinds, scope_project,
-                                              principal_id, trust_tier, exclude_kinds, epistemic)
+                                              principal_id, trust_tier, exclude_kinds,
+                                              epistemic, date_from, date_to)
                     rankings.append([f"m:{i}" for i in ppr_ids if i in gvrows])
                     rows_by_key.update({f"m:{i}": r for i, r in gvrows.items()})
                     graph_keys.update(f"m:{i}" for i in gvrows)
@@ -290,7 +296,8 @@ def search(
                 fact_ids = _facts_leg(conn, query, limit=limit)
                 if fact_ids:
                     fvrows = _memories_by_ids(conn, fact_ids, kinds, scope_project,
-                                              principal_id, trust_tier, exclude_kinds, epistemic)
+                                              principal_id, trust_tier, exclude_kinds,
+                                              epistemic, date_from, date_to)
                     rankings.append([f"m:{i}" for i in fact_ids if i in fvrows])
                     rows_by_key.update({f"m:{i}": r for i, r in fvrows.items()})
                     fact_keys.update(f"m:{i}" for i in fvrows)
@@ -373,6 +380,21 @@ def _diversify(hits: list[Hit], lambda_: float, limit: int) -> list[Hit]:
         return hits
 
 
+def _date_clause(sql: str, params: list, date_from: str | None,
+                 date_to: str | None) -> str:
+    """Optional valid_from window, applied IN the candidate query (not as a
+    post-filter on the ranked top-N — that would miss in-window rows the
+    ranking pushed past the limit). datetime() normalizes the ISO 'T'/'Z' form.
+    No-op when both bounds are None."""
+    if date_from:
+        sql += " AND datetime(m.valid_from) >= datetime(?)"
+        params.append(date_from)
+    if date_to:
+        sql += " AND datetime(m.valid_from) <= datetime(?)"
+        params.append(date_to)
+    return sql
+
+
 def _epistemic_clause(sql: str, params: list, epistemic: tuple[str, ...] | None) -> str:
     """Optional filter on the 3-value `epistemic` column (observation |
     inference | belief). Lets a caller ask for only explicit observations or
@@ -385,7 +407,8 @@ def _epistemic_clause(sql: str, params: list, epistemic: tuple[str, ...] | None)
 
 
 def _memories_by_ids(conn, ids, kinds, scope_project, principal_id, trust_tier,
-                     exclude_kinds=(), epistemic=None) -> dict:
+                     exclude_kinds=(), epistemic=None, date_from=None,
+                     date_to=None) -> dict:
     """Fetch vector-candidate memory rows with the SAME access filters as the
     FTS leg — a vector hit must never bypass scoping (finding #17)."""
     if not ids:
@@ -405,6 +428,7 @@ def _memories_by_ids(conn, ids, kinds, scope_project, principal_id, trust_tier,
         sql += " AND (m.scope_project IS NULL OR m.scope_project = ?)"
         params.append(scope_project)
     sql = _epistemic_clause(sql, params, epistemic)
+    sql = _date_clause(sql, params, date_from, date_to)
     sql = _scope_memories(sql, params, principal_id, trust_tier)
     return {r["id"]: r for r in conn.execute(sql, params).fetchall()}
 
@@ -471,6 +495,8 @@ def _memories_rows(
     trust_tier: str,
     exclude_kinds: tuple[str, ...] = (),
     epistemic: tuple[str, ...] | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
 ) -> list:
     sql = (
         f"SELECT m.*, {_MEM_BM25} AS bm25_score "
@@ -489,6 +515,7 @@ def _memories_rows(
         sql += " AND (m.scope_project IS NULL OR m.scope_project = ?)"
         params.append(scope_project)
     sql = _epistemic_clause(sql, params, epistemic)
+    sql = _date_clause(sql, params, date_from, date_to)
     sql = _scope_memories(sql, params, principal_id, trust_tier)
     sql += " ORDER BY bm25_score LIMIT ?"
     params.append(limit * 3)
@@ -542,6 +569,8 @@ def _like_search(
     source_author: str | None = None,
     trust_tier: str = "owner",
     epistemic: tuple[str, ...] | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
     diversify: bool = False,
     mmr_lambda: float = 0.7,
 ) -> list[Hit]:
@@ -576,6 +605,7 @@ def _like_search(
         sql += " AND (m.scope_project IS NULL OR m.scope_project = ?)"
         params.append(scope_project)
     sql = _epistemic_clause(sql, params, epistemic)
+    sql = _date_clause(sql, params, date_from, date_to)
     sql = _scope_memories(sql, params, principal_id, trust_tier)
     sql += " ORDER BY m.valid_from DESC LIMIT ?"
     params.append(limit * 3)

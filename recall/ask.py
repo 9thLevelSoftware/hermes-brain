@@ -354,15 +354,21 @@ def _scope_filter_chain(conn, chain, principal_id):
 def _date_range_search(search_mod, conn, params, registry, scope_project,
                        principal_id, source_author, trust_tier, embedder,
                        reranker):
-    """Scoped search filtered to a [from, to] valid_from window. Scope is
-    enforced by search(); the window is a post-filter on the hit timestamp."""
-    hits = _scoped_search(
-        search_mod, conn, str(params.get("query") or ""), None, scope_project,
-        principal_id, source_author, trust_tier, embedder, reranker,
-        _TOOL_HIT_LIMIT * 2)
+    """Scoped search with the [from, to] valid_from window applied IN the
+    candidate query (search()'s date_from/date_to), NOT as a post-filter on the
+    ranked top-N — that would miss in-window memories the ranking pushed past
+    the limit (PR #5 review). Scope is enforced by search()."""
     frm = params.get("from")
     to = params.get("to")
-    kept = [h for h in hits if _in_window(h.ts, frm, to)][:_TOOL_HIT_LIMIT]
+    hits = search_mod.search(
+        conn, str(params.get("query") or ""), limit=_TOOL_HIT_LIMIT,
+        exclude_kinds=_EXCLUDE_KINDS, scope_project=scope_project,
+        principal_id=principal_id, source_author=source_author,
+        trust_tier=trust_tier, date_from=frm, date_to=to,
+        embedder=embedder, reranker=reranker)
+    # Belt-and-braces window filter — also bounds the episode leg, which the
+    # SQL date clause (memories-only) doesn't touch.
+    kept = [h for h in hits if _in_window(h.ts, frm, to)]
     return {"hits": _summarize(kept, registry)}
 
 

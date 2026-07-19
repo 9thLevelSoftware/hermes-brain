@@ -251,7 +251,9 @@ def _run(shift: Shift) -> dict:
     # Bound the sync event-log: once sync is on, drop events already pushed
     # (synced_at set) past the retention window — keep every UNSYNCED event
     # (a device that hasn't pulled yet still needs them). Active mode only.
-    if active and bool(shift.config.get("sync_events", False)):
+    # Gate on the SAME coupled signal as recording (recording_enabled), or a
+    # log filled under sync_enabled would grow unbounded (PR #5 review).
+    if active and events.recording_enabled(shift.config):
         counts["events_compacted"] = _compact_synced_events(shift.conn)
     _set_cursor(shift.conn, next_cursor)               # rotate window (any mode)
     shift.conn.commit()

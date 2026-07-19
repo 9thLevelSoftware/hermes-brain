@@ -42,7 +42,8 @@ class FakeClient:
         return self.cursor
 
     def pull(self, cursor, *, limit=500):
-        return self.blobs[cursor:], len(self.blobs)
+        start = int(cursor or 0)  # the engine stores the cursor as a string
+        return self.blobs[start:start + limit], len(self.blobs)
 
 
 def _uid(conn, mem_id):
@@ -180,3 +181,48 @@ def test_since_quarantined_row_is_rechecked_at_push_time(conn):
         crypto.decrypt(base64.b64decode(b)).decode("utf-8") for b in client.blobs)
     assert "LATEQUAR" not in all_text
     assert client.blobs == []
+
+
+def _create_blob(crypto, uid, content, origin="other-device"):
+    env = {"op": "create", "uid": uid, "ts": "2026-01-01T00:00:00.000Z",
+           "origin": origin,
+           "memory": {"uid": uid, "content": content, "kind": "fact",
+                      "epistemic": "observation", "memory_type": "semantic",
+                      "status": "active", "version": 1,
+                      "valid_from": "2026-01-01T00:00:00.000Z",
+                      "recorded_at": "2026-01-01T00:00:00.000Z"}}
+    return base64.b64encode(crypto.encrypt(json.dumps(env).encode())).decode()
+
+
+def test_pull_skips_a_malformed_blob_and_still_advances(conn):
+    """One corrupt/undecryptable blob must not wedge the device: it is skipped,
+    later valid deltas still apply, and the cursor advances past it (PR #5)."""
+    from brain.sync.engine import pull
+
+    crypto = _crypto()
+    client = FakeClient()
+    client.blobs = ["!!!not-base64-or-a-valid-token!!!",
+                    _create_blob(crypto, "01KGOODUID0000000000000001", "a synced note")]
+    res = pull(conn, crypto, client, origin="me")
+
+    assert res["skipped_bad"] == 1        # the bad blob was skipped, not fatal
+    assert res["applied"] == 1            # the good one still applied
+    assert conn.execute(
+        "SELECT 1 FROM memories WHERE content='a synced note'").fetchone()
+    # A second pull from the advanced cursor sees nothing new (didn't re-wedge).
+    assert pull(conn, crypto, client, origin="me")["pulled"] == 0
+
+
+def test_pull_bumps_mem_generation_so_caches_invalidate(conn):
+    """Applying a remote change must bump meta.mem_generation, or a concurrent
+    provider's generation-keyed QueryCache serves stale results (PR #5)."""
+    from brain.store import db
+    from brain.sync.engine import pull
+
+    before = db.get_meta(conn, "mem_generation")
+    crypto = _crypto()
+    client = FakeClient()
+    client.blobs = [_create_blob(crypto, "01KGENUID00000000000000001", "generation test")]
+    res = pull(conn, crypto, client, origin="me")
+    assert res["applied"] == 1
+    assert db.get_meta(conn, "mem_generation") != before

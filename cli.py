@@ -820,6 +820,12 @@ def cmd_forget(args: argparse.Namespace) -> int:
             conn.execute("DELETE FROM lane1_snapshot WHERE memory_id=?", (mem_id,))
             # facts.memory_id REFERENCES memories(id) and FKs are ON, so the
             # delete below would fail if any fact still points at this row.
+            # facts.superseded_by is ALSO a self-FK: an older fact (for a
+            # DIFFERENT memory) may point at a fact we're about to delete, so
+            # clear those references first or that DELETE fails too (PR #5 review).
+            conn.execute(
+                "UPDATE facts SET superseded_by=NULL WHERE superseded_by IN "
+                "(SELECT id FROM facts WHERE memory_id=?)", (mem_id,))
             conn.execute("DELETE FROM facts WHERE memory_id=?", (mem_id,))
             for col in ("supersedes_id", "superseded_by", "invalidated_by"):
                 conn.execute(f"UPDATE memories SET {col}=NULL WHERE {col}=?", (mem_id,))

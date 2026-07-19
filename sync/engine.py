@@ -31,12 +31,15 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import sqlite3
 from typing import Any
 
 from ..store import db, events
 
 # meta keys — the two resumable cursors.
+logger = logging.getLogger(__name__)
+
 _OUTBOX_CURSOR = "sync_outbox_cursor"
 _PULL_CURSOR = "sync_pull_cursor"
 
@@ -242,11 +245,21 @@ def pull(conn: sqlite3.Connection, crypto, client, *, origin: str, limit: int = 
     pulled = 0
     applied = 0
     conflicts = 0
+    skipped_bad = 0
 
     for blob in blobs:
-        token = base64.b64decode(blob)
-        plaintext = crypto.decrypt(token)
-        envelope = json.loads(plaintext.decode("utf-8") if isinstance(plaintext, bytes) else plaintext)
+        # Decode OUTSIDE-then-inside a guard: a single corrupt / undecryptable
+        # blob must NOT wedge the device. Skip it and keep going so the cursor
+        # still advances past it and later valid deltas still sync (PR #5 review).
+        try:
+            token = base64.b64decode(blob)
+            plaintext = crypto.decrypt(token)
+            envelope = json.loads(
+                plaintext.decode("utf-8") if isinstance(plaintext, bytes) else plaintext)
+        except Exception as e:
+            logger.warning("sync pull: skipping undecodable blob: %s", e)
+            skipped_bad += 1
+            continue
         pulled += 1
         if envelope.get("origin") == origin:
             continue  # our own write echoed back by the relay
@@ -255,16 +268,25 @@ def pull(conn: sqlite3.Connection, crypto, client, *, origin: str, limit: int = 
             conn.commit()
         except Exception:
             conn.rollback()
-            raise
+            logger.warning("sync pull: apply_remote failed; skipping one envelope",
+                           exc_info=True)
+            skipped_bad += 1
+            continue  # one bad envelope must not wedge the whole pull
         if action in ("created", "superseded", "tombstoned", "lww_remote"):
             applied += 1
         if action in ("superseded", "tombstoned", "lww_remote", "lww_local"):
             conflicts += 1
 
+    # A pull that changed any row must invalidate generation-keyed caches
+    # (QueryCache) on a concurrent provider, or it keeps serving stale hits and
+    # never surfaces newly-synced (or hides remotely-deleted) memories.
+    if applied:
+        db.bump_generation(conn, "mem")
     db.set_meta(conn, _PULL_CURSOR, str(new_cursor))
     conn.commit()
 
-    return {"pulled": pulled, "applied": applied, "conflicts": conflicts, "cursor": str(new_cursor)}
+    return {"pulled": pulled, "applied": applied, "conflicts": conflicts,
+            "skipped_bad": skipped_bad, "cursor": str(new_cursor)}
 
 
 # ---------------------------------------------------------------------------
