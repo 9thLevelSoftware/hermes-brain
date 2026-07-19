@@ -291,11 +291,17 @@ def _ask(conn: sqlite3.Connection, args: dict, ctx: ToolContext) -> dict:
     from .recall.ask import ask as ask_fn  # deferred: root module stays stdlib-only
 
     cfg = ctx.config or {}
+    # Clamp the iteration cap to a hard ceiling: the bounded-tool-loop promise
+    # must hold even if a host misconfigures ask_max_iterations. 1..12.
+    try:
+        max_iters = max(1, min(12, int(cfg.get("ask_max_iterations", 6))))
+    except (TypeError, ValueError):
+        max_iters = 6
     result = ask_fn(
         conn, question, level=level,
         principal_id=ctx.principal_id, source_author=ctx.source_author,
         trust_tier=ctx.trust_tier, embedder=ctx.embedder, config=cfg,
-        max_iterations=int(cfg.get("ask_max_iterations", 6)),
+        max_iterations=max_iters,
     )
     return {
         "answered": result.answered,

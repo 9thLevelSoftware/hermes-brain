@@ -213,7 +213,7 @@ def record_proposal(conn, query: str, intent: Intent | None = None,
     """
     import json
 
-    from brain.store import db
+    from ..store import db
 
     if intent is None:
         intent = classify(query)

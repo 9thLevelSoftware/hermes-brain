@@ -811,6 +811,9 @@ def cmd_forget(args: argparse.Namespace) -> int:
             conn.execute("DELETE FROM edges WHERE src_id=? OR dst_id=?", (mem_id, mem_id))
             conn.execute("DELETE FROM entity_mentions WHERE memory_id=?", (mem_id,))
             conn.execute("DELETE FROM lane1_snapshot WHERE memory_id=?", (mem_id,))
+            # facts.memory_id REFERENCES memories(id) and FKs are ON, so the
+            # delete below would fail if any fact still points at this row.
+            conn.execute("DELETE FROM facts WHERE memory_id=?", (mem_id,))
             for col in ("supersedes_id", "superseded_by", "invalidated_by"):
                 conn.execute(f"UPDATE memories SET {col}=NULL WHERE {col}=?", (mem_id,))
             conn.execute("DELETE FROM memories WHERE id=?", (mem_id,))
@@ -1030,7 +1033,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
     from .recall.ask import ask as ask_fn
     from .recall.embed import get_embedder
     from .recall.rerank import get_reranker
-    from .store import db, sysinfo
+    from .store import sysinfo
 
     home = _hermes_home()
     question = " ".join(args.question)
@@ -1038,11 +1041,8 @@ def cmd_ask(args: argparse.Namespace) -> int:
     mode = sysinfo.resolve_mode(str(cfg.get("mode", "auto")))
     embedder = get_embedder(cfg, mode, allow_download=False)
     reranker = get_reranker(cfg, mode, allow_download=False)
-    try:
-        conn = db.connect(home)
-    except Exception as e:
-        print(f"Cannot open brain.db: {e}\n"
-              f"  Remedy: run 'hermes brain doctor' to diagnose.", file=sys.stderr)
+    conn = _open_db(home)
+    if conn is None:
         return 1
     try:
         result = ask_fn(
@@ -1083,7 +1083,7 @@ def cmd_context(args: argparse.Namespace) -> int:
     from . import config
     from .recall.context import assemble
     from .recall.embed import get_embedder
-    from .store import db, sysinfo
+    from .store import sysinfo
 
     home = _hermes_home()
     cfg = config.load_config(home)
@@ -1091,10 +1091,8 @@ def cmd_context(args: argparse.Namespace) -> int:
         cfg.get("precompress_tokens", 300))
     mode = sysinfo.resolve_mode(str(cfg.get("mode", "auto")))
     embedder = get_embedder(cfg, mode, allow_download=False)
-    try:
-        conn = db.connect(home)
-    except Exception as e:
-        print(f"Cannot open brain.db: {e}", file=sys.stderr)
+    conn = _open_db(home)
+    if conn is None:
         return 1
     try:
         block = assemble(
@@ -1151,10 +1149,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
         print("On OTHER devices: set the SAME account, salt, and passphrase.")
         return 0
 
-    try:
-        conn = db.connect(home)
-    except Exception as e:
-        print(f"Cannot open brain.db: {e}", file=sys.stderr)
+    conn = _open_db(home)
+    if conn is None:
         return 1
     try:
         if sub == "status":

@@ -128,6 +128,43 @@ def test_owner_ask_does_reach_the_secret(conn):
     assert "vaulttoken hunter2" in fake.seen()
 
 
+def test_reasoning_chain_does_not_leak_cross_scope_predecessors(conn):
+    """A version chain can cross scopes (a knowledge-update supersedes ACROSS
+    memories). A non-owner resolving a visible GLOBAL head must NOT receive an
+    owner-scoped PREDECESSOR's content through get_reasoning_chain — scope is
+    re-applied to every chain node, not just the head."""
+    pred = seed_memory(conn, "PREDSECRET the owner-only earlier value was 4242",
+                       kind="fact")
+    conn.execute("UPDATE memories SET scope_user='owner', status='summarized', "
+                 "valid_to=recorded_at WHERE id=?", (pred,))
+    head = seed_memory(conn, "HEADPUBLIC the current global value is on the wiki",
+                       kind="fact")
+    conn.execute("UPDATE memories SET supersedes_id=? WHERE id=?", (pred, head))
+    conn.commit()
+    head_uid = conn.execute("SELECT uid FROM memories WHERE id=?", (head,)).fetchone()["uid"]
+
+    fake = ScriptedLLM([
+        {"action": "get_reasoning_chain", "uid": head_uid},
+        {"action": "answer", "text": "traced", "citations": [], "abstain": False},
+    ])
+    llm.set_llm_for_tests(fake)
+    res = ask(conn, "trace the value's history", level="fast",
+              principal_id="mallory", trust_tier="known_user",
+              max_iterations=4, config={})
+
+    blob = fake.seen() + (res.answer or "")
+    assert "PREDSECRET" not in blob          # owner-scoped predecessor never leaks
+    # The owner DOES see the full chain (proves the predecessor is reachable).
+    fake2 = ScriptedLLM([
+        {"action": "get_reasoning_chain", "uid": head_uid},
+        {"action": "answer", "text": "traced", "citations": [], "abstain": False},
+    ])
+    llm.set_llm_for_tests(fake2)
+    ask(conn, "trace the value's history", level="fast",
+        principal_id=None, trust_tier="owner", max_iterations=4, config={})
+    assert "PREDSECRET" in fake2.seen()
+
+
 def test_nonowner_reasoning_chain_on_owner_uid_is_not_found(conn):
     """get_reasoning_chain on an owner-only memory must read as 'not found' for
     a non-owner — the same indistinguishable-from-absent contract as recall."""

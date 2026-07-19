@@ -189,17 +189,21 @@ class QueryCache:
 
             # Tier 3: Jaccard token-set near-match (same kinds + scope only).
             best: _Entry | None = None
+            best_key: tuple | None = None
             best_j = JACCARD_THRESHOLD
-            for (_n, k, s), e in self._store.items():
+            for cand_key, e in self._store.items():
+                _n, k, s = cand_key
                 if k != kk or s != scope:
                     continue
                 j = _jaccard(qtokens, e.tokens)
                 if j >= best_j:
                     best_j = j
                     best = e
+                    best_key = cand_key
                     if j == 1.0:
                         break
             if best is not None:
+                self._store.move_to_end(best_key)  # a fuzzy hit refreshes recency too
                 self.hits += 1
                 self.jaccard_hits += 1
                 return best.hits
@@ -231,8 +235,10 @@ class QueryCache:
             return None
 
         best: _Entry | None = None
+        best_key: tuple | None = None
         best_c = SEMANTIC_THRESHOLD
-        for (_n, k, s), e in self._store.items():
+        for cand_key, e in self._store.items():
+            _n, k, s = cand_key
             if k != kk or s != scope:
                 continue
             if e.emb is None:
@@ -242,7 +248,11 @@ class QueryCache:
             if c >= best_c:
                 best_c = c
                 best = e
-        return best.hits if best is not None else None
+                best_key = cand_key
+        if best is None:
+            return None
+        self._store.move_to_end(best_key)  # a semantic hit refreshes recency too
+        return best.hits
 
     # -- insert -----------------------------------------------------------
 

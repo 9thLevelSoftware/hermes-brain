@@ -665,9 +665,11 @@ def _write_item(conn, item, content, kind, ctx, *, embedder, shadow, actor,
         _embed_new(conn, embedder, new_id, embed_text)
         # Phase B: index this item's s-p-o triples into the facts layer, each
         # referencing this memory row (facts are an index over memories).
-        # Active rows only — quarantined/instruction-shaped content must never
-        # mint facts. Gated on facts_extract; never raises into capture.
-        if ctx.get("facts_extract", True):
+        # NEVER mint facts from instruction-shaped content — an owner-trusted
+        # instruction stays status='active' (only untrusted ones quarantine), so
+        # the active gate alone is not enough: instructions are commands, not
+        # facts. Gated on facts_extract; never raises into capture.
+        if ctx.get("facts_extract", True) and not instruction_shaped:
             _index_triples(conn, item, new_id)
     # Emit a create event to the sync seam (off by default; record_event
     # self-gates on `enabled` and never raises).

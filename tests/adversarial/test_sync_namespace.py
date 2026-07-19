@@ -109,6 +109,61 @@ def test_private_rows_never_serialize_into_push_blobs(conn):
         assert _uid(conn, mid) not in env_uids
 
 
+def test_project_and_platform_scoped_rows_never_serialize(conn):
+    """The deny-list must exclude scope_project and scope_platform too — a
+    project-private row must not ship as 'global'."""
+    proj_id = seed_memory(conn, "PROJSECRET internal roadmap for atlas", kind="fact")
+    conn.execute("UPDATE memories SET scope_project='atlas' WHERE id=?", (proj_id,))
+    plat_id = seed_memory(conn, "PLATSECRET slack-only workspace note", kind="fact")
+    conn.execute("UPDATE memories SET scope_platform='slack' WHERE id=?", (plat_id,))
+    glob_id = seed_memory(conn, "GLOBALOK the docs are public", kind="fact")
+    conn.commit()
+    for mid in (proj_id, plat_id, glob_id):
+        _event(conn, mid)
+
+    crypto = _crypto()
+    client = FakeClient()
+    push(conn, crypto, client, origin="device-A")
+    all_text = "\n".join(
+        crypto.decrypt(base64.b64decode(b)).decode("utf-8") for b in client.blobs)
+    assert "GLOBALOK" in all_text
+    assert "PROJSECRET" not in all_text
+    assert "PLATSECRET" not in all_text
+    assert len(client.blobs) == 1
+
+
+def test_public_tombstone_propagates_but_private_tombstone_does_not(conn):
+    """A deletion of a GLOBAL memory ships a content-free tombstone envelope so
+    other devices retire it; a PRIVATE memory's tombstone leaks nothing — not
+    even its uid."""
+    pub = seed_memory(conn, "PUBDELETE was global, now deleted", kind="fact")
+    priv = seed_memory(conn, "PRIVDELETE was owner-scoped, now deleted", kind="fact")
+    conn.execute("UPDATE memories SET scope_user='owner' WHERE id=?", (priv,))
+    conn.commit()
+    pub_uid, priv_uid = _uid(conn, pub), _uid(conn, priv)
+
+    # Tombstone both and log tombstone events.
+    for mid, uid in ((pub, pub_uid), (priv, priv_uid)):
+        conn.execute("UPDATE memories SET status='tombstone', valid_to=recorded_at "
+                     "WHERE id=?", (mid,))
+        events.record_event(conn, "tombstone", uid, enabled=True)
+    conn.commit()
+
+    crypto = _crypto()
+    client = FakeClient()
+    push(conn, crypto, client, origin="device-A")
+    envs = [json.loads(crypto.decrypt(base64.b64decode(b)).decode("utf-8"))
+            for b in client.blobs]
+    uids = {e.get("uid") for e in envs}
+    ops = {e.get("op") for e in envs}
+    assert pub_uid in uids and ops == {"tombstone"}   # public deletion propagates
+    assert priv_uid not in uids                        # private deletion leaks nothing
+    # The tombstone is content-free.
+    all_text = "\n".join(crypto.decrypt(base64.b64decode(b)).decode("utf-8")
+                         for b in client.blobs)
+    assert "PUBDELETE" not in all_text and "PRIVDELETE" not in all_text
+
+
 def test_since_quarantined_row_is_rechecked_at_push_time(conn):
     """A row global when its create event fired, but quarantined before push,
     must still be excluded — the deny-list is re-checked on the fresh row."""

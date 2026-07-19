@@ -749,7 +749,11 @@ class BrainProvider(MemoryProvider):
         # when lane2_blend is off. MMR diversifies the final set so the block
         # isn't three near-identical facts.
         exclude_kinds = ("strategy", "guardrail", "case", "peer_card")
-        cache_scope = (principal_id or "", trust_tier)
+        # Cache key MUST include source_author: concurrent unenrolled gateway
+        # users share principal_id='' + trust_tier='known_user', so keying on
+        # those alone would serve one user's recall to another. The episode leg
+        # is scoped by source_author, so the key must be too.
+        cache_scope = (principal_id or "", source_author or "", trust_tier)
         use_cache = bool(self._config.get("query_cache", True))
         mmr_lambda = float(self._config.get("mmr_lambda", 0.7))
         facts_leg_on = bool(self._config.get("facts_leg", True))

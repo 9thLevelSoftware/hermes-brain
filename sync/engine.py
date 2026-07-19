@@ -72,9 +72,20 @@ def is_syncable(row: Any) -> bool:
     """
     if _rowget(row, "status") != "active":
         return False  # excludes quarantined / tombstone / summarized / expired
+    return _scope_public(row)
+
+
+def _scope_public(row: Any) -> bool:
+    """The scope half of the deny-list (status-independent): True iff the row
+    carries NO privacy scope. Any of scope_user / scope_session / scope_project
+    / scope_platform, a peer_card, or instruction-shaped content makes it
+    private and un-syncable. Used both by is_syncable (which adds the active
+    gate) and by tombstone propagation (which acts on a since-retired row)."""
     private = (
         _rowget(row, "scope_user")            # owner/user-scoped
         or _rowget(row, "scope_session")      # session-ephemeral lane
+        or _rowget(row, "scope_project")      # project-private
+        or _rowget(row, "scope_platform")     # platform-private
         or _rowget(row, "kind") == "peer_card"  # private theory-of-mind
         or _rowget(row, "instruction_shaped")   # untrusted instruction-shaped
     )
@@ -157,16 +168,35 @@ def push(conn: sqlite3.Connection, crypto, client, *, origin: str, limit: int = 
     for ev in evs:
         processed.append(ev.event_id)
         row = _fetch_push_row(conn, ev.memory_uid)
-        if row is None or not is_syncable(row):
+        if ev.op == "tombstone":
+            # Deletions must propagate so other devices retire the row — but a
+            # tombstoned row is no longer 'active', so is_syncable would drop it.
+            # Send a CONTENT-FREE tombstone, gated on the scope half of the
+            # deny-list (checked on the still-present retired row) so a PRIVATE
+            # deletion doesn't even leak a uid. `purge` is intentionally NOT
+            # propagated: the tombstone that precedes it in the forget lifecycle
+            # already shipped the delete, and the purged row is gone (its scope
+            # can no longer be verified).
+            if row is not None and _scope_public(row):
+                envelope = {"op": "tombstone", "uid": ev.memory_uid, "ts": ev.ts,
+                            "origin": origin, "memory": None}
+            else:
+                skipped_private += 1
+                continue
+        elif ev.op in ("create", "supersede"):
+            if row is None or not is_syncable(row):
+                skipped_private += 1
+                continue
+            envelope = {
+                "op": ev.op,
+                "uid": ev.memory_uid,
+                "ts": ev.ts,
+                "origin": origin,
+                "memory": serialize_memory(row),
+            }
+        else:  # purge (and any future op): not propagated
             skipped_private += 1
             continue
-        envelope = {
-            "op": ev.op,
-            "uid": ev.memory_uid,
-            "ts": ev.ts,
-            "origin": origin,
-            "memory": serialize_memory(row),
-        }
         payload = json.dumps(envelope, separators=(",", ":"), sort_keys=True).encode("utf-8")
         token = crypto.encrypt(payload)
         blobs.append(base64.b64encode(token).decode("ascii"))
@@ -205,7 +235,9 @@ def pull(conn: sqlite3.Connection, crypto, client, *, origin: str, limit: int = 
     Returns ``{pulled, applied, conflicts, cursor}``.
     """
     cursor = db.get_meta(conn, _PULL_CURSOR) or "0"
-    blobs, new_cursor = client.pull(cursor, limit)
+    # RelayClient.pull declares `limit` keyword-only — pass it by keyword or the
+    # real client raises before making the request.
+    blobs, new_cursor = client.pull(cursor, limit=limit)
 
     pulled = 0
     applied = 0
@@ -356,6 +388,11 @@ def apply_remote(conn: sqlite3.Connection, env: dict) -> str:
                 (remote_ts, existing["id"]),
             )
             return "tombstoned"
+        return "ignored"
+
+    # A tombstone for a uid we never held is a no-op — it must NEVER fall
+    # through to the insert path and create a (content-free) ghost row.
+    if op == "tombstone":
         return "ignored"
 
     supersedes_uid = mem.get("supersedes_uid")

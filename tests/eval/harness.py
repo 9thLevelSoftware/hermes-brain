@@ -444,6 +444,11 @@ def run_eval(fixture_path: str | Path, *, real: bool = False) -> dict:
         if not real:
             llm.set_llm_for_tests(None)
         conn.close()
+        # The throwaway brain.db lives in a temp dir — clean it up so repeated
+        # runs (CI + manual `hermes brain eval`) don't leak dirs forever.
+        import shutil
+
+        shutil.rmtree(home, ignore_errors=True)
 
 
 if __name__ == "__main__":  # pragma: no cover - manual/CLI convenience

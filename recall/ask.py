@@ -309,11 +309,39 @@ def _reasoning_chain(conn, facts_mod, params, principal_id, trust_tier):
     if row is None:
         return {"error": "no memory visible for that uid"}
     chain = facts_mod.reasoning_chain(conn, row["id"])
+    # SECURITY: reasoning_chain walks the supersedes_id version chain and hands
+    # back each predecessor's content. A knowledge-update supersedes ACROSS
+    # memories, so the chain can cross scopes — the HEAD being visible does NOT
+    # make its predecessors visible. Re-apply the caller's scope to EVERY node
+    # (scope predicate only, NOT current-truth: predecessors are superseded).
+    if trust_tier != "owner":
+        chain = _scope_filter_chain(conn, chain, principal_id)
     return {"chain": [{
         "uid": (c.get("uid") or "")[:_UID_LEN],
         "kind": c.get("kind"),
         "snippet": _snip(c.get("content") or c.get("summary") or ""),
     } for c in chain]}
+
+
+def _scope_filter_chain(conn, chain, principal_id):
+    """Keep only chain nodes a non-owner may see: unscoped or their-own
+    principal, and never a peer_card — mirroring _resolve_memory_scoped's
+    non-owner clause but without the current-truth filter."""
+    ids = [c.get("id") for c in chain if c.get("id") is not None]
+    if not ids:
+        return []
+    placeholders = ",".join("?" * len(ids))
+    visible: dict = {}
+    try:
+        for r in conn.execute(
+            f"SELECT id, scope_user, kind FROM memories WHERE id IN ({placeholders})",
+            ids).fetchall():
+            visible[r["id"]] = (
+                (r["scope_user"] is None or r["scope_user"] == (principal_id or ""))
+                and (r["kind"] is None or r["kind"] != "peer_card"))
+    except Exception:  # capture-path safety — on any error, reveal nothing
+        return []
+    return [c for c in chain if visible.get(c.get("id"), False)]
 
 
 def _date_range_search(search_mod, conn, params, registry, scope_project,
