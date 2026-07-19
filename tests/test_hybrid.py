@@ -130,3 +130,27 @@ def test_get_embedder_never_raises_without_deps(tmp_path, monkeypatch):
     monkeypatch.setattr(embed_mod, "models_cache_dir", lambda: tmp_path)
     assert get_embedder({"embed_model": "modernbert-embed-base"}, "full",
                         allow_download=False) is None
+
+
+def test_search_date_window_filters_candidates_in_sql(tmp_home):
+    """date_from/date_to restrict candidates IN the query, so an in-window
+    memory is found even when out-of-window rows would rank above it (PR #5)."""
+    from brain.recall.search import search
+    from brain.store import db
+    from conftest import iso_days_ago, seed_memory
+
+    conn = db.connect(tmp_home)
+    try:
+        seed_memory(conn, "deploy runbook alpha edition", valid_from=iso_days_ago(400))
+        mid = seed_memory(conn, "deploy runbook beta edition", valid_from=iso_days_ago(100))
+        seed_memory(conn, "deploy runbook gamma edition", valid_from=iso_days_ago(3))
+        conn.commit()
+        hits = search(conn, "deploy runbook edition", trust_tier="owner",
+                      date_from=iso_days_ago(150), date_to=iso_days_ago(50))
+        texts = " ".join(h.text for h in hits if h.kind == "memory")
+        assert "beta edition" in texts        # the only in-window memory
+        assert "alpha edition" not in texts    # older than the window
+        assert "gamma edition" not in texts    # newer than the window
+        assert mid in [h.id for h in hits]
+    finally:
+        conn.close()

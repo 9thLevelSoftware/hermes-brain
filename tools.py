@@ -238,6 +238,124 @@ def get_schemas() -> list[dict]:
     ]
 
 
+def ask_schema() -> dict:
+    """The brain_ask tool schema. Kept separate from get_schemas() because the
+    AGENT-FACING exposure is opt-in (config ask_tool_agent, off by default): an
+    LLM-inside-a-turn is a new latency/budget pattern. The CLI and MCP surfaces
+    expose it directly regardless."""
+    return {
+        "type": "function",
+        "function": {
+            "name": "brain_ask",
+            "description": (
+                "Ask a natural-language question about what the brain knows "
+                "(memories + past conversations across every platform) and get "
+                "a synthesized, cited answer. Use for 'what did we decide about "
+                "X', 'how many Y', 'what changed about Z' — it searches, "
+                "cross-checks conflicting sources, and says it does not know "
+                "rather than guess."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "the natural-language question to answer",
+                    },
+                    "level": {
+                        "type": "string",
+                        "enum": ["fast", "deep"],
+                        "description": "fast = quick lookup (<=2 steps); deep = "
+                                       "multi-step reasoning (default)",
+                    },
+                },
+                "required": ["question"],
+            },
+        },
+    }
+
+
+def _ask(conn: sqlite3.Connection, args: dict, ctx: ToolContext) -> dict:
+    """Dialectic ask: a bounded, cited natural-language answer over the brain.
+    Scope flows from the caller's identity (ctx) into every internal search —
+    a non-owner never reaches a peer_card or a foreign principal's rows."""
+    question = str(args.get("question") or args.get("query") or "").strip()
+    if not question:
+        raise _ToolError(
+            "brain_ask needs a question",
+            'e.g. brain_ask(question="what did we decide about auth?")',
+        )
+    level = str(args.get("level") or "deep").lower()
+    if level not in ("fast", "deep"):
+        level = "deep"
+    from .recall.ask import ask as ask_fn  # deferred: root module stays stdlib-only
+
+    cfg = ctx.config or {}
+    # Clamp the iteration cap to a hard ceiling: the bounded-tool-loop promise
+    # must hold even if a host misconfigures ask_max_iterations. 1..12.
+    try:
+        max_iters = max(1, min(12, int(cfg.get("ask_max_iterations", 6))))
+    except (TypeError, ValueError):
+        max_iters = 6
+    result = ask_fn(
+        conn, question, level=level,
+        principal_id=ctx.principal_id, source_author=ctx.source_author,
+        trust_tier=ctx.trust_tier, embedder=ctx.embedder, config=cfg,
+        max_iterations=max_iters,
+    )
+    return {
+        "answered": result.answered,
+        "answer": result.answer,
+        "citations": result.citations,
+        "iterations": result.iterations,
+        "level": result.level,
+        "degraded": result.degraded,
+    }
+
+
+def context_schema() -> dict:
+    """The brain_context tool schema (read-only, token-budgeted)."""
+    return {
+        "type": "function",
+        "function": {
+            "name": "brain_context",
+            "description": (
+                "Assemble a compact, token-budgeted context block about what "
+                "the brain knows for this caller — stable identity, the "
+                "relevant peer profile, a distilled summary of durable facts. "
+                "Read-only; scoped to the caller."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tokens": {
+                        "type": "integer",
+                        "description": "token budget for the block (default 300)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    }
+
+
+def _context(conn: sqlite3.Connection, args: dict, ctx: ToolContext) -> dict:
+    """Token-budgeted brain context, scoped to the caller's identity."""
+    cfg = ctx.config or {}
+    try:
+        budget = int(args.get("tokens") or cfg.get("precompress_tokens", 300))
+    except (TypeError, ValueError):
+        budget = int(cfg.get("precompress_tokens", 300))
+    from .recall.context import assemble  # deferred: root module stays stdlib-only
+
+    block = assemble(
+        conn, [], budget,
+        principal_id=ctx.principal_id, trust_tier=ctx.trust_tier,
+        embedder=ctx.embedder, config=cfg,
+        summary_ratio=float(cfg.get("context_summary_ratio", 0.4)))
+    return {"context": block, "budget_tokens": budget}
+
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
@@ -251,13 +369,15 @@ def dispatch(conn: sqlite3.Connection, tool_name: str, args: dict | None,
         "brain_outcome": _outcome,
         "brain_manage": _manage,
     }
+    handlers["brain_ask"] = _ask
+    handlers["brain_context"] = _context
     try:
         handler = handlers.get(tool_name)
         if handler is None:
             raise _ToolError(
                 f"unknown tool '{tool_name}'",
                 "available tools: brain_recall, brain_remember, brain_outcome, "
-                'brain_manage — e.g. brain_recall(query="deploy pipeline")',
+                'brain_manage, brain_ask — e.g. brain_recall(query="deploy pipeline")',
             )
         if args is not None and not isinstance(args, dict):
             raise _ToolError(
@@ -667,6 +787,13 @@ def _remember(conn: sqlite3.Connection, args: dict, ctx: ToolContext) -> dict:
         )
         row_id = cur.lastrowid
         db.bump_generation(conn, "mem")
+        # Sync seam: a directly-remembered memory must enter the outbox too
+        # (not just extracted ones), or a synced device never sees it. Off
+        # unless sync is on; the engine gates scope at push time.
+        from .store import events as _events
+        _events.record_event(conn, "create", uid,
+                             enabled=_events.recording_enabled(ctx.config),
+                             payload={"kind": kind, "quarantined": quarantine})
         _audit(conn, "brain_remember", uid,
                {"kind": kind, "trust_tier": trust, "status": status}, now)
         conn.commit()

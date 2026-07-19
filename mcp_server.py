@@ -43,8 +43,11 @@ SERVER_NAME = "hermes-brain"
 def _mcp_tools() -> list[dict]:
     from . import tools
 
+    # The MCP surface is at 'tool' trust and is a primary ask surface — expose
+    # brain_ask here (read-only, cited) alongside the four core tools.
+    schemas = [*tools.get_schemas(), tools.ask_schema(), tools.context_schema()]
     out = []
-    for schema in tools.get_schemas():
+    for schema in schemas:
         fn = schema["function"]
         out.append({
             "name": fn["name"],

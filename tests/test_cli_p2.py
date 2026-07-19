@@ -434,3 +434,24 @@ def test_doctor_warns_without_owner_identity(home, capsys):
     capsys.readouterr()
     _run(["doctor"])
     assert "1 owner identity" in capsys.readouterr().out
+
+
+def test_forget_hard_purges_memory_with_superseded_fact_chain(home, capsys):
+    """Hard-purging a memory whose fact superseded another fact must clear the
+    facts.superseded_by self-FK first, not crash with FOREIGN KEY constraint
+    failed (PR #5)."""
+    from brain.store import facts
+
+    conn = db.connect(home)
+    try:
+        m1 = seed_memory(conn, "server region us-east")
+        facts.add_fact(conn, "server", "region", "us-east", memory_id=m1)
+        m2 = seed_memory(conn, "server region us-west")
+        facts.add_fact(conn, "server", "region", "us-west", memory_id=m2)  # closes m1's fact
+        conn.commit()
+        m2_uid = conn.execute("SELECT uid FROM memories WHERE id=?", (m2,)).fetchone()["uid"]
+    finally:
+        conn.close()
+
+    assert _run(["forget", m2_uid, "--hard", "--yes"]) == 0   # full uid (no FK crash)
+    assert _count(home, "SELECT count(*) FROM memories WHERE id=?", (m2,)) == 0

@@ -62,6 +62,17 @@ def _strategy_fn(name: str):
         from .distill import run as fn
     elif name == "consolidate":
         from .consolidate import run as fn
+    elif name == "facts":
+        def fn(shift: Shift) -> dict:
+            # s-p-o triple extraction into the facts layer. Mode-gated like
+            # peers (supports shadow silent-compute); ships shadow by default.
+            # 'off' is filtered upstream before dispatch.
+            mode = shift.config.get("_forced_mode") or shift.mode("facts")
+            if mode not in ("active", "dry_run", "shadow"):
+                return {"skipped": mode}
+            from .facts import run as facts_run
+
+            return facts_run(shift)
     elif name == "contradict":
         from .contradict import run as fn
     elif name == "forget":

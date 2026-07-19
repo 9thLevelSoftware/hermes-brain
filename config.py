@@ -35,6 +35,34 @@ DEFAULTS: dict[str, Any] = {
     "skill_auto_approve": True,  # user decision 2026-07-16: auto-approve after validation
     "capture_peers": True,       # user decision: trust-gated peer capture in group chats
     "incognito": False,
+    # -- Phase A: retrieval upgrades (best-of-three) --
+    "dedup_contest": True,       # info-content contest on near-dup merge (else exact-hash merge)
+    "lane2_blend": True,         # compose lane-2 via semantic+reinforced+recent blend
+    "lane2_blend_recent_days": 14,  # recency window for the "most-recent" blend leg
+    "query_cache": True,         # in-process recall cache, invalidated on mem_generation
+    "mmr_lambda": 0.7,           # MMR diversity/relevance tradeoff (1.0 = pure relevance)
+    "intent_weighting": "shadow",  # off | shadow (log proposed deltas) — never applied in v1
+    # -- Phase B: temporal fact layer + event seam --
+    "facts_extract": True,       # sweep extracts s-p-o triples alongside memories
+    "facts_leg": True,           # facts retrieval leg feeds memory ids into fusion
+    "sync_events": False,        # write memory_events on lifecycle ops (Phase G seam; off)
+    # -- Phase C: dream upgrades --
+    "dream_surprisal": True,     # seed consolidate with top-surprise/anomaly hints
+    "contradict_knowledge_update": True,  # deterministic same-(s,p) fact resolution (no LLM)
+    "forget_weibull": True,      # per-kind Weibull decay shapes in the forget value score
+    # -- Phase D: dialectic "ask" agent --
+    "ask_tool": True,            # expose brain_ask via CLI + MCP (tool trust)
+    "ask_tool_agent": False,     # agent-facing brain_ask schema (LLM-in-turn) — OFF by default
+    "ask_max_iterations": 6,     # hard cap on the ask tool-loop iterations (deep level)
+    # -- Phase E: token-budgeted context assembly --
+    "precompress_tokens": 300,   # budget for the on_pre_compress contribution
+    "context_summary_ratio": 0.4,  # remainder split: 40% summary / 60% recent extracts
+    # -- Phase G: multi-device encrypted delta sync (needs [sync] extra) --
+    "sync_enabled": False,       # master switch for push/pull (off by default)
+    "sync_url": "",              # relay base URL (opaque-ciphertext store)
+    "sync_device_id": "",        # this device's origin id (set at `sync init`)
+    "sync_account": "",          # shared relay namespace across a user's devices
+    "sync_salt": "",             # base64 KDF salt (shared across devices; set at init)
 }
 
 

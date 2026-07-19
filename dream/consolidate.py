@@ -39,6 +39,8 @@ _MIN_CLUSTER = 3
 _MAX_DISTILL_PER_RUN = 6
 _MAX_CANDIDATES = 200
 _MAX_LESSON_WORDS = 140          # prompt asks <=120; small slack, hard wall here
+_MAX_HINT_ITEMS = 5              # bounded anomaly hint (can't blow the prompt)
+_HINT_CONTENT_CHARS = 120        # per-line content clip in the hint block
 _IMPORTANCE_BOOST = 0.2
 _DEMOTE_FACTOR = 0.7
 _PATTERN_HALF_LIFE_DAYS = 180.0
@@ -108,6 +110,18 @@ def _run(shift: Shift) -> dict:
 
     blobs = _blobs(conn, [c["id"] for c in candidates])
     clusters = _cluster(shift, candidates, blobs)
+    # Surprisal seeding (config gate `dream_surprisal`, default on): compute the
+    # surprising subset of the candidate window ONCE and render it as a bounded
+    # "anomalies to reconcile" hint appended to every cluster prompt. Off => the
+    # hint stays "" and the prompt is byte-for-byte the plain one. Best-effort:
+    # any failure degrades to the plain prompt (surprisal is a nudge, not law).
+    hint = ""
+    if bool(shift.config.get("dream_surprisal", True)):
+        try:
+            hint = _render_hint(_surprisal_hints(shift, candidates, blobs))
+        except Exception as e:
+            logger.debug("consolidate: surprisal hint skipped: %s", e)
+            hint = ""
     llm_down = False
     for members in clusters:
         if counts["distilled"] + counts["rejected"] >= _MAX_DISTILL_PER_RUN:
@@ -126,7 +140,7 @@ def _run(shift: Shift) -> dict:
             break
         try:
             proposal = llm.call_json(
-                conn, shift.config, _cluster_prompt(members),
+                conn, shift.config, _cluster_prompt(members, hint),
                 system=_CONSOLIDATE_SYSTEM, tier="consolidate")
         except llm.LLMUnavailable as e:
             logger.info("consolidate: LLM unavailable (%s); cluster deferred", e)
@@ -243,13 +257,96 @@ def _already_distilled(conn: sqlite3.Connection, member_ids: list[int]) -> bool:
 # LLM proposal + specificity gate
 # ---------------------------------------------------------------------------
 
-def _cluster_prompt(members: list[sqlite3.Row]) -> str:
+def _cluster_prompt(members: list[sqlite3.Row], hint: str = "") -> str:
     lines = ["Member memories:"]
     for m in members:
         outcome = m["outcome"] or "none"
         lines.append(f"- [{m['uid']}] (outcome: {outcome}) {m['content']}")
     lines.append("")
     lines.append("Distill the one lesson these collectively support.")
+    prompt = "\n".join(lines)
+    # Surprisal hint (may be ""): appended AFTER the instruction. When empty
+    # the prompt is byte-for-byte identical to the pre-surprisal prompt.
+    if hint:
+        prompt = f"{prompt}\n{hint}"
+    return prompt
+
+
+# ---------------------------------------------------------------------------
+# Surprisal seeding (config-gated `dream_surprisal`) — best-effort anomaly hint
+# ---------------------------------------------------------------------------
+
+def _surprisal_hints(shift: Shift, candidates: list[sqlite3.Row],
+                     blobs: dict[int, bytes]) -> list[sqlite3.Row]:
+    """The surprising subset of the candidate window (bounded, deduped).
+
+    Two signals, unioned:
+      1. Top-decile by the stored `surprise` column (kNN-cosine distance at
+         write). Always available — no embedder needed.
+      2. kNN-density outliers: memories whose nearest neighbors inside the
+         window are far away (low mean cosine) are novel. Only computed when
+         an embedder is present AND vectors exist; skipped otherwise.
+
+    Never raises — returns [] on any failure (the caller also guards)."""
+    try:
+        n = len(candidates)
+        if n == 0:
+            return []
+        decile = max(1, n // 10)
+        picked: dict[int, sqlite3.Row] = {}
+
+        # (1) top-decile by stored surprise (only rows with a positive score).
+        scored = [c for c in candidates
+                  if c["surprise"] is not None and float(c["surprise"]) > 0.0]
+        scored.sort(key=lambda c: float(c["surprise"]), reverse=True)
+        for c in scored[:decile]:
+            picked[c["id"]] = c
+
+        # (2) kNN-density outliers — embedder + vectors required.
+        if shift.embedder is not None and blobs:
+            for c in _density_outliers(candidates, blobs, decile):
+                picked[c["id"]] = c
+
+        return list(picked.values())[:_MAX_HINT_ITEMS]
+    except Exception as e:
+        logger.debug("consolidate: surprisal compute failed: %s", e)
+        return []
+
+
+def _density_outliers(candidates: list[sqlite3.Row], blobs: dict[int, bytes],
+                      k: int) -> list[sqlite3.Row]:
+    """Lowest-density (fewest close neighbors) members of the window, most
+    surprising first. Density = mean cosine to the top-`_KNN_K` neighbors."""
+    withvec = [c for c in candidates if c["id"] in blobs]
+    if len(withvec) < _MIN_CLUSTER:
+        return []
+    ranked: list[tuple[float, sqlite3.Row]] = []
+    for c in withvec:
+        cb = blobs[c["id"]]
+        sims = sorted(
+            (_blob_cosine(cb, blobs[o["id"]]) for o in withvec if o["id"] != c["id"]),
+            reverse=True)
+        kk = min(_KNN_K, len(sims))
+        density = (sum(sims[:kk]) / kk) if kk else 0.0
+        ranked.append((density, c))
+    ranked.sort(key=lambda t: t[0])          # low density first == surprising
+    return [c for _d, c in ranked[:k]]
+
+
+def _render_hint(rows: list[sqlite3.Row]) -> str:
+    """Render the surprising rows as a short, length-bounded hint block. ""
+    when there is nothing to flag (keeps the plain prompt byte-identical)."""
+    if not rows:
+        return ""
+    lines = [
+        "Anomalies to reconcile — these memories are surprising/novel; make",
+        "sure the lesson accounts for them rather than smoothing them over:",
+    ]
+    for r in rows:
+        content = " ".join((r["content"] or "").split())
+        if len(content) > _HINT_CONTENT_CHARS:
+            content = content[:_HINT_CONTENT_CHARS - 1] + "…"
+        lines.append(f"- [{r['uid']}] {content}")
     return "\n".join(lines)
 
 

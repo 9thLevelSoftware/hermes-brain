@@ -33,8 +33,9 @@ import sqlite3
 import time
 from calendar import timegm
 
-from ..store import archive, db
+from ..store import archive, db, events
 from .shift import Shift
+from .weibull import halflife_survival
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,46 @@ _NO_HALF_LIFE_AGE_DAYS = 180.0   # stale bar when the row has no half-life
 _USAGE_RECENCY_HALF_LIFE_DAYS = 90.0
 _NO_DECAY_REFERENCE_DAYS = 365.0
 _STUB_CHARS = 200
+
+# Per-kind Weibull decay SHAPES (k) for the recency term, gated on config
+# 'forget_weibull' (config.py DEFAULTS, default True). This is a MODULE
+# CONSTANT, NOT a brain.yaml key — the flat config parser only reads scalars,
+# so a dict must live in code. The memory's half_life_days remains the SCALE;
+# k only bends the curve (k=1 == today's exact 0.5**(age/half_life)).
+#
+#   k < 1  -> decreasing hazard, HEAVY tail: retains value at long ages.
+#            Durable / safety-critical knowledge we want to resist demotion
+#            long after its nominal half-life (warnings, guardrails, prefs).
+#   k = 1  -> constant hazard: identical to the legacy exponential (default
+#            for any unlisted kind, so unmapped kinds stay legacy-equivalent).
+#   k > 1  -> increasing hazard: slow early then falls off a cliff. Ephemeral,
+#            time-boxed kinds that should age out sharply once past prime.
+#
+# Choices (rationale in the value doc): safety + identity knowledge gets the
+# heaviest tails; time-sensitive/ephemeral kinds get k>1.
+_DEFAULT_DECAY_SHAPE = 1.0
+_DECAY_SHAPES = {
+    # -- durable / safety-critical: heavy tail, resist forgetting -----------
+    "warning":      0.5,   # safety warnings must persist well past half-life
+    "guardrail":    0.5,   # learned guardrails are safety knowledge
+    "profile":      0.4,   # identity / who-the-owner-is: near-permanent
+    "preference":   0.5,   # stable personal preferences
+    "peer_card":    0.6,   # theory-of-mind of a person: slow-moving
+    "strategy":     0.7,   # planning heuristics: durable but revisable
+    "case":         0.7,   # case-bank exemplars: durable but revisable
+    "insight":      0.7,   # distilled insight: durable
+    "fact":         0.85,  # generic facts: near-exponential, slight tail
+    # -- time-sensitive / ephemeral: k>1, age out sharply once past prime ---
+    "decision":     1.0,   # decisions age out on schedule (pure exponential)
+    "event":        1.3,   # one-off events: fast fall-off
+    "request":      1.5,   # one-off requests: fastest fall-off
+}
+
+
+def _decay_shape(kind: str | None) -> float:
+    """Weibull shape k for a memory kind (default 1.0 == legacy exponential)."""
+    return _DECAY_SHAPES.get(kind or "", _DEFAULT_DECAY_SHAPE)
+
 
 # Weights sum to 1.0 so the score stays in 0..1.
 _W_RELIABILITY = 0.15
@@ -102,9 +143,10 @@ def _run(shift: Shift) -> dict:
     #    whole set over successive runs, instead of re-reading the same
     #    lowest-id prefix forever (where pinned/outcome/recalled rows are
     #    immune and permanently squat the low ids). ---------------------------
+    use_weibull = bool(shift.config.get("forget_weibull", True))
     cursor = _get_cursor(shift.conn)
     rows = shift.conn.execute(
-        "SELECT id, uid, status, pinned, outcome, scope_user, surprise,"
+        "SELECT id, uid, kind, status, pinned, outcome, scope_user, surprise,"
         " helpful_count, harmful_count, recall_count, last_recalled_at,"
         " verification_count, half_life_days, valid_from, recorded_at"
         " FROM memories WHERE valid_to IS NULL AND live=1"
@@ -117,7 +159,7 @@ def _run(shift: Shift) -> dict:
     for row in rows:
         if not shift.tick():
             break
-        score = _value_score(row, now_epoch)
+        score = _value_score(row, now_epoch, use_weibull)
         counts["scored"] += 1
         importance_updates.append((round(score, 6), row["id"]))
         if not _qualifies_demotion(row, score, demote_below, now_epoch):
@@ -157,12 +199,17 @@ def _run(shift: Shift) -> dict:
             shift.audit("forget_demote", row["uid"],
                         {"score": round(score, 4), "from": "active",
                          "to": "summarized"})
+        record_events = events.recording_enabled(shift.config)
         for row, score in tombstone:
             shift.conn.execute(
                 "UPDATE memories SET status='tombstone' WHERE id=?", (row["id"],))
             shift.audit("forget_tombstone", row["uid"],
                         {"score": round(score, 4), "from": "summarized",
                          "to": "tombstone"})
+            # Propagate the deletion to other devices (the engine gates on the
+            # row's scope at push time, so a private tombstone leaks nothing).
+            events.record_event(shift.conn, "tombstone", row["uid"],
+                                enabled=record_events)
         home = shift.config.get("hermes_home")
         purged_n = 0
         # Correctness gate: preserve the raw text in the episodic archive BEFORE
@@ -201,9 +248,35 @@ def _run(shift: Shift) -> dict:
                          "to": "tombstone", "mode": mode})
         for row in purge:
             shift.audit("would_purge", row["uid"], {"mode": mode})
+    # Bound the sync event-log: once sync is on, drop events already pushed
+    # (synced_at set) past the retention window — keep every UNSYNCED event
+    # (a device that hasn't pulled yet still needs them). Active mode only.
+    # Gate on the SAME coupled signal as recording (recording_enabled), or a
+    # log filled under sync_enabled would grow unbounded (PR #5 review).
+    if active and events.recording_enabled(shift.config):
+        counts["events_compacted"] = _compact_synced_events(shift.conn)
     _set_cursor(shift.conn, next_cursor)               # rotate window (any mode)
     shift.conn.commit()
     return counts
+
+
+_SYNCED_EVENT_RETAIN_DAYS = 30
+
+
+def _compact_synced_events(conn: sqlite3.Connection,
+                           retain_days: int = _SYNCED_EVENT_RETAIN_DAYS) -> int:
+    """Delete memory_events already pushed to a relay and older than the
+    retention window; unsynced events are always kept. datetime() on both
+    sides normalizes the ISO 'T'/'Z' stored form for the compare."""
+    try:
+        cur = conn.execute(
+            "DELETE FROM memory_events WHERE synced_at IS NOT NULL "
+            "AND datetime(ts) < datetime('now', ?)",
+            (f"-{int(retain_days)} days",))
+        return cur.rowcount or 0
+    except sqlite3.Error as e:
+        logger.warning("forget: event compaction skipped: %s", e)
+        return 0
 
 
 def _get_cursor(conn: sqlite3.Connection) -> int:
@@ -227,7 +300,8 @@ def _set_cursor(conn: sqlite3.Connection, value: int) -> None:
 # scoring
 # ---------------------------------------------------------------------------
 
-def _value_score(row: sqlite3.Row, now_epoch: float) -> float:
+def _value_score(row: sqlite3.Row, now_epoch: float,
+                 use_weibull: bool = False) -> float:
     """Weighted multi-factor value, 0..1 (pinned rows peg to 1.0)."""
     if row["pinned"]:
         return 1.0
@@ -255,7 +329,14 @@ def _value_score(row: sqlite3.Row, now_epoch: float) -> float:
     age_days = _age_days(row, now_epoch)
     half_life = row["half_life_days"]
     if half_life:
-        recency = 0.5 ** (age_days / float(half_life))
+        if use_weibull:
+            # half_life is the SCALE; per-kind k bends the curve. k=1 (the
+            # default for unmapped kinds) reproduces the legacy 0.5**(...)
+            # exactly. NULL half_life is untouched below (never routed here).
+            recency = halflife_survival(
+                age_days, float(half_life), _decay_shape(row["kind"]))
+        else:
+            recency = 0.5 ** (age_days / float(half_life))
     else:
         recency = math.exp(-age_days / _NO_DECAY_REFERENCE_DAYS)
 

@@ -99,6 +99,29 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     p_why = cmds.add_parser("why", help="provenance + retrieval history for a memory")
     p_why.add_argument("id", help="uid prefix, at least 6 characters")
 
+    p_fact = cmds.add_parser("fact", help="current (or as-of) s-p-o facts for a subject")
+    p_fact.add_argument("subject", help="the subject to look up")
+    p_fact.add_argument("--as-of", dest="as_of", default=None,
+                        help="ISO timestamp for point-in-time truth (default: now)")
+    p_fact.add_argument("--predicate", default=None, help="filter to one predicate")
+
+    p_ask = cmds.add_parser("ask", help="ask a natural-language question over the brain (cited)")
+    p_ask.add_argument("question", nargs="+", help="the question (quotes optional)")
+    p_ask.add_argument("--level", choices=["fast", "deep"], default="deep",
+                       help="fast = quick lookup (<=2 steps); deep = multi-step (default)")
+    p_ask.add_argument("--json", action="store_true", help="emit the raw result as JSON")
+
+    p_ctx = cmds.add_parser("context",
+                            help="assemble a token-budgeted context block from the brain")
+    p_ctx.add_argument("--tokens", type=int, default=None,
+                       help="token budget (default: precompress_tokens config)")
+
+    p_eval = cmds.add_parser("eval", help="run the retrieval/answer eval harness on a fixture")
+    p_eval.add_argument("--fixture", default=None,
+                        help="eval fixture JSON (default: bundled eval_basic.json)")
+    p_eval.add_argument("--real", action="store_true",
+                        help="use the real aux LLM instead of the scripted fake")
+
     p_id = cmds.add_parser("identity", help="manage platform identities (trust roots)")
     id_sub = p_id.add_subparsers(dest="identity_command")
     p_id_add = id_sub.add_parser("add", help="enroll a platform user")
@@ -171,6 +194,13 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     sk_no = sk_sub.add_parser("reject", help="reject a draft")
     sk_no.add_argument("uid", help="proposal uid")
 
+    p_sync = cmds.add_parser("sync", help="multi-device encrypted delta sync")
+    sync_sub = p_sync.add_subparsers(dest="sync_command")
+    sync_sub.add_parser("init", help="generate device id + shared account/salt (run once)")
+    sync_sub.add_parser("push", help="encrypt and push local deltas to the relay")
+    sync_sub.add_parser("pull", help="pull, decrypt, and apply remote deltas")
+    sync_sub.add_parser("status", help="show sync config, cursors, and unsynced count")
+
     cmds.add_parser("mcp", help="run the stdio MCP server (for external agents)")
 
     p_adopt = cmds.add_parser("adopt-memory",
@@ -185,17 +215,20 @@ def brain_command(args: argparse.Namespace) -> int:
     handler = {
         "status": cmd_status, "search": cmd_search, "doctor": cmd_doctor,
         "bootstrap": cmd_bootstrap, "remember": cmd_remember, "forget": cmd_forget,
-        "pin": cmd_pin, "unpin": cmd_unpin, "why": cmd_why, "identity": cmd_identity,
+        "pin": cmd_pin, "unpin": cmd_unpin, "why": cmd_why, "fact": cmd_fact,
+        "ask": cmd_ask, "context": cmd_context, "eval": cmd_eval,
+        "identity": cmd_identity,
         "refresh-index": cmd_refresh_index, "reindex": cmd_reindex,
         "models": cmd_models, "export": cmd_export, "import": cmd_import,
         "incognito": cmd_incognito, "dream-now": cmd_dream_now, "dream": cmd_dream,
         "insights": cmd_insights, "review": cmd_review, "skills": cmd_skills,
+        "sync": cmd_sync,
         "mcp": cmd_mcp, "adopt-memory": cmd_adopt_memory,
     }.get(cmd)
     if handler is None:
         print(f"Unknown brain command: {cmd}. Try: hermes brain status|search|doctor|"
-              f"remember|forget|why|identity|reindex|models|export|import|incognito|"
-              f"dream-now|dream|insights|review|skills|mcp|adopt-memory",
+              f"remember|forget|why|fact|ask|identity|reindex|models|export|import|incognito|"
+              f"dream-now|dream|insights|review|skills|context|sync|mcp|adopt-memory",
               file=sys.stderr)
         return 1
     return handler(args)
@@ -738,8 +771,15 @@ def cmd_remember(args: argparse.Namespace) -> int:
             " kind=COALESCE(?, kind) WHERE id=?",
             (args.kind, mem_id),
         )
-        conn.commit()
         row = conn.execute("SELECT uid, kind FROM memories WHERE id=?", (mem_id,)).fetchone()
+        # Sync seam: a CLI-remembered memory must enter the outbox too, or a
+        # synced device never sees it. Off unless sync is on.
+        from . import config as _config
+        from .store import events as _events
+        _events.record_event(
+            conn, "create", row["uid"], payload={"kind": row["kind"]},
+            enabled=_events.recording_enabled(_config.load_config(home)))
+        conn.commit()
         print(f"remembered {row['uid'][:8]} ({row['kind']})")
         return 0
     finally:
@@ -778,6 +818,15 @@ def cmd_forget(args: argparse.Namespace) -> int:
             conn.execute("DELETE FROM edges WHERE src_id=? OR dst_id=?", (mem_id, mem_id))
             conn.execute("DELETE FROM entity_mentions WHERE memory_id=?", (mem_id,))
             conn.execute("DELETE FROM lane1_snapshot WHERE memory_id=?", (mem_id,))
+            # facts.memory_id REFERENCES memories(id) and FKs are ON, so the
+            # delete below would fail if any fact still points at this row.
+            # facts.superseded_by is ALSO a self-FK: an older fact (for a
+            # DIFFERENT memory) may point at a fact we're about to delete, so
+            # clear those references first or that DELETE fails too (PR #5 review).
+            conn.execute(
+                "UPDATE facts SET superseded_by=NULL WHERE superseded_by IN "
+                "(SELECT id FROM facts WHERE memory_id=?)", (mem_id,))
+            conn.execute("DELETE FROM facts WHERE memory_id=?", (mem_id,))
             for col in ("supersedes_id", "superseded_by", "invalidated_by"):
                 conn.execute(f"UPDATE memories SET {col}=NULL WHERE {col}=?", (mem_id,))
             conn.execute("DELETE FROM memories WHERE id=?", (mem_id,))
@@ -811,6 +860,14 @@ def cmd_forget(args: argparse.Namespace) -> int:
             # A tombstoned memory must leave lane 1 immediately, not at the
             # next dream-cycle rematerialization (mirrors the hard branch).
             conn.execute("DELETE FROM lane1_snapshot WHERE memory_id=?", (row["id"],))
+            # Propagate the deletion to other devices (off unless sync_events).
+            # The row stays present as a tombstone, so the sync engine gates on
+            # its scope at push time — a private forget leaks nothing.
+            from . import config as _config
+            from .store import events as _events
+            _events.record_event(
+                conn, "tombstone", row["uid"],
+                enabled=_events.recording_enabled(_config.load_config(home)))
             _audit_cli(conn, "cli_forget", row["uid"])
             db.bump_generation(conn, "mem")
             conn.commit()
@@ -915,6 +972,31 @@ def cmd_why(args: argparse.Namespace) -> int:
         print(f"recalled          {row['recall_count']} times"
               f" (last {row['last_recalled_at'] or 'never'}); injected {injected} times")
 
+        facts = conn.execute(
+            "SELECT subject, predicate, object, confidence, valid_from, valid_until "
+            "FROM facts WHERE memory_id=? ORDER BY valid_from",
+            (row["id"],),
+        ).fetchall()
+        if facts:
+            print("facts:")
+            for f in facts:
+                window = f"{f['valid_from']} -> {f['valid_until'] or '(current)'}"
+                print(f"  {f['subject']} --{f['predicate']}--> {f['object']}"
+                      f"   conf={f['confidence']:.2f}  [{window}]")
+
+        try:
+            from .store import facts as facts_store
+
+            chain = facts_store.reasoning_chain(conn, row["id"])
+            if chain and len(chain) > 1:
+                print("reasoning chain:")
+                for node in chain:
+                    uid = node.get("uid") or node.get("id") or "?"
+                    snippet = str(node.get("content") or node.get("summary") or "")[:80]
+                    print(f"  {str(uid)[:8]}  {snippet}")
+        except Exception as e:  # provenance walk is best-effort diagnostic
+            logger.debug("reasoning_chain unavailable: %s", e)
+
         audits = conn.execute(
             "SELECT actor, action, ts FROM audit_log WHERE target=? ORDER BY ts",
             (row["uid"],),
@@ -931,6 +1013,274 @@ def cmd_why(args: argparse.Namespace) -> int:
         return 1
     finally:
         conn.close()
+
+
+def cmd_fact(args: argparse.Namespace) -> int:
+    """Current (or point-in-time) s-p-o facts for a subject."""
+    conn = _open_db(_hermes_home())
+    if conn is None:
+        return 1
+    try:
+        from .store import facts as facts_store
+
+        as_of = getattr(args, "as_of", None)
+        rows = facts_store.query_facts(
+            conn, subject=args.subject,
+            predicate=getattr(args, "predicate", None), as_of=as_of)
+        label = f"as of {as_of}" if as_of else "current truth"
+        if not rows:
+            print(f"no facts for subject {args.subject!r} ({label})")
+            return 0
+        print(f"facts for {args.subject!r} ({label}):")
+        for f in rows:
+            window = f"{f.valid_from} -> {f.valid_until or '(current)'}"
+            print(f"  {f.subject} --{f.predicate}--> {f.object}"
+                  f"   conf={f.confidence:.2f}  [{window}]")
+        return 0
+    except Exception as e:
+        print(f"fact failed: {e}\n"
+              f"  Remedy: run 'hermes brain doctor' to check brain.db health.",
+              file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    """Dialectic ask: a cited, natural-language answer over the brain."""
+    import json as _json
+
+    from . import config
+    from .recall.ask import ask as ask_fn
+    from .recall.embed import get_embedder
+    from .recall.rerank import get_reranker
+    from .store import sysinfo
+
+    home = _hermes_home()
+    question = " ".join(args.question)
+    cfg = config.load_config(home)
+    mode = sysinfo.resolve_mode(str(cfg.get("mode", "auto")))
+    embedder = get_embedder(cfg, mode, allow_download=False)
+    reranker = get_reranker(cfg, mode, allow_download=False)
+    conn = _open_db(home)
+    if conn is None:
+        return 1
+    try:
+        result = ask_fn(
+            conn, question, level=args.level, trust_tier="owner",
+            embedder=embedder, reranker=reranker, config=cfg,
+            max_iterations=int(cfg.get("ask_max_iterations", 6)))
+        if getattr(args, "json", False):
+            print(_json.dumps({
+                "answered": result.answered, "answer": result.answer,
+                "citations": result.citations, "iterations": result.iterations,
+                "level": result.level, "degraded": result.degraded,
+            }, indent=2))
+            return 0
+        if result.degraded:
+            print("(degraded: the LLM was unavailable — showing recall only)\n")
+        if result.answered and result.answer:
+            print(result.answer)
+        else:
+            print("I don't know — the brain has no clear evidence for that.")
+        if result.citations:
+            print("\nsources:")
+            for c in result.citations:
+                uid = str(c.get("uid") or "")[:8]
+                snip = " ".join(str(c.get("snippet") or "").split())[:100]
+                print(f"  [{uid}] {snip}")
+        print(f"\n({result.level}, {result.iterations} steps)")
+        return 0
+    except Exception as e:
+        print(f"ask failed: {e}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+
+def cmd_context(args: argparse.Namespace) -> int:
+    """Assemble a token-budgeted context block from the brain (identity +
+    peer card + distilled summary), as the compression path would."""
+    from . import config
+    from .recall.context import assemble
+    from .recall.embed import get_embedder
+    from .store import sysinfo
+
+    home = _hermes_home()
+    cfg = config.load_config(home)
+    budget = args.tokens if getattr(args, "tokens", None) else int(
+        cfg.get("precompress_tokens", 300))
+    mode = sysinfo.resolve_mode(str(cfg.get("mode", "auto")))
+    embedder = get_embedder(cfg, mode, allow_download=False)
+    conn = _open_db(home)
+    if conn is None:
+        return 1
+    try:
+        block = assemble(
+            conn, [], budget, principal_id=None, trust_tier="owner",
+            embedder=embedder, config=cfg,
+            summary_ratio=float(cfg.get("context_summary_ratio", 0.4)))
+        print(block if block else "(no context assembled)")
+        return 0
+    except Exception as e:
+        print(f"context failed: {e}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    """Multi-device encrypted delta sync: init | push | pull | status.
+
+    Client-side crypto only (the relay stores opaque ciphertext). The shared
+    passphrase comes from the HERMES_BRAIN_SYNC_PASSPHRASE env var; account +
+    salt are replicated across a user's devices (printed by `init`)."""
+    import base64
+    import os
+
+    from . import config
+    from .store import db
+
+    home = _hermes_home()
+    cfg = config.load_config(home)
+    sub = getattr(args, "sync_command", None) or "status"
+
+    if sub == "init":
+        try:
+            from .sync import crypto as sync_crypto
+        except Exception as e:
+            print(f"sync unavailable: {e}", file=sys.stderr)
+            return 1
+        updates: dict[str, object] = {}
+        if not cfg.get("sync_device_id"):
+            updates["sync_device_id"] = db.new_ulid()
+        if not cfg.get("sync_account"):
+            updates["sync_account"] = db.new_ulid()
+        if not cfg.get("sync_salt"):
+            updates["sync_salt"] = base64.b64encode(sync_crypto.new_salt()).decode()
+        if updates:
+            config.save_config(home, updates)
+            cfg = config.load_config(home)
+        print("sync initialized:")
+        print(f"  device_id  {cfg['sync_device_id']}")
+        print(f"  account    {cfg['sync_account']}   (copy to every device)")
+        print(f"  salt       {cfg['sync_salt']}   (copy to every device)")
+        print("\nNext, on THIS device: set sync_url and sync_enabled: true in "
+              "brain.yaml, and export HERMES_BRAIN_SYNC_PASSPHRASE.")
+        print("On OTHER devices: set the SAME account, salt, and passphrase.")
+        return 0
+
+    conn = _open_db(home)
+    if conn is None:
+        return 1
+    try:
+        if sub == "status":
+            unsynced = conn.execute(
+                "SELECT count(*) FROM memory_events WHERE synced_at IS NULL").fetchone()[0]
+            total = conn.execute("SELECT count(*) FROM memory_events").fetchone()[0]
+            print("sync status:")
+            print(f"  enabled     {bool(cfg.get('sync_enabled'))}")
+            print(f"  url         {cfg.get('sync_url') or '(unset)'}")
+            print(f"  account     {cfg.get('sync_account') or '(unset)'}")
+            print(f"  device_id   {cfg.get('sync_device_id') or '(unset)'}")
+            print(f"  salt        {'set' if cfg.get('sync_salt') else '(unset)'}")
+            print(f"  passphrase  {'set' if os.environ.get('HERMES_BRAIN_SYNC_PASSPHRASE') else '(unset in env)'}")
+            print(f"  events      {unsynced} unsynced / {total} total")
+            print(f"  outbox={db.get_meta(conn, 'sync_outbox_cursor') or '-'}  "
+                  f"pull={db.get_meta(conn, 'sync_pull_cursor') or '-'}")
+            return 0
+
+        if sub in ("push", "pull"):
+            if not cfg.get("sync_enabled"):
+                print("sync is disabled (set sync_enabled: true in brain.yaml)",
+                      file=sys.stderr)
+                return 1
+            try:
+                from .sync import crypto as sync_crypto
+                from .sync.engine import pull as sync_pull
+                from .sync.engine import push as sync_push
+                from .sync.relay import RelayClient
+            except Exception as e:
+                print(f"sync unavailable ({e}); install: pip install -e .[sync]",
+                      file=sys.stderr)
+                return 1
+            if not sync_crypto.crypto_available():
+                print("the [sync] extra (cryptography) is not installed: "
+                      "pip install -e .[sync]", file=sys.stderr)
+                return 1
+            passphrase = os.environ.get("HERMES_BRAIN_SYNC_PASSPHRASE")
+            fields = {"sync_url": cfg.get("sync_url"),
+                      "sync_account": cfg.get("sync_account"),
+                      "sync_salt": cfg.get("sync_salt"),
+                      "sync_device_id": cfg.get("sync_device_id"),
+                      "HERMES_BRAIN_SYNC_PASSPHRASE": passphrase}
+            missing = [k for k, v in fields.items() if not v]
+            if missing:
+                print(f"sync not configured — missing: {', '.join(missing)}. "
+                      f"Run 'hermes brain sync init'.", file=sys.stderr)
+                return 1
+            crypto = sync_crypto.SyncCrypto.from_passphrase(
+                passphrase, base64.b64decode(cfg["sync_salt"]))
+            client = RelayClient(cfg["sync_url"], namespace=cfg["sync_account"])
+            origin = cfg["sync_device_id"]
+            if sub == "push":
+                s = sync_push(conn, crypto, client, origin=origin)
+                print(f"pushed {s.get('pushed', 0)} "
+                      f"(skipped {s.get('skipped_private', 0)} private); "
+                      f"cursor {s.get('cursor')}")
+            else:
+                s = sync_pull(conn, crypto, client, origin=origin)
+                print(f"pulled {s.get('pulled', 0)}, applied {s.get('applied', 0)} "
+                      f"({s.get('conflicts', 0)} conflicts); cursor {s.get('cursor')}")
+            return 0
+
+        print(f"unknown sync command: {sub} (use init|push|pull|status)",
+              file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"sync {sub} failed: {e}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+
+def cmd_eval(args: argparse.Namespace) -> int:
+    """Run the eval harness (retrieval P@k/MRR + answer/abstain rubric) on a
+    fixture. Loads the harness by file path so it works under any package name.
+    Use --real to hit the real aux LLM instead of the scripted fake."""
+    import importlib.util
+    from pathlib import Path
+
+    harness_path = Path(__file__).parent / "tests" / "eval" / "harness.py"
+    if not harness_path.exists():
+        print(f"eval harness not found at {harness_path}", file=sys.stderr)
+        return 1
+    spec = importlib.util.spec_from_file_location("brain_eval_harness", harness_path)
+    if spec is None or spec.loader is None:
+        print("cannot load eval harness", file=sys.stderr)
+        return 1
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    except Exception as e:
+        print(f"cannot load eval harness: {e}", file=sys.stderr)
+        return 1
+    fixture = args.fixture or str(harness_path.parent / "fixtures" / "eval_basic.json")
+    try:
+        m = mod.run_eval(fixture, real=bool(getattr(args, "real", False)))
+    except Exception as e:
+        print(f"eval failed: {e}\n"
+              f"  Remedy: check the fixture path and (for --real) that an aux "
+              f"LLM is configured.", file=sys.stderr)
+        return 1
+    print(f"fixture:          {fixture}")
+    print(f"tier:             {m.get('tier')}   real_llm={m.get('real')}")
+    print(f"P@{m.get('k', 5)}:             {m.get('p_at_5', 0.0):.3f}")
+    print(f"MRR:              {m.get('mrr', 0.0):.3f}")
+    print(f"answer pass rate: {m.get('answer_pass_rate', 0.0):.3f}")
+    print(f"abstain correct:  {m.get('abstain_correct', 0.0):.3f}")
+    print(f"llm calls:        {m.get('llm_calls', 0)}")
+    return 0
 
 
 # ---------------------------------------------------------------------------
