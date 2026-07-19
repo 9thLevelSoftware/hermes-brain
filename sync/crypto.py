@@ -100,16 +100,12 @@ class SyncCrypto:
 
     @classmethod
     def from_passphrase(cls, passphrase: str, salt: bytes) -> SyncCrypto:
-        """Derive the key from a passphrase + salt (deterministic).
+        """Derive the key from a passphrase + salt, deterministically and
+        IDENTICALLY on every device.
 
-        Prefers **Argon2id** when available — first ``cryptography``'s own
-        ``Argon2id`` KDF (cryptography >= 44), then the ``argon2-cffi``
-        low-level binding. Falls back to **PBKDF2-HMAC-SHA256** at 600,000
-        iterations when neither Argon2 backend is present. All three derive a
-        32-byte key; the same passphrase+salt always yields the same key.
-
-        Argon2id params: time_cost=3, memory_cost=65536 KiB (64 MiB),
-        parallelism=4, hash_len=32 (OWASP-recommended baseline).
+        Uses **PBKDF2-HMAC-SHA256** at 600,000 iterations (32-byte key) — pinned
+        rather than auto-selected, so all installs behind the ``[sync]`` extra
+        (``cryptography>=42``) derive the same key from the same passphrase+salt.
         """
         if not isinstance(passphrase, str):
             raise TypeError("passphrase must be str")
@@ -118,39 +114,15 @@ class SyncCrypto:
         salt = bytes(salt)
         secret = passphrase.encode("utf-8")
 
-        # 1) cryptography's Argon2id (preferred).
-        try:
-            from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
-
-            kdf = Argon2id(
-                salt=salt,
-                length=32,
-                iterations=3,
-                lanes=4,
-                memory_cost=65536,
-            )
-            return cls(kdf.derive(secret))
-        except ImportError:
-            pass
-
-        # 2) argon2-cffi low-level (Argon2id) — same primitive, different lib.
-        try:
-            import argon2.low_level as _argon2
-
-            raw = _argon2.hash_secret_raw(
-                secret=secret,
-                salt=salt,
-                time_cost=3,
-                memory_cost=65536,
-                parallelism=4,
-                hash_len=32,
-                type=_argon2.Type.ID,
-            )
-            return cls(raw)
-        except ImportError:
-            pass
-
-        # 3) PBKDF2-HMAC-SHA256 fallback (needs cryptography).
+        # KDF is PINNED to PBKDF2-HMAC-SHA256 for CROSS-DEVICE DETERMINISM.
+        # The [sync] extra only requires cryptography>=42; Argon2id is absent
+        # from cryptography <44 and argon2-cffi is not a dependency, so
+        # auto-selecting the "best available" backend made two otherwise-valid
+        # installs derive DIFFERENT keys from the same passphrase+salt — a
+        # silent decrypt failure across devices (PR #5 review). PBKDF2HMAC ships
+        # in every cryptography version, so it is the one KDF all devices agree
+        # on. (To adopt Argon2id later: pin argon2-cffi in the extra AND record
+        # a KDF id + params in the shared config so devices negotiate one.)
         try:
             from cryptography.hazmat.primitives import hashes
             from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC

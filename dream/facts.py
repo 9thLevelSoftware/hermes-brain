@@ -147,10 +147,10 @@ def _run(shift: Shift) -> dict:
                 "superseded": conflict,
             })
 
-    if not active:
-        # add_fact() commits its own writes; in shadow/dry_run only the audit
-        # rows are pending, so flush them here.
-        conn.commit()
+    # add_fact no longer self-commits (PR #5 review — it must not commit the
+    # caller's transaction), so flush here in EVERY mode: active persists the
+    # triples + their memory links, shadow/dry_run persists only the audit rows.
+    conn.commit()
     return counts
 
 

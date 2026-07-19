@@ -136,3 +136,19 @@ def test_body_mac_roundtrip_with_derived_key():
     mac = sc.body_mac(data)
     assert sc.verify_mac(data, mac) is True
     assert sc.verify_mac(b"other", mac) is False
+
+
+def test_from_passphrase_is_pinned_to_pbkdf2_for_cross_device_agreement():
+    """The KDF is PINNED to PBKDF2-HMAC-SHA256, not auto-selected by installed
+    backends — so every install behind the [sync] extra derives the SAME key
+    from the same passphrase+salt (PR #5 review: Argon2 auto-selection made two
+    valid installs derive different, incompatible keys)."""
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+    salt = b"0123456789abcdef"
+    c = SyncCrypto.from_passphrase("correct horse battery", salt)
+    ref = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt,
+                     iterations=600_000).derive(b"correct horse battery")
+    assert c._raw_key == ref

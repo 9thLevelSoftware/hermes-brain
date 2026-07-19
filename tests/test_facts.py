@@ -198,3 +198,38 @@ def test_reasoning_chain_single_row(conn):
 
 def test_reasoning_chain_missing_memory(conn):
     assert facts.reasoning_chain(conn, 999999) == []
+
+
+def test_superseding_one_triple_does_not_orphan_a_sibling_fact(conn):
+    """A single memory can back MANY triples (extraction emits several per
+    item). Superseding one triple must NOT retire the shared memory while other
+    current facts still point at it — the siblings must stay retrievable
+    (PR #5 review)."""
+    mem = seed_memory(conn, "alice is an engineer who lives in berlin")
+    facts.add_fact(conn, "alice", "role", "engineer", memory_id=mem)
+    facts.add_fact(conn, "alice", "lives_in", "berlin", memory_id=mem)
+
+    mem2 = seed_memory(conn, "alice now lives in munich")
+    facts.add_fact(conn, "alice", "lives_in", "munich", memory_id=mem2)  # update
+
+    # The shared memory is NOT retired (it still backs role=engineer).
+    row = conn.execute("SELECT valid_to FROM memories WHERE id=?", (mem,)).fetchone()
+    assert row["valid_to"] is None
+    # The sibling fact is still current-truth and points at the live memory.
+    role = facts.query_facts(conn, subject="alice", predicate="role")
+    assert [f.object for f in role] == ["engineer"]
+    assert role[0].memory_id == mem
+    # And the update itself took effect.
+    where = facts.query_facts(conn, subject="alice", predicate="lives_in")
+    assert [f.object for f in where] == ["munich"]
+
+
+def test_add_fact_does_not_commit_the_callers_transaction(conn):
+    """add_fact must not commit — the caller owns the transaction, so a
+    rollback after add_fact must discard the fact (PR #5 review)."""
+    mem = seed_memory(conn, "a fact that will be rolled back")
+    facts.add_fact(conn, "server", "region", "us-east", memory_id=mem)
+    assert facts.query_facts(conn, subject="server", predicate="region")  # visible pre-commit
+    conn.rollback()
+    # If add_fact had committed, the row would survive the rollback.
+    assert facts.query_facts(conn, subject="server", predicate="region") == []

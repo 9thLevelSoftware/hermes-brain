@@ -278,3 +278,25 @@ def test_grep_and_reasoning_chain_actions(conn):
     assert "grep_episodes" in res.tools_used
     assert "get_reasoning_chain" in res.tools_used
     assert res.iterations == 3
+
+
+def test_grep_evidence_is_citable(conn):
+    """An answer built from grep_episodes must be able to CITE the grepped
+    episode. grep now registers its hits, so finalization keeps the citation
+    instead of discarding it (PR #5 review: grep answers came back citations=[])."""
+    from conftest import seed_episode
+
+    ep = seed_episode(conn, "the office wifi password is hunter2-max",
+                      "saved that for you")
+    conn.execute("UPDATE episodes SET trust_tier='owner' WHERE id=?", (ep,))
+    conn.commit()
+    ep_uid8 = conn.execute(
+        "SELECT uid FROM episodes WHERE id=?", (ep,)).fetchone()["uid"][:8]
+
+    llm.set_llm_for_tests(ScriptedLLM([
+        _action("grep_episodes", pattern="wifi password"),
+        _action("answer", text="It's hunter2-max.", citations=[ep_uid8]),
+    ]))
+    res = ask(conn, "what is the office wifi password?", trust_tier="owner")
+    assert res.answered
+    assert any(c["uid"] == ep_uid8 and c["snippet"] for c in res.citations)

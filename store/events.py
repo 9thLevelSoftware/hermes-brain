@@ -120,6 +120,16 @@ class Event:
 # Writer
 # ---------------------------------------------------------------------------
 
+def recording_enabled(config: dict | None) -> bool:
+    """Whether lifecycle events should be recorded. True when EITHER sync_events
+    (record without pushing — pre-populate the log) OR sync_enabled (the master
+    push/pull switch) is set. Coupling them removes the footgun where a user
+    follows the CLI hint to set sync_enabled but leaves the outbox empty because
+    sync_events was still off (PR #5 review)."""
+    config = config or {}
+    return bool(config.get("sync_events") or config.get("sync_enabled"))
+
+
 def record_event(
     conn: sqlite3.Connection,
     op: str,
@@ -149,14 +159,15 @@ def record_event(
             " VALUES (?,?,?,?,?,?)",
             (event_id, db.iso_now(), op, memory_uid, payload_json, origin),
         )
-        conn.commit()
+        # No conn.commit() / rollback here — the CALLER owns the transaction
+        # (this runs inside _write_item / forget, which have audit + promotion
+        # + batch work still pending). Committing would persist a half-built
+        # unit; rolling back would DESTROY the caller's pending writes. On a
+        # failed insert we simply skip the event and leave the txn untouched
+        # (PR #5 review).
         return event_id
     except Exception as exc:  # never raise into a turn (invariant #3)
         logger.warning("record_event(%s, %s) skipped: %s", op, memory_uid, exc)
-        try:
-            conn.rollback()
-        except sqlite3.Error:
-            pass
         return None
 
 

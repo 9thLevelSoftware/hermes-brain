@@ -156,3 +156,47 @@ def test_empty_log_returns_no_rows_and_none_cursor(conn):
     got, nxt = events.events_since(conn)
     assert got == []
     assert nxt is None
+
+
+def test_recording_enabled_couples_sync_enabled(conn):
+    """Events record when EITHER sync_events OR the master sync_enabled is on —
+    so enabling sync_enabled (per the CLI hint) alone populates the outbox
+    (PR #5 review)."""
+    assert events.recording_enabled({}) is False
+    assert events.recording_enabled({"sync_events": True}) is True
+    assert events.recording_enabled({"sync_enabled": True}) is True   # the fix
+    assert events.recording_enabled(None) is False
+
+
+def test_record_event_does_not_commit_the_callers_transaction(conn):
+    """record_event must leave the transaction to the caller — a rollback after
+    it must discard the event (PR #5 review)."""
+    events.record_event(conn, "create", "uid-xyz", enabled=True)
+    assert events.events_since(conn)[0]              # visible pre-commit
+    conn.rollback()
+    assert events.events_since(conn)[0] == []        # gone after rollback
+
+
+def test_remember_tool_emits_create_event_when_sync_on(conn):
+    """A DIRECT add via brain_remember must enter the outbox when sync is on —
+    the user's repro was 'a direct add produced zero memory_events' (PR #5)."""
+    from brain import tools
+    from brain.config import DEFAULTS
+
+    ctx = tools.ToolContext(
+        session_id="s", principal_id="owner", trust_tier="owner",
+        config={**DEFAULTS, "sync_enabled": True})   # sync_enabled alone
+    out = tools.dispatch(conn, "brain_remember",
+                         {"content": "the primary database is postgres 16"}, ctx=ctx)
+    assert "error" not in out
+    evs, _ = events.events_since(conn)
+    assert any(e.op == "create" for e in evs)
+
+    # ...and NOT when sync is off (no outbox churn by default).
+    ctx_off = tools.ToolContext(
+        session_id="s", principal_id="owner", trust_tier="owner",
+        config=dict(DEFAULTS))
+    tools.dispatch(conn, "brain_remember",
+                   {"content": "the cache layer is redis"}, ctx=ctx_off)
+    evs2, _ = events.events_since(conn)
+    assert len(evs2) == len(evs)          # no new event added

@@ -199,7 +199,7 @@ def _run(shift: Shift) -> dict:
             shift.audit("forget_demote", row["uid"],
                         {"score": round(score, 4), "from": "active",
                          "to": "summarized"})
-        sync_events = bool(shift.config.get("sync_events", False))
+        record_events = events.recording_enabled(shift.config)
         for row, score in tombstone:
             shift.conn.execute(
                 "UPDATE memories SET status='tombstone' WHERE id=?", (row["id"],))
@@ -209,7 +209,7 @@ def _run(shift: Shift) -> dict:
             # Propagate the deletion to other devices (the engine gates on the
             # row's scope at push time, so a private tombstone leaks nothing).
             events.record_event(shift.conn, "tombstone", row["uid"],
-                                enabled=sync_events)
+                                enabled=record_events)
         home = shift.config.get("hermes_home")
         purged_n = 0
         # Correctness gate: preserve the raw text in the episodic archive BEFORE

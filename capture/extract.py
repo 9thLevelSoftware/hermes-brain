@@ -230,7 +230,10 @@ def sweep(
             # Phase B: extract s-p-o triples into the facts index, and (off by
             # default) append lifecycle events to the sync seam.
             ctx["facts_extract"] = bool(config.get("facts_extract", True))
-            ctx["sync_events"] = bool(config.get("sync_events", False))
+            # Record lifecycle events when sync is on (sync_events OR the master
+            # sync_enabled switch — see store/events.recording_enabled).
+            ctx["record_events"] = bool(
+                config.get("sync_events") or config.get("sync_enabled"))
             wrote = _apply_items(conn, result, ctx, embedder=embedder,
                                  shadow=shadow, actor=actor, counts=counts)
             _promote(conn, promote_rows)
@@ -714,7 +717,7 @@ def _record_event(conn, op: str, memory_uid: str, ctx, *, payload=None) -> None:
     it). No-op unless sync_events is on; record_event never raises."""
     from ..store import events as events_store
     events_store.record_event(conn, op, memory_uid, payload=payload,
-                              enabled=ctx.get("sync_events", False))
+                              enabled=ctx.get("record_events", False))
 
 
 def _resolve_scope(item, ctx, known):

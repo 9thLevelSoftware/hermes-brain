@@ -787,6 +787,13 @@ def _remember(conn: sqlite3.Connection, args: dict, ctx: ToolContext) -> dict:
         )
         row_id = cur.lastrowid
         db.bump_generation(conn, "mem")
+        # Sync seam: a directly-remembered memory must enter the outbox too
+        # (not just extracted ones), or a synced device never sees it. Off
+        # unless sync is on; the engine gates scope at push time.
+        from .store import events as _events
+        _events.record_event(conn, "create", uid,
+                             enabled=_events.recording_enabled(ctx.config),
+                             payload={"kind": kind, "quarantined": quarantine})
         _audit(conn, "brain_remember", uid,
                {"kind": kind, "trust_tier": trust, "status": status}, now)
         conn.commit()

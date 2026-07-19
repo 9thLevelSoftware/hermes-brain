@@ -116,14 +116,27 @@ def add_fact(
             (now, new_id, old_id),
         )
         # The fact index moved to a new memory -> retire the old NL row in
-        # lockstep. Only when both sides carry a memory AND they differ.
+        # lockstep — but ONLY when that memory no longer backs any OTHER
+        # current-truth fact. One memory can carry MANY triples (extraction
+        # emits several per item), so retiring it because a single triple
+        # changed would orphan the siblings: they'd point at a non-current row
+        # and drop out of current-truth recall (PR #5 review).
         if old_mem is not None and memory_id is not None and old_mem != memory_id:
-            conn.execute(
-                "UPDATE memories SET valid_to=?, superseded_by=? WHERE id=?",
-                (now, memory_id, old_mem),
-            )
+            still_used = conn.execute(
+                "SELECT 1 FROM facts WHERE memory_id=? AND valid_until IS NULL LIMIT 1",
+                (old_mem,),
+            ).fetchone()
+            if still_used is None:
+                conn.execute(
+                    "UPDATE memories SET valid_to=?, superseded_by=? WHERE id=?",
+                    (now, memory_id, old_mem),
+                )
 
-    conn.commit()
+    # NOTE: no conn.commit() here — the CALLER owns the transaction. add_fact
+    # runs inside _write_item's extraction transaction (audit + promotion still
+    # pending) and inside dream strategies that batch multiple writes; a commit
+    # here would prematurely persist a half-built unit and defeat the caller's
+    # rollback (PR #5 review).
     return new_id
 
 

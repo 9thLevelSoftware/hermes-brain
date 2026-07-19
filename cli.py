@@ -771,8 +771,15 @@ def cmd_remember(args: argparse.Namespace) -> int:
             " kind=COALESCE(?, kind) WHERE id=?",
             (args.kind, mem_id),
         )
-        conn.commit()
         row = conn.execute("SELECT uid, kind FROM memories WHERE id=?", (mem_id,)).fetchone()
+        # Sync seam: a CLI-remembered memory must enter the outbox too, or a
+        # synced device never sees it. Off unless sync is on.
+        from . import config as _config
+        from .store import events as _events
+        _events.record_event(
+            conn, "create", row["uid"], payload={"kind": row["kind"]},
+            enabled=_events.recording_enabled(_config.load_config(home)))
+        conn.commit()
         print(f"remembered {row['uid'][:8]} ({row['kind']})")
         return 0
     finally:
@@ -854,7 +861,7 @@ def cmd_forget(args: argparse.Namespace) -> int:
             from .store import events as _events
             _events.record_event(
                 conn, "tombstone", row["uid"],
-                enabled=bool(_config.load_config(home).get("sync_events", False)))
+                enabled=_events.recording_enabled(_config.load_config(home)))
             _audit_cli(conn, "cli_forget", row["uid"])
             db.bump_generation(conn, "mem")
             conn.commit()

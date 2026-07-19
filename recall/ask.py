@@ -254,12 +254,12 @@ def _dispatch(conn, search_mod, facts_mod, name, params, registry,
 
         if name == "grep_episodes":
             return _grep_episodes(
-                conn, search_mod, params, principal_id, source_author,
+                conn, search_mod, params, registry, principal_id, source_author,
                 trust_tier), "grep_episodes"
 
         if name == "get_reasoning_chain":
             return _reasoning_chain(
-                conn, facts_mod, params, principal_id,
+                conn, facts_mod, params, registry, principal_id,
                 trust_tier), "get_reasoning_chain"
 
         if name == "date_range_search":
@@ -278,10 +278,12 @@ def _dispatch(conn, search_mod, facts_mod, name, params, registry,
         return {"error": "action failed", "action": name}, (name or None)
 
 
-def _grep_episodes(conn, search_mod, params, principal_id, source_author,
-                   trust_tier):
+def _grep_episodes(conn, search_mod, params, registry, principal_id,
+                   source_author, trust_tier):
     """Scoped FTS over episode_fts. Reuses search.py's episode scoping — a
-    non-owner only ever sees episodes attributable to them."""
+    non-owner only ever sees episodes attributable to them. Registers each hit
+    in `registry` so the model can CITE grep evidence (finalization keeps only
+    citations backed by the registry, so an unregistered uid is dropped)."""
     pattern = str(params.get("pattern") or params.get("query") or "")
     match = search_mod._match_expr(pattern)
     if not match:
@@ -293,17 +295,19 @@ def _grep_episodes(conn, search_mod, params, principal_id, source_author,
     except Exception as e:  # e.g. no fts5 on the floor tier
         logger.warning("brain ask grep_episodes failed: %s", e)
         rows = []
-    episodes = [{
-        "uid": r["uid"][:_UID_LEN],
-        "ts": r["ts"],
-        "snippet": _snip(f"{r['user_content']} / {r['assistant_content']}"),
-    } for r in rows]
+    episodes = []
+    for r in rows:
+        uid8 = r["uid"][:_UID_LEN]
+        snippet = _snip(f"{r['user_content']} / {r['assistant_content']}")
+        registry[uid8] = snippet
+        episodes.append({"uid": uid8, "ts": r["ts"], "snippet": snippet})
     return {"episodes": episodes}
 
 
-def _reasoning_chain(conn, facts_mod, params, principal_id, trust_tier):
+def _reasoning_chain(conn, facts_mod, params, registry, principal_id, trust_tier):
     """uid -> memory id (scope-verified: the caller must be able to SEE that
-    memory first) -> provenance chain. Out-of-scope uids read as not found."""
+    memory first) -> provenance chain. Out-of-scope uids read as not found.
+    Registers each visible node so the model can cite the chain."""
     row = _resolve_memory_scoped(
         conn, params.get("uid") or params.get("id"), principal_id, trust_tier)
     if row is None:
@@ -316,11 +320,14 @@ def _reasoning_chain(conn, facts_mod, params, principal_id, trust_tier):
     # (scope predicate only, NOT current-truth: predecessors are superseded).
     if trust_tier != "owner":
         chain = _scope_filter_chain(conn, chain, principal_id)
-    return {"chain": [{
-        "uid": (c.get("uid") or "")[:_UID_LEN],
-        "kind": c.get("kind"),
-        "snippet": _snip(c.get("content") or c.get("summary") or ""),
-    } for c in chain]}
+    out = []
+    for c in chain:
+        uid8 = (c.get("uid") or "")[:_UID_LEN]
+        snippet = _snip(c.get("content") or c.get("summary") or "")
+        if uid8:
+            registry[uid8] = snippet
+        out.append({"uid": uid8, "kind": c.get("kind"), "snippet": snippet})
+    return {"chain": out}
 
 
 def _scope_filter_chain(conn, chain, principal_id):
