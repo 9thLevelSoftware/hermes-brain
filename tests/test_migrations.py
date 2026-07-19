@@ -32,13 +32,22 @@ def _structure(conn: sqlite3.Connection) -> list[str]:
     )
 
 
-def _v2_objects() -> set[str]:
-    """Names the v2 delta introduces (parsed from the migration itself)."""
+def _migration_objects() -> set[str]:
+    """Names every delta introduces (parsed from the migration files).
+
+    Collected across ALL migrations (not just v2), so reconstructing a v1
+    database drops what v2 AND v3+ added — the migrate-forward path then
+    genuinely re-applies each delta and drift in any of them fails here,
+    rather than a later migration's CREATE ... IF NOT EXISTS silently
+    no-op'ing over a table the fresh schema already made."""
     import re
 
-    sql = (db._MIGRATIONS_DIR / "002_proposals.sql").read_text(encoding="utf-8")
-    return set(re.findall(
-        r"CREATE (?:TABLE|INDEX) IF NOT EXISTS (\w+)", sql))
+    names: set[str] = set()
+    for sql_file in sorted(db._MIGRATIONS_DIR.glob("*.sql")):
+        sql = sql_file.read_text(encoding="utf-8")
+        names |= set(re.findall(
+            r"CREATE (?:TABLE|INDEX) IF NOT EXISTS (\w+)", sql))
+    return names
 
 
 def test_migration_files_exist_for_every_version():
@@ -57,7 +66,7 @@ def test_fresh_and_migrated_schemas_are_identical(tmp_path):
     # Build a v1 database: fresh v2 minus everything the v2 delta added.
     old_home = tmp_path / "old"
     conn = db.connect(old_home)
-    for name in _v2_objects():
+    for name in _migration_objects():
         kind = "INDEX" if name.startswith("idx_") else "TABLE"
         conn.execute(f"DROP {kind} IF EXISTS {name}")
     db.set_meta(conn, "schema_version", "1")
@@ -80,7 +89,7 @@ def test_migration_takes_a_backup_first(tmp_path):
     """critique item 34: VACUUM INTO backup before migrating."""
     home = tmp_path / "h"
     conn = db.connect(home)
-    for name in _v2_objects():
+    for name in _migration_objects():
         kind = "INDEX" if name.startswith("idx_") else "TABLE"
         conn.execute(f"DROP {kind} IF EXISTS {name}")
     db.set_meta(conn, "schema_version", "1")
@@ -97,7 +106,8 @@ def test_migration_is_idempotent(tmp_path):
     """A re-run (crash between executescript and the version stamp) is a no-op."""
     conn = db.connect(tmp_path / "h")
     before = _structure(conn)
-    db.MIGRATIONS[2](conn)
+    for version in range(2, db.SCHEMA_VERSION + 1):
+        db.MIGRATIONS[version](conn)
     conn.commit()
     assert _structure(conn) == before
     conn.close()

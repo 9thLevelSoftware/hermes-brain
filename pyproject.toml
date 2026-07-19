@@ -23,6 +23,12 @@ rerank = [
     "tokenizers>=0.20",
     "numpy>=1.26",
 ]
+# Multi-device encrypted delta sync (Phase G). Client-side crypto only; the
+# relay stores opaque ciphertext. Never required at floor tier — lazy-imported
+# inside the sync/ subpackage so a no-sync install never needs cryptography.
+sync = [
+    "cryptography>=42",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.9.0",

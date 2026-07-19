@@ -32,7 +32,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 _MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 
@@ -67,6 +67,7 @@ def _migration_step(version: int):
 # Version N upgrades a version N-1 database.
 MIGRATIONS: dict[int, Any] = {
     2: _migration_step(2),   # migrations/002_proposals.sql
+    3: _migration_step(3),   # migrations/003_facts_events.sql
 }
 
 

@@ -39,6 +39,7 @@ DEFAULT_MODES = {
     "cases": "active",          # writes episodic case rows (P5)
     "distill": "active",        # writes procedural strategy/guardrail items (P5)
     "consolidate": "active",    # writes new semantic patterns
+    "facts": "shadow",          # s-p-o triple extraction — proposes, ships shadow
     "peers": "active",          # theory-of-mind peer cards from group chats (D3)
     "contradict": "active",     # invalidates contradicted rows
     "forget": "active",         # demotes/tombstones (archives raw text first)
@@ -62,7 +63,8 @@ DEFAULT_MODES = {
 # probes runs last so it checks the shift's net effect; tune runs after
 # forgetting so it sees the settled working set.
 PIPELINE = ("flush", "mine", "cases", "distill", "forge", "revise",
-            "consolidate", "peers", "contradict", "forget", "tune", "probes", "lane1")
+            "consolidate", "facts", "peers", "contradict", "forget", "tune",
+            "probes", "lane1")
 
 _PREEMPT_CHECK_EVERY = 8  # work units between activity re-checks
 

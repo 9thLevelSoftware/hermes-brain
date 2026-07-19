@@ -79,6 +79,11 @@ _TRUST_RANK = {"owner": 0, "agent": 1, "known_user": 2, "tool": 3, "untrusted": 
 _BATCH_FLOOR_DEFAULT = "known_user"
 
 _WS = re.compile(r"\s+")
+# Word tokenizer for the info-content dedup contest. Mirrors the embedder's
+# tokenization (recall/embed.py StubEmbedder: `[^\W_]+`, casefolded) so the
+# "unique tokens" that decide the contest align with what drove the near-dup
+# vector match in the first place.
+_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 
 _EXTRACT_SYSTEM = """\
 You distill a conversation digest into durable memories for a personal AI agent.
@@ -93,9 +98,15 @@ Return a JSON array (possibly empty) of items shaped exactly:
   {"content": "...", "kind": "fact|decision|preference|warning|insight|profile",
    "about_user": true|false, "time_sensitive": true|false,
    "instruction_shaped": true|false, "source_uids": ["a1b2c3d4"],
-   "search_aids": ["...", "..."]}
+   "search_aids": ["...", "..."],
+   "triples": [{"s": "subject", "p": "predicate", "o": "object"}]}
 
 Rules:
+- triples: OPTIONAL. When the item states a concrete relationship, also give
+  1-3 normalized subject-predicate-object triples for it: subject and object as
+  short canonical noun phrases, predicate as a short verb/relation phrase. Use
+  ABSOLUTE dates ("2026-07-18", never "yesterday"/"last week"). Use [] (or omit)
+  when the item is not a clean relational fact.
 - content: 10-400 characters; one self-contained fact, decision, preference,
   warning, or insight worth remembering across sessions. It must stand alone
   without the conversation.
@@ -213,6 +224,13 @@ def sweep(
             # D2 write-time rewriting gate (config): 0 disables search aids.
             ctx["aids_max"] = (int(config.get("extract_max_aids", _MAX_AIDS))
                                if config.get("extract_search_aids", True) else 0)
+            # Info-content dedup contest gate (config): when False, near-dup
+            # handling is the byte-for-byte legacy reinforce-the-older-row path.
+            ctx["dedup_contest"] = bool(config.get("dedup_contest", True))
+            # Phase B: extract s-p-o triples into the facts index, and (off by
+            # default) append lifecycle events to the sync seam.
+            ctx["facts_extract"] = bool(config.get("facts_extract", True))
+            ctx["sync_events"] = bool(config.get("sync_events", False))
             wrote = _apply_items(conn, result, ctx, embedder=embedder,
                                  shadow=shadow, actor=actor, counts=counts)
             _promote(conn, promote_rows)
@@ -598,7 +616,7 @@ def _write_item(conn, item, content, kind, ctx, *, embedder, shadow, actor,
     if not quarantine:
         merged = _try_merge(conn, chash, content, scope_user, embedder=embedder,
                             shadow=shadow, actor=actor, session=ctx["session_id"],
-                            now=now)
+                            now=now, contest=ctx.get("dedup_contest", True))
         if merged:
             counts["merged"] += 1
             return True
@@ -645,12 +663,56 @@ def _write_item(conn, item, content, kind, ctx, *, embedder, shadow, actor,
     new_id = cur.lastrowid
     if status == "active":
         _embed_new(conn, embedder, new_id, embed_text)
+        # Phase B: index this item's s-p-o triples into the facts layer, each
+        # referencing this memory row (facts are an index over memories).
+        # Active rows only — quarantined/instruction-shaped content must never
+        # mint facts. Gated on facts_extract; never raises into capture.
+        if ctx.get("facts_extract", True):
+            _index_triples(conn, item, new_id)
+    # Emit a create event to the sync seam (off by default; record_event
+    # self-gates on `enabled` and never raises).
+    _record_event(conn, "create", uid, ctx,
+                  payload={"kind": kind, "quarantined": quarantine})
     _audit(conn, actor,
            "extract_quarantine" if quarantine else "extract_insert", uid,
            {"kind": kind, "trust_tier": floor, "session": ctx["session_id"]},
            now)
     counts["quarantined" if quarantine else "inserted"] += 1
     return True
+
+
+def _index_triples(conn, item, memory_id: int) -> int:
+    """Write an item's optional s-p-o triples into the facts index, each
+    linked to `memory_id`. Best-effort — a bad triple or a facts write error
+    is logged and skipped; extraction must never break on the facts path."""
+    triples = item.get("triples")
+    if not isinstance(triples, list):
+        return 0
+    from ..store import facts as facts_store
+    written = 0
+    for t in triples:
+        if not isinstance(t, dict):
+            continue
+        s = str(t.get("s") or "").strip()
+        p = str(t.get("p") or "").strip()
+        o = str(t.get("o") or "").strip()
+        if not (s and p and o):
+            continue
+        try:
+            facts_store.add_fact(conn, s, p, o, memory_id=memory_id,
+                                 source="extract", supersede=True)
+            written += 1
+        except Exception as e:
+            logger.warning("extract: add_fact(%r,%r,%r) failed: %s", s, p, o, e)
+    return written
+
+
+def _record_event(conn, op: str, memory_uid: str, ctx, *, payload=None) -> None:
+    """Append a lifecycle event to the memory_events seam (Phase G sync drains
+    it). No-op unless sync_events is on; record_event never raises."""
+    from ..store import events as events_store
+    events_store.record_event(conn, op, memory_uid, payload=payload,
+                              enabled=ctx.get("sync_events", False))
 
 
 def _resolve_scope(item, ctx, known):
@@ -669,9 +731,18 @@ def _resolve_scope(item, ctx, known):
 
 
 def _try_merge(conn, chash, content, scope_user, *, embedder, shadow, actor,
-               session, now) -> bool:
+               session, now, contest: bool = True) -> bool:
     """Exact-hash then vector near-dup merge, SCOPED (finding #12): only
-    merges with a live row in the SAME scope. Returns True if it merged."""
+    merges with a live row in the SAME scope. Returns True if it merged.
+
+    Info-content dedup contest (config `dedup_contest`): on the VECTOR
+    near-dup path only, when the incoming text carries strictly more
+    information than the existing row, supersede it (versions-are-rows) with
+    the richer text and carry the learning counters forward — instead of
+    blindly discarding the new text and bumping the older row. Exact-hash
+    matches, quarantined/instruction-shaped rows, and shadow mode all keep the
+    legacy reinforce-the-older-row behavior.
+    """
     scope_pred = "scope_user IS ?" if scope_user is None else "scope_user = ?"
 
     existing = conn.execute(
@@ -686,6 +757,23 @@ def _try_merge(conn, chash, content, scope_user, *, embedder, shadow, actor,
         reason = "content_hash"
     if existing is None:
         return False
+
+    # Contest only the vector near-dup path, in active mode, for rows that are
+    # safe to rewrite. A scoring failure degrades to the reinforce path — the
+    # capture path must never raise (the DB writes in _contest_supersede stay
+    # inside the caller's sqlite3.Error rollback net).
+    if reason == "vector" and contest and not shadow and _contestable(existing):
+        try:
+            new_wins = _new_text_wins(content, existing["content"])
+        except Exception as e:
+            logger.warning("dedup contest scoring failed (%s); reinforcing", e)
+            new_wins = False
+        if new_wins:
+            _contest_supersede(conn, existing, content, scope_user,
+                               embedder=embedder, actor=actor, session=session,
+                               now=now)
+            return True
+
     if shadow:
         _audit(conn, actor, "would_insert", existing["uid"],
                {"op": f"merge_{reason}", "content": content}, now)
@@ -696,6 +784,81 @@ def _try_merge(conn, chash, content, scope_user, *, embedder, shadow, actor,
         _audit(conn, actor, "extract_merge", existing["uid"],
                {"reason": reason, "session": session}, now)
     return True
+
+
+def _contestable(row) -> bool:
+    """A near-dup row may enter the info-content contest only if it is neither
+    quarantined nor instruction-shaped — rewriting either would launder
+    untrusted/command content into a fresh active version (trust model)."""
+    try:
+        if row["status"] == "quarantined":
+            return False
+        if row["instruction_shaped"]:
+            return False
+    except (KeyError, IndexError):
+        return False
+    return True
+
+
+def _info_content(toks: list[str], other: set[str]) -> int:
+    """Information-content score of a token list vs another text's token set:
+    total token count plus 10x the number of DISTINCT tokens this text has
+    that the other lacks (novelty dominates raw length)."""
+    unique = sum(1 for t in set(toks) if t not in other)
+    return len(toks) + 10 * unique
+
+
+def _new_text_wins(new_text: str, old_text: str) -> bool:
+    """True iff the incoming text has STRICTLY higher information content than
+    the existing near-dup. Ties keep the older row (versions-are-rows: don't
+    churn a chain for no gain)."""
+    new_toks = _TOKEN_RE.findall((new_text or "").casefold())
+    old_toks = _TOKEN_RE.findall((old_text or "").casefold())
+    new_score = _info_content(new_toks, set(old_toks))
+    old_score = _info_content(old_toks, set(new_toks))
+    return new_score > old_score
+
+
+def _contest_supersede(conn, old, new_content, scope_user, *, embedder, actor,
+                       session, now) -> None:
+    """Supersede the older near-dup with a new version carrying the richer
+    text (canonical version-chain template — dream/peers._insert_or_supersede):
+    INSERT the new version (version+1, supersedes_id=old.id) carrying the
+    learning counters forward (verification bumped +1 for the reinforcement),
+    then close the old row (valid_to, superseded_by) and move its vector."""
+    uid = db.new_ulid()
+    version = (old["version"] or 1) + 1
+    chash = db.content_hash(new_content)
+    verification = (old["verification_count"] or 0) + 1  # carry + reinforce
+    helpful = old["helpful_count"] or 0
+    recall = old["recall_count"] or 0
+    cur = conn.execute(
+        "INSERT INTO memories (uid, epistemic, memory_type, kind, status, live,"
+        " content, content_hash, symbols, tags, token_len, source_platform,"
+        " source_session, source_refs, trust_tier, created_by,"
+        " instruction_shaped, scope_user, version, supersedes_id, valid_from,"
+        " recorded_at, half_life_days, prompt_version, verification_count,"
+        " helpful_count, recall_count)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            uid, old["epistemic"], old["memory_type"], old["kind"], "active", 1,
+            new_content, chash, symbols_field(new_content), old["tags"],
+            db.approx_tokens(new_content), old["source_platform"], session,
+            old["source_refs"], old["trust_tier"], old["created_by"],
+            old["instruction_shaped"], scope_user, version, old["id"], now, now,
+            old["half_life_days"], _PROMPT_VERSION, verification, helpful, recall,
+        ),
+    )
+    new_id = cur.lastrowid
+    conn.execute(
+        "UPDATE memories SET valid_to=?, superseded_by=? WHERE id=?",
+        (now, new_id, old["id"]),
+    )
+    _drop_vector(conn, old["id"])   # dead version must not hold a KNN slot
+    _embed_new(conn, embedder, new_id, new_content)
+    _audit(conn, actor, "extract_contest_supersede", uid,
+           {"supersedes": old["uid"], "version": version, "session": session},
+           now)
 
 
 def _vec_merge_candidate(conn, embedder, content: str,
@@ -717,14 +880,26 @@ def _vec_merge_candidate(conn, embedder, content: str,
         if _int8_cosine(blob_row["emb"], qvec) < _MERGE_COSINE:
             return None
         scope_pred = "scope_user IS ?" if scope_user is None else "scope_user = ?"
+        # SELECT * (not just id/uid): the info-content contest needs the row's
+        # content + learning counters + safety flags.
         return conn.execute(
-            "SELECT id, uid FROM memories WHERE id=? AND valid_to IS NULL"
+            "SELECT * FROM memories WHERE id=? AND valid_to IS NULL"
             f" AND status='active' AND live=1 AND {scope_pred}",
             (top_id, scope_user),
         ).fetchone()
     except Exception as e:
         logger.warning("vector merge check failed (%s); treating as novel", e)
         return None
+
+
+def _drop_vector(conn, row_id: int) -> None:
+    """Remove a superseded row's vector so a dead version never wastes a KNN
+    top-k slot (mirrors dream/peers._drop_vector)."""
+    try:
+        if vec_store.vec_available(conn):
+            vec_store.delete(conn, "mem_vec", row_id)
+    except Exception as e:
+        logger.warning("sweep: drop vector for memory %s failed: %s", row_id, e)
 
 
 def _int8_cosine(blob: bytes, vector) -> float:

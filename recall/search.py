@@ -40,7 +40,7 @@ from datetime import UTC, datetime
 from ..capture.symbols import expand_query
 from ..store import db
 from ..store import vec as vec_store
-from . import fusion, rerank
+from . import fusion, mmr, rerank
 from . import graph as graph_leg
 
 logger = logging.getLogger(__name__)
@@ -178,10 +178,14 @@ def search(
     principal_id: str | None = None,
     source_author: str | None = None,
     trust_tier: str = "owner",
+    epistemic: tuple[str, ...] | None = None,
     embedder=None,
     reranker=None,
     rerank_budget_s: float = rerank.DEFAULT_BUDGET_S,
     graph: bool = True,
+    facts: bool = True,
+    diversify: bool = False,
+    mmr_lambda: float = 0.7,
 ) -> list[Hit]:
     """Ranked, access-scoped recall over memories (+episodes). Never raises.
 
@@ -204,13 +208,14 @@ def search(
                 include_episodes=include_episodes, episode_limit=episode_limit,
                 exclude_session=exclude_session, principal_id=principal_id,
                 source_author=source_author, trust_tier=trust_tier,
+                epistemic=epistemic, diversify=diversify, mmr_lambda=mmr_lambda,
             )
         now = datetime.now(UTC)
         want_episodes = include_episodes and episode_limit > 0
 
         # -- FTS legs (rows arrive filtered and in bm25 order) --
         mem_rows = _memories_rows(conn, match, limit, kinds, scope_project,
-                                  principal_id, trust_tier, exclude_kinds)
+                                  principal_id, trust_tier, exclude_kinds, epistemic)
         epi_rows = _episodes_rows(conn, match, episode_limit * 3, exclude_session,
                                   principal_id, source_author, trust_tier) \
             if want_episodes else []
@@ -228,7 +233,7 @@ def search(
                 qvec = embedder.encode_query(query)
                 mem_knn = [i for i, _ in vec_store.knn(conn, "mem_vec", qvec, limit * 3)]
                 mvrows = _memories_by_ids(conn, mem_knn, kinds, scope_project,
-                                          principal_id, trust_tier, exclude_kinds)
+                                          principal_id, trust_tier, exclude_kinds, epistemic)
                 rankings.append([f"m:{i}" for i in mem_knn if i in mvrows])
                 rows_by_key.update({f"m:{i}": r for i, r in mvrows.items()})
                 vec_keys.update(f"m:{i}" for i in mvrows)
@@ -264,12 +269,33 @@ def search(
                 ppr_ids = graph_leg.ppr_leg(conn, seed_ids, limit=limit * 3)
                 if ppr_ids:
                     gvrows = _memories_by_ids(conn, ppr_ids, kinds, scope_project,
-                                              principal_id, trust_tier, exclude_kinds)
+                                              principal_id, trust_tier, exclude_kinds, epistemic)
                     rankings.append([f"m:{i}" for i in ppr_ids if i in gvrows])
                     rows_by_key.update({f"m:{i}": r for i, r in gvrows.items()})
                     graph_keys.update(f"m:{i}" for i in gvrows)
             except Exception as e:
                 logger.warning("graph leg failed (%s); continuing", e)
+
+        # -- facts leg: current-truth s-p-o facts whose subject/object match the
+        #    query, mapped to their backing memory ids. Facts are an index over
+        #    memories (critique item 9), so this feeds memory ids into the same
+        #    fusion + re-fetch (scoping enforced centrally). Empty when the query
+        #    hits no facts, or when the caller disabled the leg. --
+        fact_keys: set = set()
+        if facts:
+            try:
+                # Lazy import: facts_leg imports helpers back from this module,
+                # so a top-level import here would be a cycle.
+                from .facts_leg import facts_leg as _facts_leg
+                fact_ids = _facts_leg(conn, query, limit=limit)
+                if fact_ids:
+                    fvrows = _memories_by_ids(conn, fact_ids, kinds, scope_project,
+                                              principal_id, trust_tier, exclude_kinds, epistemic)
+                    rankings.append([f"m:{i}" for i in fact_ids if i in fvrows])
+                    rows_by_key.update({f"m:{i}": r for i, r in fvrows.items()})
+                    fact_keys.update(f"m:{i}" for i in fvrows)
+            except Exception as e:
+                logger.warning("facts leg failed (%s); continuing", e)
 
         fts_keys = {f"m:{r['id']}" for r in mem_rows} | {f"e:{r['id']}" for r in epi_rows}
         bases = fusion.normalized(fusion.rrf(rankings), floor=_NORM_FLOOR)
@@ -289,6 +315,8 @@ def search(
                 parts.append("vec")
             if key in graph_keys:
                 parts.append("ppr")
+            if key in fact_keys:
+                parts.append("fact")
             return "+".join(parts) or "fts"
 
         hits: list[Hit] = []
@@ -315,14 +343,49 @@ def search(
                     score=base * _EPISODE_SCORE_FACTOR, source=_leg(key),
                 ))
         hits.sort(key=lambda h: h.score, reverse=True)
+        if diversify:
+            hits = _diversify(hits, mmr_lambda, limit)
         return hits[:limit]
     except Exception as e:  # capture path — a memory bug must never break the turn
         logger.warning("brain search failed for %r: %s", query, e)
         return []
 
 
+def _diversify(hits: list[Hit], lambda_: float, limit: int) -> list[Hit]:
+    """MMR reorder over the modulated hits so a lane-2 block isn't three
+    near-identical facts (memory-engine §3.4). Relevance = the modulated
+    score; text = the hit body for Jaccard novelty. Degrades to the input
+    order on any error — diversity is a nicety, never a correctness gate."""
+    try:
+        if len(hits) < 3:
+            return hits
+        by_uid = {h.uid: h for h in hits}
+        ordered = mmr.mmr(
+            [(h.uid, h.score, h.text or h.summary or "") for h in hits],
+            lambda_=lambda_, k=limit,
+        )
+        picked = [by_uid[c[0]] for c in ordered if c[0] in by_uid]
+        seen = {h.uid for h in picked}
+        picked.extend(h for h in hits if h.uid not in seen)  # tail: unpicked
+        return picked
+    except Exception as e:
+        logger.warning("brain diversify (mmr) failed: %s; keeping fused order", e)
+        return hits
+
+
+def _epistemic_clause(sql: str, params: list, epistemic: tuple[str, ...] | None) -> str:
+    """Optional filter on the 3-value `epistemic` column (observation |
+    inference | belief). Lets a caller ask for only explicit observations or
+    only derived (inference/belief) rows — the dual-prefetch split Phase D
+    needs, and a no-op when None."""
+    if epistemic:
+        sql += f" AND m.epistemic IN ({','.join('?' * len(epistemic))})"
+        params.extend(epistemic)
+    return sql
+
+
 def _memories_by_ids(conn, ids, kinds, scope_project, principal_id, trust_tier,
-                     exclude_kinds=()) -> dict:
+                     exclude_kinds=(), epistemic=None) -> dict:
     """Fetch vector-candidate memory rows with the SAME access filters as the
     FTS leg — a vector hit must never bypass scoping (finding #17)."""
     if not ids:
@@ -341,6 +404,7 @@ def _memories_by_ids(conn, ids, kinds, scope_project, principal_id, trust_tier,
     if scope_project is not None:
         sql += " AND (m.scope_project IS NULL OR m.scope_project = ?)"
         params.append(scope_project)
+    sql = _epistemic_clause(sql, params, epistemic)
     sql = _scope_memories(sql, params, principal_id, trust_tier)
     return {r["id"]: r for r in conn.execute(sql, params).fetchall()}
 
@@ -406,6 +470,7 @@ def _memories_rows(
     principal_id: str | None,
     trust_tier: str,
     exclude_kinds: tuple[str, ...] = (),
+    epistemic: tuple[str, ...] | None = None,
 ) -> list:
     sql = (
         f"SELECT m.*, {_MEM_BM25} AS bm25_score "
@@ -423,6 +488,7 @@ def _memories_rows(
     if scope_project is not None:
         sql += " AND (m.scope_project IS NULL OR m.scope_project = ?)"
         params.append(scope_project)
+    sql = _epistemic_clause(sql, params, epistemic)
     sql = _scope_memories(sql, params, principal_id, trust_tier)
     sql += " ORDER BY bm25_score LIMIT ?"
     params.append(limit * 3)
@@ -475,6 +541,9 @@ def _like_search(
     principal_id: str | None = None,
     source_author: str | None = None,
     trust_tier: str = "owner",
+    epistemic: tuple[str, ...] | None = None,
+    diversify: bool = False,
+    mmr_lambda: float = 0.7,
 ) -> list[Hit]:
     """Degraded search when capabilities lack fts5: LIKE per token, score by
     match count (fraction of tokens present). Same Hit surface, source='like'.
@@ -506,6 +575,7 @@ def _like_search(
     if scope_project is not None:
         sql += " AND (m.scope_project IS NULL OR m.scope_project = ?)"
         params.append(scope_project)
+    sql = _epistemic_clause(sql, params, epistemic)
     sql = _scope_memories(sql, params, principal_id, trust_tier)
     sql += " ORDER BY m.valid_from DESC LIMIT ?"
     params.append(limit * 3)
@@ -546,6 +616,8 @@ def _like_search(
                 ))
 
     hits.sort(key=lambda h: h.score, reverse=True)
+    if diversify:
+        hits = _diversify(hits, mmr_lambda, limit)
     return hits[:limit]
 
 

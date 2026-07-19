@@ -51,8 +51,10 @@ from .capture.turns import (
     capture_turn,
 )
 from .config import DEFAULTS, load_config, save_config
+from .recall.blend import blend
+from .recall.query_cache import QueryCache
 from .recall.render import guidance_block, lane1_static, lane2_block
-from .recall.search import log_retrieval, search, stamp_pending_injections
+from .recall.search import _diversify, log_retrieval, search, stamp_pending_injections
 from .recall.strategies import retrieve_guidance
 from .store import db as store_db
 from .store import sysinfo
@@ -90,6 +92,9 @@ class BrainProvider(MemoryProvider):
         self._lane1 = ""
         self._lane1_staged = ""   # marker-job re-render, swapped at reset switch
         self._lane2_cache: dict[str, str] = {}
+        # Single-consumer recall cache (brain-bg worker only), invalidated on
+        # the memories generation counter. Never touches the turn path.
+        self._query_cache = QueryCache()
         self._turn_counts: dict[str, int] = {}
         self._queue: queue.Queue[Any] = queue.Queue()
         self._worker: threading.Thread | None = None
@@ -310,12 +315,35 @@ class BrainProvider(MemoryProvider):
         if not self._capture_allowed():
             return ""
         self._queue.put(("precompress", self._session_id, messages))
-        # Synchronous, LLM-free, ≤300 tokens: the compressor preserves the
-        # salient pairs from the span being discarded (ABC return contract).
+        # Synchronous, LLM-free, budget-bounded (Phase E): assemble a context
+        # block from the brain — stable identity + relevant peer card (fixed,
+        # budget-first), then a 40/60 distilled-summary / recent-extracts split
+        # — over a short-lived READ connection. Falls back to the message-only
+        # salience contribution on any failure. Never raises (ABC contract).
+        budget = int(self._config.get("precompress_tokens", 300))
+        principal_id, trust_tier, _author = self._identity_for(self._session_id)
+        try:
+            from .recall.context import assemble
+
+            conn = store_db.connect(self._hermes_home)
+            try:
+                block = assemble(
+                    conn, messages, budget,
+                    principal_id=principal_id, trust_tier=trust_tier,
+                    embedder=self._embedder, config=self._config,
+                    summary_ratio=float(self._config.get("context_summary_ratio", 0.4)),
+                )
+            finally:
+                conn.close()
+            if block:
+                return block
+        except Exception:
+            logger.warning("brain: context assemble failed; salience fallback",
+                           exc_info=True)
         try:
             from .capture.extract import precompress_contribution
 
-            return precompress_contribution(messages, 300)
+            return precompress_contribution(messages, budget)
         except Exception:
             logger.warning("brain: precompress contribution failed", exc_info=True)
             return ""
@@ -346,7 +374,13 @@ class BrainProvider(MemoryProvider):
             return []
         from . import tools
 
-        return tools.get_schemas()
+        schemas = tools.get_schemas()
+        # brain_ask is an LLM-inside-a-turn: expose it to the agent only when
+        # explicitly enabled (ask_tool_agent, off by default). The CLI and MCP
+        # surfaces expose it directly regardless.
+        if self._config.get("ask_tool_agent", False):
+            schemas = [*schemas, tools.ask_schema()]
+        return schemas
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
         """Runs on the host's tool-execution thread: short-lived connection
@@ -706,16 +740,51 @@ class BrainProvider(MemoryProvider):
         gblock = guidance_block(guidance, budget // 2)
         remaining = max(0, budget - approx_tokens(gblock)) if gblock else budget
 
-        hits = search(
-            conn, query_text, limit=8,
-            exclude_session=session_id,
-            exclude_kinds=("strategy", "guardrail", "case", "peer_card"),
-            principal_id=principal_id,
-            source_author=source_author,
-            trust_tier=trust_tier,
-            embedder=self._embedder,
-            reranker=self._reranker,
-        )
+        # Lane-2 fact candidates. Two config-gated upgrades over the plain
+        # similarity search (Phase A): (1) the working-representation *blend*
+        # (semantic + most-reinforced + most-recent, fused) which favors
+        # consolidated memories over raw turns; (2) an in-process recall cache
+        # keyed on the memories generation counter. Both live on the brain-bg
+        # worker and never touch the turn path. Falls back to plain search()
+        # when lane2_blend is off. MMR diversifies the final set so the block
+        # isn't three near-identical facts.
+        exclude_kinds = ("strategy", "guardrail", "case", "peer_card")
+        cache_scope = (principal_id or "", trust_tier)
+        use_cache = bool(self._config.get("query_cache", True))
+        mmr_lambda = float(self._config.get("mmr_lambda", 0.7))
+        facts_leg_on = bool(self._config.get("facts_leg", True))
+        hits = None
+        if use_cache:
+            hits = self._query_cache.get(
+                conn, query_text, kinds=None, scope=cache_scope,
+                embedder=self._embedder)
+        if hits is None:
+            if self._config.get("lane2_blend", True):
+                hits = blend(
+                    conn, query_text, limit=8,
+                    principal_id=principal_id, source_author=source_author,
+                    trust_tier=trust_tier,
+                    embedder=self._embedder, reranker=self._reranker,
+                    recent_days=int(self._config.get("lane2_blend_recent_days", 14)),
+                    exclude_kinds=exclude_kinds,
+                    exclude_session=session_id,
+                    facts=facts_leg_on,
+                )
+            else:
+                hits = search(
+                    conn, query_text, limit=8,
+                    exclude_session=session_id,
+                    exclude_kinds=exclude_kinds,
+                    principal_id=principal_id,
+                    source_author=source_author,
+                    trust_tier=trust_tier,
+                    embedder=self._embedder,
+                    reranker=self._reranker,
+                    facts=facts_leg_on,
+                )
+            hits = _diversify(hits, mmr_lambda, 8)
+            if use_cache:
+                self._query_cache.put(query_text, kinds=None, scope=cache_scope, hits=hits)
         facts_block = lane2_block(hits, remaining)
         block = "\n".join(p for p in (gblock, facts_block) if p)
         self._lane2_cache[session_id] = block

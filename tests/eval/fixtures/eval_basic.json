@@ -1,0 +1,150 @@
+{
+  "name": "eval_basic",
+  "description": "Small hermetic BEAM eval fixture: three owner sessions, a cross-session supersession case (Phase B/C), a set of labeled retrieval queries, and gold QA pairs including one 'unknown' abstain case.",
+  "principal_id": "owner-p",
+  "trust_tier": "owner",
+  "platform": "cli",
+  "sessions": [
+    {
+      "session_id": "eval-s1-setup",
+      "trust_tier": "owner",
+      "principal_id": "owner-p",
+      "match": "tabs over spaces",
+      "turns": [
+        {
+          "user": "For the Zephyr project I prefer tabs over spaces in Python code, please remember that.",
+          "assistant": "Noted -- tabs over spaces for all Zephyr Python code."
+        },
+        {
+          "user": "We decided to use SQLite as the database for the Zephyr brain store, instead of Postgres.",
+          "assistant": "Good call: one file, zero ops."
+        },
+        {
+          "user": "The Zephyr staging environment deploys to the host prod-box-7.",
+          "assistant": "Got it -- staging deploys to prod-box-7."
+        }
+      ],
+      "extract": [
+        {
+          "content": "User prefers tabs over spaces in Python for the Zephyr project",
+          "kind": "preference",
+          "about_user": true
+        },
+        {
+          "content": "Zephyr uses SQLite as its database for the brain store instead of Postgres",
+          "kind": "decision",
+          "triples": [{"s": "zephyr", "p": "uses database", "o": "sqlite"}]
+        },
+        {
+          "content": "Zephyr staging deploys to the host prod-box-7",
+          "kind": "fact",
+          "triples": [{"s": "zephyr staging", "p": "deploys to", "o": "prod-box-7"}]
+        }
+      ]
+    },
+    {
+      "session_id": "eval-s2-change",
+      "trust_tier": "owner",
+      "principal_id": "owner-p",
+      "match": "prod-box-9",
+      "turns": [
+        {
+          "user": "Update for Zephyr: staging now deploys to prod-box-9. We retired prod-box-7.",
+          "assistant": "Understood -- staging is prod-box-9 now."
+        }
+      ],
+      "extract": [
+        {
+          "content": "Zephyr staging now deploys to the host prod-box-9 (prod-box-7 was retired)",
+          "kind": "fact",
+          "triples": [{"s": "zephyr staging", "p": "deploys to", "o": "prod-box-9"}]
+        }
+      ]
+    },
+    {
+      "session_id": "eval-s3-profile",
+      "trust_tier": "owner",
+      "principal_id": "owner-p",
+      "match": "coffee black",
+      "turns": [
+        {
+          "user": "Remember that I take my coffee black, with no sugar.",
+          "assistant": "Black coffee, no sugar -- noted."
+        },
+        {
+          "user": "My timezone is US Eastern, America/New_York.",
+          "assistant": "Got it -- Eastern time."
+        }
+      ],
+      "extract": [
+        {
+          "content": "User drinks their coffee black with no sugar",
+          "kind": "preference",
+          "about_user": true
+        },
+        {
+          "content": "User's timezone is US Eastern (America/New_York)",
+          "kind": "profile",
+          "about_user": true
+        }
+      ]
+    }
+  ],
+  "queries": [
+    {
+      "id": "q_tabs",
+      "query": "Python tabs spaces indentation preference",
+      "relevant": ["tabs over spaces"]
+    },
+    {
+      "id": "q_db",
+      "query": "which database does Zephyr use for its store",
+      "relevant": ["SQLite"]
+    },
+    {
+      "id": "q_deploy",
+      "query": "Zephyr staging deploy host",
+      "relevant": ["prod-box-9"],
+      "not_relevant": ["prod-box-7"],
+      "note": "supersession: prod-box-7 (s1) was superseded by prod-box-9 (s2); the current-truth memory must win and the old row must be retired."
+    },
+    {
+      "id": "q_coffee",
+      "query": "how does the user take their coffee",
+      "relevant": ["coffee black"]
+    },
+    {
+      "id": "q_tz",
+      "query": "what is the user's timezone",
+      "relevant": ["Eastern"]
+    }
+  ],
+  "qa": [
+    {
+      "id": "qa_deploy_current",
+      "question": "Where does Zephyr staging deploy now?",
+      "search": "Zephyr staging deploy host",
+      "answer_text": "Zephyr staging now deploys to prod-box-9.",
+      "keywords": ["prod-box-9"],
+      "abstain": false,
+      "note": "supersession current-truth: the answer must be prod-box-9 (Y), not prod-box-7 (X)."
+    },
+    {
+      "id": "qa_indent_pref",
+      "question": "What does the user prefer for Python indentation in Zephyr?",
+      "search": "Python indentation tabs spaces preference",
+      "answer_text": "You prefer tabs over spaces for Python.",
+      "keywords": ["tabs"],
+      "abstain": false
+    },
+    {
+      "id": "qa_unknown_address",
+      "question": "What is the user's home mailing address?",
+      "search": "home mailing address street",
+      "answer_text": "I don't have any record of the user's home mailing address in memory.",
+      "keywords": [],
+      "abstain": true,
+      "note": "unknown: the brain has no evidence, so the answerer must abstain (answered=False)."
+    }
+  ]
+}

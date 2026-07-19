@@ -17,6 +17,14 @@ history. 'neither' flags both rows needs_review=1 instead.
 
 Watermark advances ONLY in active mode, and only over candidates that were
 fully processed — dry_run/shadow must re-see everything next run.
+
+Phase C (config ``contradict_knowledge_update``, default on): before the LLM
+adjudication, a pair whose BOTH rows are triple-backed by facts sharing a
+(subject, predicate) with DIFFERENT objects is a knowledge UPDATE, not a
+genuine contradiction — resolved deterministically with ZERO LLM calls. The
+newer memory wins; ``store.facts.add_fact(supersede=True)`` moves the fact
+layer forward (retiring the stale linked memory in lockstep) and the stale
+row is demoted to ``status='summarized'`` (never tombstoned/deleted).
 """
 
 from __future__ import annotations
@@ -28,6 +36,7 @@ import sqlite3
 
 from .. import llm
 from ..store import db
+from ..store import facts as facts_store
 from ..store import vec as vec_store
 from .consolidate import _blob_cosine, _dequantize
 from .shift import Shift
@@ -97,8 +106,12 @@ def _run(shift: Shift) -> dict:
     conn = shift.conn
     mode = shift.config.get("_forced_mode") or shift.mode("contradict")
     active = mode == "active"
+    # Phase C: deterministic same-(subject,predicate) knowledge-update path.
+    # A fact-backed update is a stronger, cheaper signal than the polarity
+    # heuristic + LLM adjudication — resolve it with ZERO LLM calls.
+    kn_update = bool(shift.config.get("contradict_knowledge_update", True))
     counts = {"scanned": 0, "pairs": 0, "contradictions": 0, "invalidated": 0,
-              "flagged": 0, "skipped_llm": 0}
+              "flagged": 0, "skipped_llm": 0, "updated": 0}
 
     if shift.preempted():
         return {**counts, "preempted": True}
@@ -142,6 +155,19 @@ def _run(shift: Shift) -> dict:
                 continue
             seen_pairs.add(key)
             newer, older = _order(cand, other)
+            # Deterministic knowledge-update resolution (config-gated, ZERO
+            # LLM): both rows triple-backed by facts sharing a (subject,
+            # predicate) with DIFFERENT objects is an UPDATE, not a genuine
+            # contradiction. This runs BEFORE the polarity gate because a
+            # value change ("lives in X" -> "lives in Y") carries no negation
+            # token, so the heuristic would never surface it for the LLM.
+            if kn_update:
+                upd = _knowledge_update(conn, newer, older)
+                if upd is not None:
+                    counts["pairs"] += 1
+                    _apply_update(shift, upd, active=active, mode=mode,
+                                  counts=counts)
+                    continue
             if not _polarity_conflict(newer["content"], older["content"]):
                 continue
             if _edge_exists(conn, newer["id"], older["id"]):
@@ -300,6 +326,96 @@ def _apply_verdict(shift: Shift, verdict, newer: sqlite3.Row, older: sqlite3.Row
             "winner": winner["uid"], "loser": loser["uid"], "why": why,
         })
         counts["invalidated"] += 1
+    db.bump_generation(conn, "mem")
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Deterministic knowledge-update resolution (no LLM)
+# ---------------------------------------------------------------------------
+
+def _current_sp_objects(conn: sqlite3.Connection, mem_id: int) -> dict:
+    """Current-truth facts linked to `mem_id`, as {(subject, predicate): object}."""
+    rows = conn.execute(
+        "SELECT subject, predicate, object FROM facts"
+        " WHERE memory_id=? AND valid_until IS NULL",
+        (mem_id,),
+    ).fetchall()
+    return {(r["subject"], r["predicate"]): r["object"] for r in rows}
+
+
+def _knowledge_update(conn: sqlite3.Connection, a: sqlite3.Row,
+                      b: sqlite3.Row) -> dict | None:
+    """A deterministic UPDATE iff BOTH rows are triple-backed by a fact with
+    the SAME (subject, predicate) but a DIFFERENT object. The newer memory
+    (later valid_from; id breaks ties) wins; its object is the new truth.
+
+    Returns None when the pair is not a fact-backed same-(s,p) update — the
+    caller then falls through to the polarity heuristic + LLM adjudication.
+    """
+    fa = _current_sp_objects(conn, a["id"])
+    if not fa:
+        return None
+    fb = _current_sp_objects(conn, b["id"])
+    for (subject, predicate), obj_a in fa.items():
+        obj_b = fb.get((subject, predicate))
+        if obj_b is None or obj_b == obj_a:
+            continue
+        winner, loser = _order_by_valid_from(a, b)
+        new_object = fa[(subject, predicate)] if winner is a else fb[(subject, predicate)]
+        return {"subject": subject, "predicate": predicate,
+                "new_object": new_object, "winner": winner, "loser": loser}
+    return None
+
+
+def _order_by_valid_from(a: sqlite3.Row, b: sqlite3.Row
+                         ) -> tuple[sqlite3.Row, sqlite3.Row]:
+    """(newer, older) by valid_from (id breaks ties) — the update winner rule."""
+    ka = ((a["valid_from"] or ""), a["id"])
+    kb = ((b["valid_from"] or ""), b["id"])
+    return (a, b) if ka >= kb else (b, a)
+
+
+def _apply_update(shift: Shift, upd: dict, *, active: bool, mode: str,
+                  counts: dict) -> None:
+    """Resolve a fact-backed knowledge update WITHOUT any LLM call.
+
+    Active: move the fact layer forward via ``facts.add_fact(supersede=True)``
+    (which closes the prior fact and retires the stale linked memory in
+    lockstep), then DEMOTE the stale row to ``status='summarized'`` —
+    supersede-don't-delete: it stays a queryable, recoverable row, never
+    tombstoned. shadow/dry_run compute the decision but mutate nothing.
+    """
+    conn = shift.conn
+    winner, loser = upd["winner"], upd["loser"]
+    counts["updated"] += 1
+
+    if not active:
+        if mode == "dry_run":                         # shadow is audit-silent (#8)
+            shift.audit("would_knowledge_update", loser["uid"], {
+                "mode": mode, "subject": upd["subject"],
+                "predicate": upd["predicate"], "new_object": upd["new_object"],
+                "winner": winner["uid"], "loser": loser["uid"],
+            })
+            conn.commit()
+        return
+
+    # Fact layer forward: add_fact(supersede=True) closes the prior current
+    # (subject,predicate) fact(s) and retires the OLD linked memory in lockstep
+    # (valid_to + superseded_by) since the new fact points at a different
+    # memory. Then demote the stale row so it also leaves current-truth recall
+    # yet remains a recoverable summary tier.
+    facts_store.add_fact(
+        conn, upd["subject"], upd["predicate"], upd["new_object"],
+        memory_id=winner["id"], source="dream:contradict", supersede=True,
+    )
+    conn.execute("UPDATE memories SET status='summarized' WHERE id=?",
+                 (loser["id"],))
+    shift.audit("contradict_knowledge_update", loser["uid"], {
+        "subject": upd["subject"], "predicate": upd["predicate"],
+        "new_object": upd["new_object"], "winner": winner["uid"],
+        "loser": loser["uid"],
+    })
     db.bump_generation(conn, "mem")
     conn.commit()
 

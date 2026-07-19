@@ -38,7 +38,7 @@
 --     expire. Hard purge exists only for compliance (`forget --hard`) and
 --     tombstone grace expiry in the dream's forgetting pass.
 
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
 
 -- ------------------------------------------------------------
 -- meta: schema version, generation counters, capability cache
@@ -496,3 +496,52 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
+
+-- ------------------------------------------------------------
+-- facts: temporal subject-predicate-object layer, an INDEX OVER memories
+-- (critique item 9 — every triple also lands as a kind='fact' memories row;
+-- facts.memory_id references it). Single-current-truth per (subject,predicate):
+-- `add` closes the current row then inserts the new one (versions-are-rows,
+-- like memories). Point-in-time queries pivot on valid_from/valid_until.
+-- See store/facts.py (adapted from mnemosyne triples.py, MIT).
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS facts (
+    id            INTEGER PRIMARY KEY,
+    subject       TEXT NOT NULL,
+    predicate     TEXT NOT NULL,
+    object        TEXT NOT NULL,
+    memory_id     INTEGER REFERENCES memories(id),   -- the NL memory row this indexes
+    entity_id     INTEGER REFERENCES entities(id),   -- optional canonical subject entity
+    confidence    REAL NOT NULL DEFAULT 1.0,
+    source        TEXT,                              -- 'extract'|'dream:facts'|'sync'|...
+    valid_from    TEXT NOT NULL,                     -- ISO-8601; when this became true
+    valid_until   TEXT,                              -- NULL = current truth
+    recorded_at   TEXT NOT NULL,                     -- ISO-8601; when the row was written
+    superseded_by INTEGER REFERENCES facts(id)       -- the row that closed this one
+);
+
+CREATE INDEX IF NOT EXISTS idx_facts_sp_current ON facts(subject, predicate)
+    WHERE valid_until IS NULL;
+CREATE INDEX IF NOT EXISTS idx_facts_obj_current ON facts(object)
+    WHERE valid_until IS NULL;
+CREATE INDEX IF NOT EXISTS idx_facts_memory ON facts(memory_id);
+
+-- ------------------------------------------------------------
+-- memory_events: append-only log of memory lifecycle ops — the event seam
+-- Phase G sync drains. Off by default (sync_events); writers no-op when off.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS memory_events (
+    id         INTEGER PRIMARY KEY,
+    event_id   TEXT NOT NULL UNIQUE,               -- ULID (monotonic, sortable)
+    ts         TEXT NOT NULL,                       -- ISO-8601
+    op         TEXT NOT NULL
+                 CHECK (op IN ('create','supersede','tombstone','purge')),
+    memory_uid TEXT NOT NULL,                       -- the memories.uid affected
+    payload    TEXT,                                -- JSON (surface-safe delta)
+    origin     TEXT,                                -- device id that authored it
+    synced_at  TEXT                                 -- NULL = not yet pushed to a relay
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_cursor ON memory_events(ts, event_id);
+CREATE INDEX IF NOT EXISTS idx_events_unsynced ON memory_events(ts)
+    WHERE synced_at IS NULL;
