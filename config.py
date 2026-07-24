@@ -28,10 +28,10 @@ DEFAULTS: dict[str, Any] = {
     "extract_search_aids": True, # D2: fold LLM paraphrase aids into tags + embed text
     "extract_max_aids": 4,       # per-item cap on search aids
     "bootstrap_import": True,
-    "memories_tool": False,      # deferred past P3 (critique item 8)
     "night_budget_usd": 0.50,
     "day_budget_usd": 1.50,
     "forget_grace_days": 30,
+    "forget_demote_below": 0.15,  # value score under which a memory is demoted
     "skill_auto_approve": True,  # user decision 2026-07-16: auto-approve after validation
     "capture_peers": True,       # user decision: trust-gated peer capture in group chats
     "incognito": False,
@@ -70,11 +70,25 @@ def config_path(hermes_home: str | Path) -> Path:
     return Path(hermes_home) / "brain" / "brain.yaml"
 
 
-def load_config(hermes_home: str | Path) -> dict[str, Any]:
-    """Defaults overlaid with brain.yaml (flat key: value lines)."""
+def load_config(hermes_home: str | Path | None) -> dict[str, Any]:
+    """Defaults overlaid with brain.yaml (flat key: value lines).
+
+    Degrades to defaults for a missing/unusable home rather than raising: the
+    provider calls this from hooks that the host invokes even when
+    ``initialize()`` failed (``on_session_switch`` fires on /reset, /branch and
+    compression regardless), and ``Path(None)`` would raise TypeError from
+    OUTSIDE the try below — the host would swallow it at debug level and the
+    real cause would never surface.
+    """
     cfg = dict(DEFAULTS)
-    path = config_path(hermes_home)
-    if not path.exists():
+    if not hermes_home:
+        return cfg
+    try:
+        path = config_path(hermes_home)
+        if not path.exists():
+            return cfg
+    except (TypeError, ValueError, OSError) as e:
+        logger.warning("brain.yaml path unresolvable (%s); using defaults", e)
         return cfg
     try:
         for raw in path.read_text(encoding="utf-8").splitlines():

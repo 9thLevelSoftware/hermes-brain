@@ -150,16 +150,59 @@ def _injection_probes(conn, config, embedder, report) -> None:
             else f"quarantined {row['uid'][:8]} is in the lane-1 snapshot"))
 
     # Lane 2: searching a quarantined row's OWN content must not return it.
+    #
+    # Absence alone proves nothing — every leg in recall/search.py already
+    # filters `status = 'active'`, so a quarantined row could never appear no
+    # matter how broken the guard was, and this probe passed unconditionally
+    # while feeding the skill-forge's hard promotion veto. So first establish
+    # that the query is genuinely CAPABLE of finding the canary (it is present
+    # in the retrieval index under these very terms, status filter aside);
+    # only then is absence from search() real signal.
     canary = quarantined[0]
     query = _probe_query(canary["content"])
     if query:
-        hits = search(conn, query, limit=8, trust_tier="owner",
-                      include_episodes=False, embedder=embedder)
-        leaked = any(h.kind == "memory" and h.id == canary["id"] for h in hits)
-        report.results.append(ProbeResult(
-            name=f"lane2_{canary['uid'][:8]}", family="injection", passed=not leaked,
-            detail="" if not leaked
-            else f"quarantined {canary['uid'][:8]} surfaced in recall"))
+        findable = _index_reaches(conn, canary["id"], query)
+        if not findable:
+            # Inconclusive, not a pass: a probe that cannot discriminate is a
+            # health check that did not run (see run_probes' contract).
+            report.results.append(ProbeResult(
+                name=f"lane2_{canary['uid'][:8]}", family="injection", passed=False,
+                detail=(f"probe inconclusive: quarantined {canary['uid'][:8]} is "
+                        "not reachable in the retrieval index by its own words, "
+                        "so its absence from recall proves nothing")))
+        else:
+            hits = search(conn, query, limit=8, trust_tier="owner",
+                          include_episodes=False, embedder=embedder)
+            leaked = any(h.kind == "memory" and h.id == canary["id"] for h in hits)
+            report.results.append(ProbeResult(
+                name=f"lane2_{canary['uid'][:8]}", family="injection", passed=not leaked,
+                detail="" if not leaked
+                else f"quarantined {canary['uid'][:8]} surfaced in recall"))
+
+
+def _index_reaches(conn, memory_id: int, query: str) -> bool:
+    """Would the retrieval index find *memory_id* for *query* if the
+    status filter were not there? FTS5 when available, LIKE otherwise —
+    the same two legs recall/search.py degrades between."""
+    from ..recall.search import _match_expr, _tokens
+
+    expr = _match_expr(query)
+    if expr:
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM memory_fts WHERE memory_fts MATCH ? AND rowid = ?",
+                (expr, memory_id)).fetchone()
+            if row:
+                return True
+        except sqlite3.Error:
+            pass  # no FTS5 (or the table is out of sync) — fall through to LIKE
+    toks = _tokens(query)
+    if not toks:
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM memories WHERE id = ? AND lower(content) LIKE ?",
+        (memory_id, f"%{toks[0]}%")).fetchone()
+    return row is not None
 
 
 def _latency_probes(conn, config, embedder, report) -> None:

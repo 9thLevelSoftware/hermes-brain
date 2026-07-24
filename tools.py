@@ -369,15 +369,20 @@ def dispatch(conn: sqlite3.Connection, tool_name: str, args: dict | None,
         "brain_outcome": _outcome,
         "brain_manage": _manage,
     }
-    handlers["brain_ask"] = _ask
+    # ask_tool is an operator kill switch for the LLM-backed surface (it burns
+    # day_budget_usd and runs a tool-loop over the owner's memory). When it is
+    # off brain_ask is not registered at all, so it falls through to the
+    # unknown-tool error below — same shape a client already handles.
+    if ctx.config.get("ask_tool", True):
+        handlers["brain_ask"] = _ask
     handlers["brain_context"] = _context
     try:
         handler = handlers.get(tool_name)
         if handler is None:
             raise _ToolError(
                 f"unknown tool '{tool_name}'",
-                "available tools: brain_recall, brain_remember, brain_outcome, "
-                'brain_manage, brain_ask — e.g. brain_recall(query="deploy pipeline")',
+                "available tools: " + ", ".join(handlers)
+                + ' — e.g. brain_recall(query="deploy pipeline")',
             )
         if args is not None and not isinstance(args, dict):
             raise _ToolError(

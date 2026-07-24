@@ -211,6 +211,13 @@ def _run(shift: Shift) -> dict:
             events.record_event(shift.conn, "tombstone", row["uid"],
                                 enabled=record_events)
         home = shift.config.get("hermes_home")
+        if purge and not home:
+            # Without a home there is no archive to write to, so the whole
+            # grace purge is skipped. That used to be silent, which made a
+            # caller that forgot to inject the key look like "nothing was due".
+            logger.warning(
+                "forget: %d row(s) due for purge but config has no 'hermes_home'; "
+                "skipping archive-before-purge (they stay tombstoned)", len(purge))
         purged_n = 0
         # Correctness gate: preserve the raw text in the episodic archive BEFORE
         # nulling live content, so demotion is non-destructive. Archive ALL

@@ -139,6 +139,62 @@ def db_path(hermes_home: str | Path) -> Path:
     return brain_dir(hermes_home) / "brain.db"
 
 
+def main_db_file(conn: sqlite3.Connection) -> str:
+    """Filesystem path backing *conn*'s main database ('' when in-memory)."""
+    try:
+        for row in conn.execute("PRAGMA database_list"):
+            if row[1] == "main":          # (seq, name, file)
+                return str(row[2] or "")
+    except sqlite3.Error:
+        pass
+    return ""
+
+
+def commit_isolated(conn: sqlite3.Connection, sql: str, params: tuple) -> None:
+    """Run one append-only write so it CANNOT commit the caller's transaction.
+
+    For observability rows (llm_ledger metering, shadow intent proposals) that
+    are emitted from the middle of someone else's unit of work. Committing
+    such a row on the CALLER's connection also commits the caller's pending
+    writes, which silently turned every ``conn.rollback()`` in dream/ into a
+    no-op for anything written before the LLM call.
+
+    Two paths, and the choice is deterministic rather than racy:
+
+    * Caller is NOT mid-transaction (the common case — e.g. ``extract.sweep``
+      commits its claim before calling the LLM): open a short-lived second
+      connection and commit there. The row survives a later caller rollback,
+      which is the right semantic for metering — the money was spent whether
+      or not the caller's work survives.
+    * Caller IS mid-transaction: a second connection would block on the
+      caller's write lock until busy_timeout expired and then lose the row, so
+      write inline WITHOUT committing and let the row ride the caller's
+      transaction. Same discipline as store/facts.py and store/events.py.
+      Worst case the row is rolled back with everything else — never the
+      inverse, which is the bug being fixed.
+
+    In-memory databases (tests) have no path to reopen and always take the
+    inline branch.
+
+    Best-effort by contract: observability must never mask a real result, so
+    storage errors are logged, not raised.
+    """
+    path = main_db_file(conn)
+    try:
+        if not path or conn.in_transaction:
+            conn.execute(sql, params)
+            return
+        side = sqlite3.connect(path, timeout=5.0)
+        try:
+            side.execute("PRAGMA busy_timeout=5000")
+            side.execute(sql, params)
+            side.commit()
+        finally:
+            side.close()
+    except sqlite3.Error as e:
+        logger.warning("isolated write failed: %s", e)
+
+
 # ---------------------------------------------------------------------------
 # Capability probe
 # ---------------------------------------------------------------------------
@@ -370,6 +426,12 @@ def _migrate(conn: sqlite3.Connection, path: Path, current: int) -> None:
             "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)",
             (str(version),),
         )
+        # schema.sql sets PRAGMA user_version on fresh creates, so a migrated DB
+        # that never updated it diverged from an identical fresh one. Nothing
+        # reads user_version today (all version logic goes through
+        # meta.schema_version) but the file declares it, so it must be kept
+        # true — tests/test_migrations.py now compares it.
+        conn.execute(f"PRAGMA user_version = {int(version)}")
         conn.commit()
 
 

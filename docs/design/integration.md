@@ -260,6 +260,10 @@ dream_model       default ""                                              (auxil
 bootstrap_import  choices [yes, no]                      default yes      (MEMORY.md/USER.md + state.db backfill on first run)
 memories_tool     default true                                            (the Anthropic-shaped file tool)
 ```
+NOTE (audit 2026-07-24): `memories_tool` is NOT currently in `config.py:DEFAULTS`.
+The phase-3 `memories` tool was deferred (critique item 8) and the placeholder key
+was removed because `load_config` drops undeclared keys, so it read as a live gate
+that did nothing. Re-add it to `DEFAULTS` when the tool is actually built.
 No secrets → nothing to `.env`; `save_config()` writes `~/.hermes/brain/brain.yaml`. `post_setup(hermes_home, config)` (F9) then: creates dirs, downloads/validates the embedding model with a progress bar and an explicit skip option (skip → fts-only until `hermes brain doctor --fix`), runs bootstrap if accepted, offers the cron job (§1.3), sets `memory.provider: "brain"`, and prints the built-ins matrix (§4.6).
 
 Model files live in a **shared, non-backed-up cache**: `~/.cache/hermes-brain/models/` (Windows `%LOCALAPPDATA%\hermes-brain\models`), shared across profiles, re-downloadable — deliberately outside HERMES_HOME so `hermes backup` archives memories, not 300MB of ONNX (F15). `backup_paths()` returns `[]`; all state is under HERMES_HOME already.
