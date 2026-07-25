@@ -95,6 +95,9 @@ def _run(shift: Shift) -> dict:
 
     home = shift.config.get("hermes_home")
     if not home:
+        logger.warning(
+            "mine: config has no 'hermes_home' — cannot locate state.db, so "
+            "outcome credit is skipped for this run")
         return {"skipped": "no_hermes_home"}
     path = Path(home) / "state.db"
     if not path.exists():

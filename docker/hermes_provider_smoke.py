@@ -27,7 +27,16 @@ def main() -> int:
     block = prov.system_prompt_block()          # lane 1 (byte-stable)
     print(f"system_prompt_block: {len(block)} chars")
     schemas = prov.get_tool_schemas()
-    print(f"tool schemas: {[s.get('name') for s in schemas]}")
+    # Providers may return either the bare function schema or an already
+    # wrapped OpenAI tool entry; Hermes normalizes both
+    # (agent/memory_manager.py:normalize_tool_schema). The brain returns the
+    # wrapped form, so read through "function" or this prints [None, ...].
+    def _name(s):
+        if s.get("type") == "function" and isinstance(s.get("function"), dict):
+            s = s["function"]
+        return s.get("name")
+
+    print(f"tool schemas: {[_name(s) for s in schemas]}")
     assert isinstance(schemas, list)
 
     prov.prefetch("what is my staging database?", session_id="smoke-1")  # lane 2

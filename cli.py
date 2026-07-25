@@ -1059,6 +1059,11 @@ def cmd_ask(args: argparse.Namespace) -> int:
     home = _hermes_home()
     question = " ".join(args.question)
     cfg = config.load_config(home)
+    if not cfg.get("ask_tool", True):
+        print("ask is disabled (ask_tool: false in brain.yaml).\n"
+              "Re-enable it there, or use 'hermes brain search' for "
+              "recall without an LLM call.", file=sys.stderr)
+        return 1
     mode = sysinfo.resolve_mode(str(cfg.get("mode", "auto")))
     embedder = get_embedder(cfg, mode, allow_download=False)
     reranker = get_reranker(cfg, mode, allow_download=False)

@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS meta (
 ) WITHOUT ROWID;
 
 -- Seeded by store/db.py on create:
---   schema_version    '1'
+--   schema_version    str(store/db.py:SCHEMA_VERSION) — currently '3'
 --   created_at        ISO ts
 --   mem_generation    '0'   (bumped on any memories write — cheap cross-
 --   graph_generation  '0'    process cache invalidation, Daem0n pattern)
@@ -324,7 +324,10 @@ CREATE TABLE IF NOT EXISTS retrieval_log (
     user_msg_hash   TEXT,                         -- (session, hash, ts window)
     ts              TEXT NOT NULL,
     memory_id       INTEGER NOT NULL REFERENCES memories(id),
-    leg             TEXT NOT NULL,                -- fts|vec|fts+vec|like|ppr|pinned
+    leg             TEXT NOT NULL,                -- which retrieval leg produced the hit:
+                                                  -- fts|vec|like|ppr|fact (and '+'-joined
+                                                  -- combos, e.g. 'fts+vec'), plus the
+                                                  -- whole-block sources 'guidance'|'blend'
     rank_score      REAL,
     injected        INTEGER NOT NULL DEFAULT 0,
     resolved_turn_id TEXT                         -- filled by the nightly miner
@@ -391,13 +394,16 @@ CREATE TABLE IF NOT EXISTS shift_runs (
     kind        TEXT NOT NULL DEFAULT 'dream',    -- dream|sweep
     started_at  TEXT NOT NULL,
     finished_at TEXT,
-    outcome     TEXT,                             -- completed|preempted|failed|rolled_back
+    outcome     TEXT,                             -- completed|preempted|failed|aborted
     phases_done TEXT NOT NULL DEFAULT '[]',       -- JSON list (idempotent rerun cursor)
     notes       TEXT
 ) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS strategy_state (
-    strategy    TEXT PRIMARY KEY,                 -- flush|consolidate|distill|cases|profile|forget|skills
+    strategy    TEXT PRIMARY KEY,                 -- any name in dream/shift.py:PIPELINE
+                                                  -- (flush|mine|cases|distill|forge|revise|
+                                                  --  consolidate|facts|peers|contradict|
+                                                  --  forget|tune|probes|lane1)
     -- NULL mode = "use dream.shift.DEFAULT_MODES" (the ship-inert defaults);
     -- a bookkeeping row created by _mark_run must NOT pin a strategy to 'off'
     -- and silently disable the pipeline. Only an explicit --enable/--disable
@@ -424,7 +430,9 @@ CREATE INDEX IF NOT EXISTS idx_ledger_ts ON llm_ledger(ts);
 
 CREATE TABLE IF NOT EXISTS work_queue (
     id         INTEGER PRIMARY KEY,
-    task       TEXT NOT NULL,                     -- embed|reembed|archive|extract
+    task       TEXT NOT NULL,                     -- observed_tool_call|observed_subagent_stop
+                                                  -- (written by observer/, drained by the
+                                                  --  brain-bg worker)
     payload    TEXT NOT NULL,                     -- JSON
     created_at TEXT NOT NULL,
     attempts   INTEGER NOT NULL DEFAULT 0,

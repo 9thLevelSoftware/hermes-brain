@@ -5,6 +5,7 @@ author: "NousResearch (Hermes-Brain)"
 kind: standalone
 pip_dependencies: []
 requires_env: []
-hooks:
+# `provides_hooks` is the key hermes_cli/plugins.py parses; `hooks:` is dropped.
+provides_hooks:
   - post_tool_call
   - subagent_stop

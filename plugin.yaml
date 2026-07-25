@@ -1,13 +1,29 @@
 name: brain
 version: 0.1.0
 description: "Hermes-Brain — global memory & continual learning for Hermes Agent (persistent recall, active forgetting, sleep-time consolidation)."
+author: "NousResearch (Hermes-Brain)"
+# No `kind:` on purpose. hermes_cli/plugins.py text-scans __init__.py for
+# `register_memory_provider` and auto-promotes this to kind='exclusive', which
+# routes it to plugins/memory discovery instead of the general PluginManager.
 # P1 has zero required pip dependencies: stdlib + sqlite only.
 # P2 adds optional tiers (onnxruntime, tokenizers, sqlite-vec) via extras —
 # lazy-installed, never required for the FTS floor tier.
 pip_dependencies: []
 requires_env: []
-hooks:
+# `provides_hooks` is the key hermes_cli/plugins.py actually parses (a `hooks:`
+# key is silently discarded). It is metadata only — MemoryProvider hooks are
+# invoked as plain methods on the instance by agent/memory_manager.py, never
+# through the hook registry — so this list documents the surface rather than
+# gating it. Keep it complete: it is what a reader trusts.
+provides_hooks:
+  - system_prompt_block
+  - prefetch
+  - queue_prefetch
+  - sync_turn
+  - on_turn_start
   - on_session_end
+  - on_session_switch
   - on_pre_compress
   - on_memory_write
   - on_delegation
+  - shutdown

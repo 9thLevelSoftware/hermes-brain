@@ -21,8 +21,11 @@ BRAIN_ROOT="$(cd "$HERE/../.." && pwd)"
 # Locate hermes-agent.
 HA="${HA:-}"
 if [ -z "$HA" ]; then
+  # ${USER:-} — Git Bash on Windows does not export USER, and `set -u` aborts
+  # while EXPANDING this list, so an unguarded $USER killed the search before
+  # the earlier candidates were ever tried.
   for cand in "$BRAIN_ROOT/../hermes-agent" "$HOME/hermes-agent" \
-              "$HOME/Documents/hermes-agent" "/c/Users/$USER/hermes-agent"; do
+              "$HOME/Documents/hermes-agent" "/c/Users/${USER:-}/hermes-agent"; do
     if [ -d "$cand/.git" ] || [ -f "$cand/pyproject.toml" ]; then HA="$cand"; break; fi
   done
 fi

@@ -23,13 +23,20 @@ def _structure(conn: sqlite3.Connection) -> list[str]:
 
     Auto-created objects (sqlite_autoindex_*) have sql IS NULL and are
     excluded: they are implied by the DDL we do compare.
+
+    ``PRAGMA user_version`` is included: schema.sql sets it on fresh creates,
+    so a migration chain that forgot to bump it left a migrated DB structurally
+    different from an identical fresh one — invisible to a sqlite_master-only
+    comparison.
     """
-    return sorted(
+    objects = sorted(
         r["sql"] for r in conn.execute(
             "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL "
             "AND name NOT LIKE 'sqlite_%'"
         )
     )
+    user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+    return [f"PRAGMA user_version = {user_version}", *objects]
 
 
 def _migration_objects() -> set[str]:
@@ -70,9 +77,14 @@ def test_fresh_and_migrated_schemas_are_identical(tmp_path):
         kind = "INDEX" if name.startswith("idx_") else "TABLE"
         conn.execute(f"DROP {kind} IF EXISTS {name}")
     db.set_meta(conn, "schema_version", "1")
+    # A genuine v1 database also has user_version = 1. Without this the old DB
+    # inherits the fresh schema.sql PRAGMA and _structure's user_version check
+    # would be trivially satisfied instead of testing the migration.
+    conn.execute("PRAGMA user_version = 1")
     conn.commit()
     assert not conn.execute(
         "SELECT 1 FROM sqlite_master WHERE name='proposals'").fetchone()
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
     conn.close()
 
     # Reopening must migrate it forward to an identical structure.

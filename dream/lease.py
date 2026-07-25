@@ -34,9 +34,13 @@ def acquire(conn: sqlite3.Connection, name: str, holder: str,
     """Try to take the named lease. Atomic: only succeeds when the row is
     free (holder NULL) or expired. Returns True iff this holder now owns it."""
     now = db.iso_now()
+    # `expires_at IS NULL` is load-bearing: in SQL `NULL < '2026-...'` is NULL,
+    # not true, so a row left with a holder but no expiry could never be
+    # reclaimed and the dream would be wedged forever with no recovery path.
+    # held_by() already treats that state as free — this mirrors it.
     cur = conn.execute(
         "UPDATE brain_lease SET holder=?, acquired_at=?, expires_at=? "
-        "WHERE name=? AND (holder IS NULL OR expires_at < ?)",
+        "WHERE name=? AND (holder IS NULL OR expires_at IS NULL OR expires_at < ?)",
         (holder, now, _future_iso(ttl_seconds), name, now),
     )
     conn.commit()

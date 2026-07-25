@@ -122,10 +122,35 @@ class BrainProvider(MemoryProvider):
         self._platform = kwargs.get("platform") or "cli"
         agent_context = kwargs.get("agent_context") or "primary"
         self._active = agent_context == "primary"
+        # A previous shutdown() latched this; without clearing it here a
+        # long-lived gateway process that re-initializes would never run the
+        # forced end-of-session sweep again (it is only ever .set()).
+        self._shutting_down.clear()
 
+        # The host always injects hermes_home (memory_manager.initialize_all),
+        # so a MISSING key means an out-of-Hermes caller and ~/.hermes is the
+        # right guess. A key that is PRESENT but empty is different: silently
+        # guessing there would write another profile's memory into the default
+        # one, so it is a hard error.
+        if "hermes_home" in kwargs and not str(kwargs.get("hermes_home") or "").strip():
+            raise ValueError(
+                "brain: hermes_home was passed but empty — refusing to guess a "
+                "profile directory (memory would land in the wrong profile)")
         home = kwargs.get("hermes_home")
-        self._hermes_home = Path(home) if home else Path.home() / ".hermes"
-        self._config = load_config(self._hermes_home)
+        # Path()/config parsing outside a guard used to leave _initialized
+        # False for the WHOLE session behind one host-level warning; degrade to
+        # the stdlib floor instead.
+        try:
+            self._hermes_home = Path(home) if home else Path.home() / ".hermes"
+        except (TypeError, ValueError) as e:
+            logger.warning("brain: unusable hermes_home %r (%s)", home, e)
+            self._hermes_home = Path.home() / ".hermes"
+        # hermes_home must be IN the config dict, not just on the instance:
+        # dream/forget.py, dream/mine_state.py and skillforge/* all read
+        # config['hermes_home'] and silently skip when it is absent — which
+        # made forget() skip archive-before-purge with no warning.
+        self._config = {**load_config(self._hermes_home),
+                        "hermes_home": str(self._hermes_home)}
         self._incognito = bool(self._config.get("incognito"))
 
         # Platform-only trust FIRST — must not depend on a DB connect
@@ -171,14 +196,24 @@ class BrainProvider(MemoryProvider):
         # Lane 1: rendered once, byte-stable for the session (invariant #1).
         self._lane1 = lane1_block or lane1_static()
 
+        # A thread-start failure (RuntimeError under thread exhaustion) must
+        # not leave _initialized False and silently disable every hook for the
+        # session: the two lanes still serve, capture just degrades.
+        worker_up = True
         if self._worker is None or not self._worker.is_alive():
-            self._worker = threading.Thread(
-                target=self._worker_loop, name="brain-bg", daemon=True
-            )
-            self._worker.start()
+            try:
+                self._worker = threading.Thread(
+                    target=self._worker_loop, name="brain-bg", daemon=True
+                )
+                self._worker.start()
+            except RuntimeError:
+                worker_up = False
+                self._worker = None
+                logger.warning("brain: worker thread unavailable; capture degraded",
+                               exc_info=True)
 
         self._initialized = True
-        if needs_bootstrap and self._active:
+        if needs_bootstrap and self._active and worker_up:
             # First run on an empty brain: import MEMORY.md/USER.md + start
             # the rate-limited state.db backfill — on the worker, never
             # blocking the first turn.
@@ -291,7 +326,13 @@ class BrainProvider(MemoryProvider):
             # honor 'takes effect next session' promises (finding #25) and
             # swap in a lane-1 snapshot re-rendered by the marker job
             # (finding #27) — byte-stability holds WITHIN a session only.
-            self._config = load_config(self._hermes_home)
+            # load_config tolerates a None home (initialize() may have failed
+            # — the host keeps dispatching /reset and /branch either way), and
+            # hermes_home is re-injected so the reloaded dict keeps the key
+            # dream/ and skillforge/ depend on.
+            self._config = {**load_config(self._hermes_home)}
+            if self._hermes_home:
+                self._config["hermes_home"] = str(self._hermes_home)
             self._incognito = bool(self._config.get("incognito"))
             with self._lock:
                 if self._lane1_staged and self._session_identity.get(
@@ -376,9 +417,12 @@ class BrainProvider(MemoryProvider):
 
         schemas = tools.get_schemas()
         # brain_ask is an LLM-inside-a-turn: expose it to the agent only when
-        # explicitly enabled (ask_tool_agent, off by default). The CLI and MCP
-        # surfaces expose it directly regardless.
-        if self._config.get("ask_tool_agent", False):
+        # explicitly enabled (ask_tool_agent, off by default). ask_tool is the
+        # master kill switch across every surface — with it off tools.dispatch
+        # refuses brain_ask, so advertising the schema here would hand the
+        # model a tool that always errors.
+        if (self._config.get("ask_tool_agent", False)
+                and self._config.get("ask_tool", True)):
             schemas = [*schemas, tools.ask_schema()]
         return schemas
 
@@ -428,7 +472,17 @@ class BrainProvider(MemoryProvider):
         post_setup(hermes_home, config)
 
     def backup_paths(self) -> list[str]:
-        return []  # everything lives under HERMES_HOME/brain/
+        """No extra paths to back up.
+
+        All *state* lives under HERMES_HOME/brain/, so `hermes backup` already
+        walks it. The one thing outside is the ONNX model cache
+        (recall/embed.py: %LOCALAPPDATA% / $XDG_CACHE_HOME / ~/.cache), and it
+        is deliberately NOT declared: it is a re-downloadable artifact worth
+        hundreds of MB, and critique.md item on backup bloat rejects carrying
+        it through every backup/import cycle. Losing it costs a re-download,
+        not a memory.
+        """
+        return []
 
     # -- worker -------------------------------------------------------------------
 
@@ -759,6 +813,22 @@ class BrainProvider(MemoryProvider):
         use_cache = bool(self._config.get("query_cache", True))
         mmr_lambda = float(self._config.get("mmr_lambda", 0.7))
         facts_leg_on = bool(self._config.get("facts_leg", True))
+
+        # Query-intent weighting is SHADOW-ONLY and that is a hard invariant,
+        # exactly like the `tune` strategy: it records what the classifier
+        # WOULD propose for this query so the deltas can be analyzed offline,
+        # and nothing downstream reads the result. Do not feed `proposal` into
+        # fusion, ranking, or the cache key — a shadow lane that silently
+        # starts steering retrieval is the failure mode this guards against.
+        # Runs on the brain-bg worker only; never the turn path.
+        if str(self._config.get("intent_weighting", "shadow")) == "shadow":
+            try:
+                from .recall import intent as intent_mod
+
+                intent_mod.record_proposal(conn, query_text)
+            except Exception:  # capture-path: observability must never degrade recall
+                logger.debug("brain: intent shadow proposal failed", exc_info=True)
+
         hits = None
         if use_cache:
             hits = self._query_cache.get(

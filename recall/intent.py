@@ -221,12 +221,15 @@ def record_proposal(conn, query: str, intent: Intent | None = None,
     detail = dict(proposal)
     detail["signals"] = intent.signals
     try:
-        conn.execute(
+        # Isolated write: this runs on the brain-bg worker's connection mid
+        # retrieval, and a shadow observability row must never commit the
+        # worker's pending transaction (see store/db.commit_isolated).
+        db.commit_isolated(
+            conn,
             "INSERT INTO audit_log (actor, action, target, detail, ts)"
             " VALUES (?,?,?,?,?)",
             (actor, "intent_proposal", None, json.dumps(detail), db.iso_now()),
         )
-        conn.commit()
     except Exception:  # pragma: no cover - shadow observability must never raise
         pass
     return proposal

@@ -40,12 +40,18 @@ SERVER_NAME = "hermes-brain"
 # tool schema conversion (OpenAI function-calling -> MCP inputSchema)
 # ---------------------------------------------------------------------------
 
-def _mcp_tools() -> list[dict]:
+def _mcp_tools(config: dict | None = None) -> list[dict]:
     from . import tools
 
     # The MCP surface is at 'tool' trust and is a primary ask surface — expose
-    # brain_ask here (read-only, cited) alongside the four core tools.
-    schemas = [*tools.get_schemas(), tools.ask_schema(), tools.context_schema()]
+    # brain_ask here (read-only, cited) alongside the four core tools. The
+    # ask_tool gate is an operator kill switch for the LLM-backed surface: when
+    # it is off brain_ask must not be ADVERTISED here either, or a client sees
+    # a tool that tools/call will refuse (tools.dispatch enforces the same key).
+    schemas = [*tools.get_schemas()]
+    if (config or {}).get("ask_tool", True):
+        schemas.append(tools.ask_schema())
+    schemas.append(tools.context_schema())
     out = []
     for schema in schemas:
         fn = schema["function"]
@@ -71,16 +77,27 @@ class BrainMCPServer:
         self._conn = None
         self._embedder = None
         self._initialized = False
+        # Declared here, not first-assigned in _open(): if _open() raised
+        # AFTER setting _conn, the `if self._conn is None` guard would never
+        # re-run it and every later tools/call died with AttributeError ->
+        # an opaque -32603 for the life of the process.
+        self._config: dict = {}
 
     # -- lifecycle ----------------------------------------------------------
 
+    def _ensure_config(self) -> dict:
+        """Config without touching the DB — tools/list must work before _open()."""
+        if not self._config:
+            from . import config as brain_config
+
+            self._config = brain_config.load_config(self._hermes_home)
+        return self._config
+
     def _open(self) -> None:
-        from . import config as brain_config
         from .store import db, sysinfo
 
+        cfg = self._ensure_config()
         self._conn = db.connect(self._hermes_home)
-        cfg = brain_config.load_config(self._hermes_home)
-        self._config = cfg
         # Embedder is best-effort and never downloads (that is setup's job).
         try:
             from .recall.embed import get_embedder
@@ -124,7 +141,7 @@ class BrainMCPServer:
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
-                result = {"tools": _mcp_tools()}
+                result = {"tools": _mcp_tools(self._ensure_config())}
             elif method == "tools/call":
                 result = self._on_tools_call(msg.get("params") or {})
             elif is_notification:
@@ -248,8 +265,16 @@ def serve(hermes_home: str) -> int:
 
 if __name__ == "__main__":  # pragma: no cover
     import os
+    import pathlib
 
     logging.basicConfig(level=logging.WARNING)
-    home = os.environ.get("HERMES_HOME") or str(
-        __import__("pathlib").Path.home() / ".hermes")
+    # Same three-step chain as cli.py:_hermes_home and observer/__init__.py —
+    # hermes_constants FIRST, or running this module inside a non-default
+    # profile without an exported HERMES_HOME opens the wrong brain.db.
+    try:
+        from hermes_constants import get_hermes_home  # type: ignore[import-not-found]
+
+        home = str(get_hermes_home())
+    except ImportError:
+        home = os.environ.get("HERMES_HOME") or str(pathlib.Path.home() / ".hermes")
     sys.exit(serve(home))

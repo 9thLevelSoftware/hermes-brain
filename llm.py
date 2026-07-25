@@ -355,7 +355,14 @@ def _meter(conn: sqlite3.Connection, tier: str, model: str, prompt: str,
            usage: _Usage | None = None) -> None:
     """Insert one llm_ledger row. With a real *usage* (B2) record the
     provider's token counts and priced est_usd; without it fall back to the
-    char/4 proxy with est_usd=0.0. Never raises into the call path."""
+    char/4 proxy with est_usd=0.0. Never raises into the call path.
+
+    The row is written via ``db.commit_isolated`` (see it for the exact
+    branching). This used to call ``conn.commit()`` directly, which also
+    hard-committed whatever the CALLER had pending, silently turning every
+    ``shift.conn.rollback()`` in dream/ into a no-op for work done before the
+    LLM call. Metering must never be able to commit someone else's work.
+    """
     if usage is not None:
         tokens_in = usage.tokens_in
         tokens_out = usage.tokens_out
@@ -364,12 +371,9 @@ def _meter(conn: sqlite3.Connection, tier: str, model: str, prompt: str,
         tokens_in = db.approx_tokens((system or "") + (prompt or ""))
         tokens_out = db.approx_tokens(response or "")
         est_usd = 0.0
-    try:
-        conn.execute(
-            "INSERT INTO llm_ledger (strategy, model, tokens_in, tokens_out,"
-            " est_usd, ts) VALUES (?,?,?,?,?,?)",
-            (tier, model, tokens_in, tokens_out, est_usd, db.iso_now()),
-        )
-        conn.commit()
-    except sqlite3.Error as e:  # metering must never mask a good response
-        logger.warning("llm_ledger insert failed: %s", e)
+    db.commit_isolated(
+        conn,
+        "INSERT INTO llm_ledger (strategy, model, tokens_in, tokens_out,"
+        " est_usd, ts) VALUES (?,?,?,?,?,?)",
+        (tier, model, tokens_in, tokens_out, est_usd, db.iso_now()),
+    )
