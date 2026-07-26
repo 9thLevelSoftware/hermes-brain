@@ -44,6 +44,28 @@ def baseline_path(hermes_home: str | Path) -> Path:
     return Path(hermes_home) / "brain" / "eval" / "baseline.json"
 
 
+def queryset_fingerprint(queries: list[dict[str, Any]] | None) -> str:
+    """Stable digest of the query set a report was measured on.
+
+    A baseline is only comparable to a run over the SAME queries. Regenerating
+    or editing the query set changes which items are scorable, so subtracting
+    the two MRRs would produce a number that looks like a retrieval delta and
+    is an artifact of the dataset changing underneath (review round 2, P2).
+    """
+    import hashlib
+
+    if not queries:
+        return ""
+    digest = hashlib.sha256()
+    for item in queries:
+        digest.update(str(item.get("query") or "").encode("utf-8", "replace"))
+        digest.update(b"|")
+        for uid in sorted(item.get("gold") or []):
+            digest.update(str(uid).encode("utf-8", "replace"))
+        digest.update(b";")
+    return digest.hexdigest()[:16]
+
+
 def save_baseline(hermes_home: str | Path, report: dict[str, Any]) -> Path:
     """Record a comparison run so a later one can show the DIFFERENCE.
 

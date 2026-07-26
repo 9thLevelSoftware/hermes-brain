@@ -639,3 +639,55 @@ places (`log_retrieval`, deep traversal, full import). Any code that takes an
 id from one database and uses it against another is wrong by default;
 `Hit.profile is None` and the import id-maps are the two guards, and new call
 sites need to be checked against them.
+
+## G9. Codex review round 2 — seven more findings, merged before they were seen
+
+A SECOND review landed 48 minutes before PR #9 was merged and was not addressed
+in it. Recorded as a process failure as much as a technical one: the standing
+instruction was to address comments as they arrived, and completion was reported
+without re-checking. All seven were legitimate; three were P1.
+
+**P1 — `brain_ask` broke the very invariant §G6 established.** The pre-init
+schema list was still gated on config, and `ask_tool_agent` defaults FALSE — so
+enabling it in brain.yaml produced a tool that was advertised post-init and
+absent from the routing map. §G6 again, in the one tool whose gate is off by
+default; the §G6 test passed only because it used default config. The routing
+call now returns the UNION of everything that could ever be enabled, which makes
+"offered ⊆ routable" true by construction rather than by coincidence.
+
+**P1 — `memories.invalidated_by` was a third unremapped id reference.** §G8
+fixed `supersedes_id`/`superseded_by` and missed contradiction history, so
+restoring into a non-empty database pointed it at an unrelated local row or
+dropped the memory on a failed insert.
+
+**P1 — the full import bypassed `--trust-owner` hardening entirely.** The
+manifest branch returned before the memories-only path capped trust, cleared
+pins, and quarantined instruction-shaped rows. A crafted snapshot could insert
+active, pinned, owner-trust behavioural memories straight into lane 1, while the
+flag's own help text promised verbatim preservation required it. A snapshot is a
+FILE; it is never the owner speaking.
+
+**P2 — lane-2 caching still had a hole.** Bypassing only when a linked row
+actually appeared left two gaps: a result cached when links returned nothing,
+and entries cached BEFORE a link was added. Neither can be invalidated by a
+remote write. Now any registered link disables both the cache read and the write.
+
+**P2 — baselines were not bound to their query set.** `format_report` would
+subtract MRRs measured on different datasets and label the result a retrieval
+delta. Reports now carry a query-set fingerprint and the delta column only
+appears when they match.
+
+**P2 — incomplete snapshots restored "successfully".** A missing table file was
+skipped silently. The manifest's declared tables are now checked before writing,
+and a post-restore shortfall is reported.
+
+**P2 — a plain export left `--full` artifacts behind.** The default output
+directory is date-based and reused, so a normal export after a full one on the
+same day overwrote `memories.jsonl` and left the old `manifest.json` — which
+`import` keys off, producing a mixed restore of current memories plus stale
+facts and edges. Plain exports now clear those artifacts.
+
+**Process note.** Both review rounds found real defects, and round 2 found three
+in code round 1 had just touched. Fixes deserve the same scrutiny as features —
+several of these were introduced by the previous fix, not by the original
+feature.

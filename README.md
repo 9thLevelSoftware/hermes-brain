@@ -21,7 +21,9 @@ hermes memory setup     # choose "brain"
 
 The repo root **is** the plugin. The directory name `brain` is load-bearing (provider
 name = config key = CLI verb). All state lives in `$HERMES_HOME/brain/` (one SQLite
-file + append-only archive); per-profile isolation comes free via `HERMES_HOME`.
+file + append-only archive), so every profile gets its own brain for free via
+`HERMES_HOME` — and you can [link them](#one-brain-many-profiles) when you want one
+profile to draw on another.
 
 ## Tiers
 
@@ -74,10 +76,50 @@ warns when nothing has consolidated in a while.
 (`recallMode`) and Hindsight (`memory_mode`): `hybrid` injects *and* exposes tools,
 `context` injects only, `tools` exposes tools only.
 
+## One brain, many profiles
+
+Profiles keep separate brains — that's the right default, and it's also why a new
+`hermes profile create coder` starts out knowing nothing about you. Linking fixes that
+without merging anything:
+
+```bash
+hermes brain link personal --home ~/.hermes-personal   # read-only, owner-only
+hermes brain links                                     # what's linked, and reachable?
+hermes brain unlink personal
+```
+
+Your coder profile can now recall what you told your personal one — the timezone you
+work in, the box you rent, the deploy runbook you wrote three months ago — while each
+profile keeps writing only to its own store. Results are labelled `@personal` so you
+always know which brain answered, and linked memories are read-only from the other side:
+`forget` on one tells you which profile owns it rather than reaching across.
+
+Ranking is a proper merge, not a concatenation. Each profile is searched on its own and
+the ranked lists are fused with RRF, so a profile with 50 memories and one with 5,000
+are compared by *rank* rather than by scores that only mean something inside their own
+corpus. Linked profiles are fused at a slight discount and hold a guaranteed share of the
+result slots, so another profile informs your results without crowding out the one you're
+working in.
+
+Two things worth knowing before you link:
+
+- **Links are owner-only.** A gateway peer or an MCP session at tool trust searches your
+  local profile and nothing else, so a link widens what *you* see and never becomes a
+  way in for anyone else.
+- **Linking is genuine sharing, including the private parts.** A linked profile is read
+  as its owner, so peer cards — the brain's private notes about specific people — cross
+  the link too. That's the point when it's your own two profiles; it's worth a moment's
+  thought if a profile is shared with anyone.
+
+Per-turn injection stays local unless you opt in with `link_lane2: true`; on-demand
+recall (`search`, `brain_recall`, `ask`) uses links immediately.
+
 ## What leaves your device
 
 Nothing, by default. All memory lives in `$HERMES_HOME/brain/brain.db`; retrieval,
-forgetting and consolidation are local. Two paths can send data off-device, both opt-in:
+forgetting and consolidation are local. Linked profiles are local too — a link reads
+another directory on the same machine, never a network. Two paths can send data
+off-device, both opt-in:
 
 - **Auxiliary LLM calls** — extraction and dreaming send memory/conversation excerpts to
   whatever model you configured under `auxiliary.brain_extract` / `auxiliary.brain_consolidate`.

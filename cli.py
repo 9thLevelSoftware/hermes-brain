@@ -2421,7 +2421,11 @@ _FULL_IMPORT_ORDER = ("memories", "episodes", "entities", "entity_mentions",
 # are resolved in a second pass, because the target row may be exported after
 # the row that points at it.
 _FULL_IMPORT_REFS: dict[str, dict[str, str]] = {
-    "memories": {"supersedes_id": "memories", "superseded_by": "memories"},
+    # invalidated_by is a THIRD memories(id) reference (schema.sql:187) —
+    # contradiction history. Missing it pointed restored rows at unrelated
+    # local memories or dropped them on a failed insert (review round 2, P1).
+    "memories": {"supersedes_id": "memories", "superseded_by": "memories",
+                 "invalidated_by": "memories"},
     "entity_mentions": {"entity_id": "entities", "memory_id": "memories"},
     "edges": {"src_id": "memories", "dst_id": "memories"},
     "facts": {"memory_id": "memories", "entity_id": "entities",
@@ -2443,6 +2447,28 @@ _FULL_IMPORT_IDENTITY: dict[str, tuple[str, ...]] = {
     # validity window is the stable identity of an exported row.
     "facts": ("subject", "predicate", "object", "valid_from", "recorded_at"),
 }
+
+
+def _harden_imported_memory(rec: dict, now: str) -> None:
+    """Apply the SAME trust hardening the memories-only importer applies.
+
+    The full-import branch used to return before any of this ran, so a crafted
+    manifest could insert active, pinned, owner-trust, instruction-shaped rows
+    verbatim — straight into lane 1 — while `--trust-owner`'s help text promised
+    that verbatim trust preservation required the flag (PR #9 review round 2,
+    P1). A snapshot is a FILE; it is never the owner speaking.
+    """
+    content = str(rec.get("content") or "")
+    rec["created_by"] = "migration"
+    rec.setdefault("valid_from", now)
+    rec.setdefault("recorded_at", now)
+    if rec.get("trust_tier") not in ("agent", "known_user", "tool", "untrusted"):
+        rec["trust_tier"] = "agent"
+    rec["pinned"] = 0
+    rec["live"] = 1
+    if rec.get("kind") in ("warning", "insight") or \
+            _INSTRUCTION_SHAPED_RE.search(content):
+        rec["status"] = "quarantined"
 
 
 def _existing_row_id(conn, table: str, rec: dict):
@@ -2471,6 +2497,26 @@ def _existing_row_id(conn, table: str, rec: dict):
     except Exception:
         return None
     return row[0] if row else None
+
+
+def _clear_full_export_artifacts(out_dir: Path) -> int:
+    """Remove a previous --full export's files from a reused directory.
+
+    Leaving `manifest.json` behind is the dangerous part: `import` keys off it,
+    so a plain export into yesterday's --full directory would silently restore
+    current memories PLUS stale facts, entities and edges.
+    """
+    removed = 0
+    for name in ("manifest.json", *(f"{t}.jsonl" for t in _FULL_EXPORT_TABLES
+                                    if t != "memories")):
+        target = out_dir / name
+        try:
+            if target.exists():
+                target.unlink()
+                removed += 1
+        except OSError as e:
+            logger.warning("export: could not remove stale %s (%s)", target, e)
+    return removed
 
 
 def _export_full(conn, out_dir: Path) -> dict[str, int]:
@@ -2565,6 +2611,14 @@ def cmd_export(args: argparse.Namespace) -> int:
             for table, n in counts.items():
                 print(f"  {table:<16} {n}")
         else:
+            # The default output directory is date-based and REUSED, so a plain
+            # export after a --full one on the same day would leave the old
+            # manifest.json and table files in place — and `import` auto-detects
+            # that manifest, producing a mixed restore of current memories plus
+            # stale facts/entities/edges (review round 2, P2).
+            stale = _clear_full_export_artifacts(out_dir)
+            if stale:
+                print(f"  removed {stale} stale full-export file(s) from {out_dir}")
             print("  (current-truth memories only — use --full for a complete, "
                   "re-importable snapshot)")
         return 0
@@ -2595,7 +2649,7 @@ _INSTRUCTION_SHAPED_RE = re.compile(
 )
 
 
-def _import_full(conn, manifest_path: Path) -> dict[str, int]:
+def _import_full(conn, manifest_path: Path, *, trust_owner: bool = False) -> dict[str, int]:
     """Restore a `--full` export.
 
     Row IDs are NOT preserved — they are rowids, and reusing them would collide
@@ -2622,6 +2676,18 @@ def _import_full(conn, manifest_path: Path) -> dict[str, int]:
     # old id -> new id, per table. Populated for SKIPPED rows too, so a
     # reference to an already-present row still resolves.
     idmap: dict[str, dict[int, int]] = {t: {} for t in _FULL_EXPORT_TABLES}
+
+    # A snapshot that lost a file mid-copy must not restore "successfully" and
+    # silently drop memories or graph data (review round 2, P2). The manifest
+    # declares what should be here; check it before writing anything.
+    declared = manifest.get("tables") or {}
+    missing = [t for t, n in declared.items()
+               if int(n or 0) > 0 and not (out_dir / f"{t}.jsonl").exists()]
+    if missing:
+        raise ValueError(
+            f"incomplete snapshot: the manifest declares {', '.join(sorted(missing))} "
+            f"but the file(s) are absent from {out_dir}. Re-copy the export "
+            f"directory in full rather than restoring a partial one.")
 
     for table in _FULL_IMPORT_ORDER:
         src = out_dir / f"{table}.jsonl"
@@ -2668,6 +2734,9 @@ def _import_full(conn, manifest_path: Path) -> dict[str, int]:
                 else:
                     rec[col] = idmap.get(target, {}).get(val)
 
+            if table == "memories" and not trust_owner:
+                _harden_imported_memory(rec, db.iso_now())
+
             existing = _existing_row_id(conn, table, rec)
             if existing is not None:
                 if old_id is not None:
@@ -2699,6 +2768,22 @@ def _import_full(conn, manifest_path: Path) -> dict[str, int]:
                                  table, col, e)
         counts[table] = added
 
+    shortfall = []
+    for table, expected in declared.items():
+        expected = int(expected or 0)
+        if not expected:
+            continue
+        try:
+            actual = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        except Exception:
+            continue
+        if actual < expected:
+            shortfall.append(f"{table}: {actual} of {expected}")
+    if shortfall:
+        # Loud, but not fatal: the rows that DID land are real, and rolling
+        # back would lose them too. The operator has to know either way.
+        counts["INCOMPLETE"] = "; ".join(shortfall)
+
     db.bump_generation(conn, "mem")
     conn.commit()
     return counts
@@ -2721,7 +2806,8 @@ def cmd_import(args: argparse.Namespace) -> int:
     manifest = path if path.name == "manifest.json" else path.parent / "manifest.json"
     if manifest.exists():
         try:
-            counts = _import_full(conn, manifest)
+            counts = _import_full(conn, manifest,
+                                  trust_owner=bool(getattr(args, "trust_owner", False)))
             print("restored full export:")
             for table, n in counts.items():
                 print(f"  {table:<16} {n}")
