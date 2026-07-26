@@ -57,30 +57,6 @@ def test_unknown_keys_are_dropped(tmp_home):
     assert "not_a_real_key" not in text
 
 
-def test_every_default_key_is_actually_read_somewhere():
-    """Regression: `dream_schedule` and `dream_time` were prompted by the setup
-    wizard and read by NOTHING — the user answered two questions that did not
-    exist. A config key the product advertises must do something.
-
-    config.py declares the keys and brain_setup.py only prompts for them, so
-    neither counts as a reader; tests don't either.
-    """
-    import re
-    from pathlib import Path
-
-    root = Path(__file__).resolve().parent.parent
-    declared = re.findall(r'^\s{4}"([a-z0-9_]+)":',
-                          (root / "config.py").read_text(encoding="utf-8"), re.M)
-    assert declared, "could not parse DEFAULTS"
-
-    sources = [
-        p for p in root.rglob("*.py")
-        if not {".venv-dev", "tests", "__pycache__"} & set(p.parts)
-        and p.name not in ("config.py", "brain_setup.py")
-    ]
-    corpus = "\n".join(p.read_text(encoding="utf-8", errors="replace") for p in sources)
-
-    dead = [k for k in declared if f'"{k}"' not in corpus and f"'{k}'" not in corpus]
-    assert not dead, (
-        f"config keys declared but never read: {dead} — wire them up or remove "
-        f"them (and drop them from brain_setup.config_schema)")
+# NOTE: the "every DEFAULTS key is actually read" invariant lives in
+# tests/test_audit_fixes.py::test_every_declared_config_key_is_read_somewhere.
+# It was duplicated here; one strict, fast version beats two slow near-copies.

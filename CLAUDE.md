@@ -113,6 +113,8 @@ hermes brain why-not <query> <id>                    # why a memory did NOT surf
 hermes brain eval --generate|--sample K|--compare    # real-corpus retrieval measurement
 hermes brain weights show|reset                      # active retrieval-leg weights
 hermes brain import-provider <name> [--apply]        # migrate from another provider
+hermes brain link <name> --home <p> | unlink | links # read a sibling profile (owner-only)
+hermes brain export --full | import <manifest>       # lossless snapshot / restore
 hermes brain export | import | sync init|push|pull|status
 ```
 
@@ -132,6 +134,8 @@ Beyond the `MemoryProvider` ABC, the host duck-types a few optional provider met
 - **`recall/weights.py`** holds the active per-leg fusion weights in a `meta` row. `fusion.rrf()` takes an optional positional `weights` list; `recall/search.py` maintains `leg_names` parallel to `rankings` to map them. Uniform weights are byte-identical to no weights — every other caller (`blend.py`) depends on that.
 - **`tune` is still shadow and still never auto-applies.** The ONLY path from a fitted weight to live retrieval is `hermes brain review --approve` on a `kind='tuning'` proposal. A proposal with no fitted weights is refused, not silently "approved". `weights.from_proposal` rescales `fit_weights`' CONVEX output to mean 1.0 (a uniform scale would leave RRF ranking unchanged) and renames its `ppr` leg to `graph`.
 - **`evalkit/`** measures retrieval on the owner's real corpus: LLM-generated *paraphrase* queries (verbatim ones just measure BM25 finding itself), stored under `$HERMES_HOME/brain/eval/` (user data, never the repo), scored per leg-configuration with **paired win/loss/tie** alongside means. A config whose leg is unavailable is reported skipped, never scored.
+- **`get_tool_schemas()` must NOT gate on `self._initialized`.** The host calls it TWICE: `MemoryManager.add_provider` builds the `_tool_to_provider` ROUTING map from it *before* `initialize()`, and `inject_memory_provider_tools` builds the agent's advertised list *after*. Returning `[]` pre-init left routing empty and every brain tool came back "Unknown tool" while the schemas still appeared in `agent.tools` — advertised but unroutable (alignment-audit.md §G6). Invariant: **the offered set is always a subset of the routable set**, and `tools.dispatch` re-checks the real config gates at call time.
+- **Cross-profile links** (`store/links.py`, `recall/linked.py`) are merged at the fusion layer — each linked profile gets its own `search()` on its own `mode=ro` connection and the ranked lists go through `fusion.rrf()`, keyed on `(profile, uid)`. **Links are traversed ONLY for an owner-trust caller**; that single comparison is what keeps full-owner-access links from being an escalation path, so do not soften it. `Hit.id` is a rowid, so `log_retrieval` filters linked hits — writing one locally would corrupt whatever memory shares the number. Lane 2 is opt-in (`link_lane2`).
 - **`bootstrap/state_db.py`** has a staleness reaper: an `ended_at IS NULL` session is withheld only while genuinely live (newest message within `bootstrap_stale_days`). Without it, 72% of a real install's history was skipped forever.
 
 ## "Best-of-three" subsystems (Mnemosyne + Honcho ports)

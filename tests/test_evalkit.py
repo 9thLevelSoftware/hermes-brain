@@ -198,9 +198,16 @@ def test_configurations_needing_absent_legs_are_skipped_not_scored(conn, tmp_hom
     # never silently scored (which would read as "this leg changed nothing").
     for name in ("+vec", "+vec+rerank", "+vec+graph", "+vec+facts", "all"):
         assert by_name[name]["skipped"], f"{name} should be skipped"
+    # ...but best-available still RUNS: it is computed from what is present, so
+    # you can always see your real stack even when a leg's model is missing.
+    assert by_name["best-available"]["skipped"] is None
     assert by_name["+vec"]["skipped"] == "no embedder for this tier"
     # ...and skipped configs never appear in the paired comparison.
-    assert report["paired"] == {}
+    for name in ("+vec", "+vec+rerank", "+vec+graph", "+vec+facts", "all"):
+        assert name not in report["paired"]
+    # best-available did run, so it is paired — and with no legs available it
+    # is the baseline by another name, hence all ties.
+    assert report["paired"]["best-available"]["win"] == 0
 
 
 def test_rerank_skip_reason_names_the_missing_model(conn, tmp_home, monkeypatch):
@@ -233,11 +240,14 @@ def test_report_covers_every_configuration(conn, tmp_home):
     queries = [{"query": "staging database", "gold": [uids[0]],
                 "source_kind": "memory", "source_uid": uids[0]}]
     report = run_comparison(conn, queries, embedder=None, reranker=None)
-    assert len(report["results"]) == len(CONFIGURATIONS)
+    # Every fixed configuration, PLUS the runtime-computed best-available row.
+    assert len(report["results"]) == len(CONFIGURATIONS) + 1
+    assert report["results"][-1]["name"] == "best-available"
 
     text = format_report(report)
     for cfg in CONFIGURATIONS:
         assert cfg.name in text
+    assert "best-available" in text
     assert "n=1 is small" in text, "small samples must be called out"
 
 
@@ -308,3 +318,43 @@ def test_best_available_reflects_what_is_actually_present(conn):
     assert cfg.name == "best-available"
     assert cfg.vec is False and cfg.rerank is False
     assert cfg.graph is True and cfg.facts is True
+
+
+def test_baseline_round_trip_and_delta_column(conn, tmp_home):
+    """Approving a tune proposal changes retrieval; without a stored before-run
+    there is nothing to compare the after-run against."""
+    from brain.evalkit import load_baseline, save_baseline
+    from brain.evalkit.compare import format_report
+
+    assert load_baseline(tmp_home) is None
+
+    uids = _seed(conn, 6)
+    queries = [{"query": "staging database number 0", "gold": [uids[0]],
+                "source_kind": "memory", "source_uid": uids[0]}]
+    report = run_comparison(conn, queries, embedder=None, reranker=None)
+    save_baseline(tmp_home, report)
+
+    loaded = load_baseline(tmp_home)
+    assert loaded is not None
+    text = format_report(report, loaded)
+    assert "ΔMRR vs saved" in text
+    assert "+0.0000" in text, "the same run against itself is a zero delta"
+
+
+def test_format_report_without_a_baseline_has_no_delta_column(conn, tmp_home):
+    from brain.evalkit.compare import format_report
+
+    uids = _seed(conn, 4)
+    queries = [{"query": "staging database", "gold": [uids[0]],
+                "source_kind": "memory", "source_uid": uids[0]}]
+    text = format_report(run_comparison(conn, queries, embedder=None), None)
+    assert "ΔMRR" not in text
+
+
+def test_corrupt_baseline_reads_as_absent(tmp_home):
+    from brain.evalkit import baseline_path, load_baseline
+
+    path = baseline_path(tmp_home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not json", encoding="utf-8")
+    assert load_baseline(tmp_home) is None

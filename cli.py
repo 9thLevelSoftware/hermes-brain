@@ -130,6 +130,9 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     p_eval.add_argument("--sample", type=int, default=0, metavar="K",
                         help="print K query/gold pairs from the stored set for "
                              "manual spot-checking")
+    p_eval.add_argument("--save-baseline", dest="save_baseline", action="store_true",
+                        help="with --compare: record this run as the baseline for "
+                             "future comparisons")
     p_eval.add_argument("--compare", action="store_true",
                         help="score the stored query set across every leg "
                              "configuration (no LLM calls)")
@@ -160,6 +163,10 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
 
     p_exp = cmds.add_parser("export", help="JSONL + markdown snapshot of current memories")
     p_exp.add_argument("--out", default=None, help="output directory (default brain/exports/<date>)")
+    p_exp.add_argument("--full", action="store_true",
+                       help="complete, re-importable snapshot: every table plus "
+                            "superseded/tombstoned rows (the default is "
+                            "current-truth memories only)")
 
     p_imp = cmds.add_parser("import", help="re-import a memories.jsonl (content-hash dedup)")
     p_imp.add_argument("file", help="path to a memories.jsonl produced by export")
@@ -2019,7 +2026,14 @@ def cmd_eval_sample(args: argparse.Namespace) -> int:
 def cmd_eval_compare(args: argparse.Namespace) -> int:
     """Score the stored query set across leg configurations. No LLM calls."""
     from . import config
-    from .evalkit import format_report_or_none, load_queryset, queryset_path, run_comparison
+    from .evalkit import (
+        format_report_or_none,
+        load_baseline,
+        load_queryset,
+        queryset_path,
+        run_comparison,
+        save_baseline,
+    )
 
     home = _hermes_home()
     data = load_queryset(home)
@@ -2037,7 +2051,13 @@ def cmd_eval_compare(args: argparse.Namespace) -> int:
                                 embedder=embedder, reranker=reranker)
     finally:
         conn.close()
-    print(format_report_or_none(report))
+    print(format_report_or_none(report, load_baseline(home)))
+    if getattr(args, "save_baseline", False):
+        path = save_baseline(home, report)
+        print(f"\nbaseline saved to {path} — a later --compare shows the delta.")
+    elif load_baseline(home) is None:
+        print("\nTip: 'hermes brain eval --compare --save-baseline' records this "
+              "run so a later one can show what changed.")
     return 0
 
 
@@ -2386,6 +2406,51 @@ def _topic_filename(tag: str) -> str:
     return (_re.sub(r"[^A-Za-z0-9_-]+", "-", tag).strip("-") or "untagged") + ".md"
 
 
+# Tables a --full export carries, in dependency order. `memories` FIRST so an
+# importer can map old->new ids before anything references them.
+_FULL_EXPORT_TABLES = ("memories", "episodes", "facts", "entities",
+                       "entity_mentions", "edges")
+FULL_EXPORT_VERSION = 1
+
+
+def _export_full(conn, out_dir: Path) -> dict[str, int]:
+    """Write every table a brain's knowledge lives in, plus a manifest.
+
+    The default export is current-truth memories only, which `integration.md`
+    §5.3 nonetheless described as "lossless, re-importable" — it was neither
+    (alignment-audit.md §G3). This mode makes the claim true.
+
+    `memories` is exported WITHOUT the valid_to/status filter: versions-are-rows
+    is the storage model, so dropping superseded and tombstoned rows discards
+    exactly the history `hermes brain why` reads back.
+    """
+    from .store import db
+
+    counts: dict[str, int] = {}
+    for table in _FULL_EXPORT_TABLES:
+        try:
+            rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+        except Exception as e:      # a table this schema version lacks
+            logger.debug("full export: skipping %s (%s)", table, e)
+            continue
+        path = out_dir / f"{table}.jsonl"
+        with open(path, "w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(dict(row), ensure_ascii=False, default=str) + "\n")
+        counts[table] = len(rows)
+
+    manifest = {
+        "format": "hermes-brain-full-export",
+        "version": FULL_EXPORT_VERSION,
+        "schema_version": db.get_meta(conn, "schema_version"),
+        "exported_at": db.iso_now(),
+        "tables": counts,
+    }
+    (out_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    return counts
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     from .store import db
 
@@ -2434,6 +2499,14 @@ def cmd_export(args: argparse.Namespace) -> int:
                     f"# {tag}\n\n" + "\n".join(lines) + "\n", encoding="utf-8")
 
         print(f"exported {len(rows)} memories to {out_dir}")
+        if getattr(args, "full", False):
+            counts = _export_full(conn, out_dir)
+            print("full export (identity-preserving):")
+            for table, n in counts.items():
+                print(f"  {table:<16} {n}")
+        else:
+            print("  (current-truth memories only — use --full for a complete, "
+                  "re-importable snapshot)")
         return 0
     except Exception as e:
         print(f"Export failed: {e}\n"
@@ -2462,6 +2535,61 @@ _INSTRUCTION_SHAPED_RE = re.compile(
 )
 
 
+def _import_full(conn, manifest_path: Path) -> dict[str, int]:
+    """Restore a `--full` export, preserving uids so a round trip is genuinely
+    identity-preserving.
+
+    Row IDS are deliberately NOT preserved (they are rowids, and colliding with
+    existing rows would corrupt the target); a uid that already exists is
+    skipped rather than duplicated, which makes re-import idempotent.
+    """
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("format") != "hermes-brain-full-export":
+        raise ValueError(f"{manifest_path} is not a full-export manifest")
+    out_dir = manifest_path.parent
+    counts: dict[str, int] = {}
+
+    for table in _FULL_EXPORT_TABLES:
+        src = out_dir / f"{table}.jsonl"
+        if not src.exists():
+            continue
+        try:
+            cols = [r["name"] for r in
+                    conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        except Exception:
+            continue
+        if not cols:
+            continue
+        has_uid = "uid" in cols
+        insert_cols = [c for c in cols if c != "id"]
+        placeholders = ",".join("?" * len(insert_cols))
+        sql = (f"INSERT INTO {table} ({','.join(insert_cols)}) "
+               f"VALUES ({placeholders})")
+        added = 0
+        for line in src.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (has_uid and rec.get("uid")
+                    and conn.execute(f"SELECT 1 FROM {table} WHERE uid=? LIMIT 1",
+                                     (rec["uid"],)).fetchone()):
+                continue
+            try:
+                conn.execute(sql, [rec.get(c) for c in insert_cols])
+                added += 1
+            except Exception as e:
+                logger.debug("full import: %s row skipped (%s)", table, e)
+        counts[table] = added
+    from .store import db
+
+    db.bump_generation(conn, "mem")
+    conn.commit()
+    return counts
+
+
 def cmd_import(args: argparse.Namespace) -> int:
     from .store import db
 
@@ -2474,6 +2602,25 @@ def cmd_import(args: argparse.Namespace) -> int:
     conn = _open_db(_hermes_home())
     if conn is None:
         return 1
+    # A manifest next to the file (or handed in directly) means this is a full
+    # export — restore every table rather than memories alone.
+    manifest = path if path.name == "manifest.json" else path.parent / "manifest.json"
+    if manifest.exists():
+        try:
+            counts = _import_full(conn, manifest)
+            print("restored full export:")
+            for table, n in counts.items():
+                print(f"  {table:<16} {n}")
+            print("\nuids preserved; existing rows were left alone (re-import is "
+                  "idempotent).")
+            return 0
+        except Exception as e:
+            print(f"Full import failed: {e}\n"
+                  f"  Remedy: check {manifest} came from 'hermes brain export --full'.",
+                  file=sys.stderr)
+            return 1
+        finally:
+            conn.close()
     try:
         columns = [r["name"] for r in conn.execute("PRAGMA table_info(memories)").fetchall()
                    if r["name"] not in _IMPORT_SKIP_COLS]

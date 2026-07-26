@@ -203,3 +203,67 @@ def test_get_tool_schemas_match_host_expected_shape(synthetic_brain, tmp_path):
             assert "unknown tool" not in out
     finally:
         provider.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Bug 3 — tool ROUTING is built before initialize() (alignment-audit.md §G6)
+# ---------------------------------------------------------------------------
+
+def test_get_tool_schemas_works_before_initialize(synthetic_brain, tmp_path):
+    """The host calls get_tool_schemas() TWICE, at two different times.
+
+    `MemoryManager.add_provider` calls it to build `_tool_to_provider` — the
+    map that routes a tool call back to us — and that happens BEFORE
+    `initialize()`. Returning [] there left the routing map empty, so every
+    brain tool the model called failed with "Unknown tool: ...", while the
+    schemas still showed up in the agent's advertised list (injected later,
+    post-init). The entire agent-facing tool surface was dead.
+    """
+    provider_mod = importlib.import_module(f"{_BRAIN}.provider")
+    provider = provider_mod.BrainProvider()
+
+    assert provider._initialized is False
+    names = [s["function"]["name"] for s in provider.get_tool_schemas()]
+    assert "brain_recall" in names, "routing must learn our tool names pre-init"
+    assert "brain_remember" in names and "brain_manage" in names
+    assert "memories" in names
+
+
+def test_routing_names_are_a_superset_of_what_is_offered(synthetic_brain, tmp_path):
+    """Pre-init (config = DEFAULTS) routing learns every name we could answer
+    to; post-init the advertised list reflects brain.yaml. A name that can be
+    OFFERED must always be ROUTABLE, or the model gets 'Unknown tool'."""
+    provider_mod = importlib.import_module(f"{_BRAIN}.provider")
+    home = tmp_path / "home"
+    home.mkdir()
+
+    routable = {s["function"]["name"] for s in provider_mod.BrainProvider().get_tool_schemas()}
+
+    provider = provider_mod.BrainProvider()
+    provider.initialize("t", hermes_home=str(home), platform="replay",
+                        agent_context="primary")
+    try:
+        offered = {s["function"]["name"] for s in provider.get_tool_schemas()}
+    finally:
+        provider.shutdown()
+    assert offered <= routable, f"offered but unroutable: {offered - routable}"
+
+
+def test_context_recall_mode_only_hides_tools_after_initialize(synthetic_brain, tmp_path):
+    """recall_mode='context' means "no tools for the agent" — but it must still
+    not empty the ROUTING map, or a config change mid-life breaks dispatch."""
+    from brain import config as brain_config
+
+    provider_mod = importlib.import_module(f"{_BRAIN}.provider")
+    home = tmp_path / "home2"
+    home.mkdir()
+    brain_config.save_config(home, {"recall_mode": "context", "mode": "fts-only"})
+
+    provider = provider_mod.BrainProvider()
+    assert provider.get_tool_schemas(), "pre-init routing is never empty"
+    provider.initialize("t", hermes_home=str(home), platform="replay",
+                        agent_context="primary")
+    try:
+        assert provider.get_tool_schemas() == []
+    finally:
+        provider.shutdown()

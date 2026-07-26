@@ -220,3 +220,105 @@ def test_worker_idle_tick_calls_the_idle_dream(tmp_home):
     # ...and specifically on the queue.Empty (idle) path, not the job path.
     before_continue = idle_branch.split("continue", 1)[0]
     assert "_maybe_idle_dream" in before_continue
+
+
+# ---------------------------------------------------------------------------
+# Cron job creation against a FAKE `cron.jobs` (alignment-audit.md §G4)
+# ---------------------------------------------------------------------------
+#
+# This path has never run against a real gateway — cron is gateway-resident, so
+# no test environment had it. These tests do not make it production-verified;
+# they move it from "unknown" to "known against a fake", which is the honest
+# distinction. What they pin is the shape of the call: no_agent=True, the right
+# schedule, a script that actually exists, and idempotency.
+
+@pytest.fixture
+def fake_cron(monkeypatch):
+    """Inject a stand-in `cron.jobs` module the way a gateway install provides
+    the real one."""
+    import sys
+    import types
+
+    calls = {"created": [], "jobs": []}
+
+    def create_job(prompt, schedule, **kwargs):
+        job = {"id": f"job-{len(calls['created']) + 1}", "prompt": prompt,
+               "schedule": schedule, **kwargs}
+        calls["created"].append(job)
+        calls["jobs"].append(job)
+        return job
+
+    def list_jobs(include_disabled=False):
+        return list(calls["jobs"])
+
+    cron_pkg = types.ModuleType("cron")
+    jobs_mod = types.ModuleType("cron.jobs")
+    jobs_mod.create_job = create_job
+    jobs_mod.list_jobs = list_jobs
+    cron_pkg.jobs = jobs_mod
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.jobs", jobs_mod)
+    monkeypatch.setattr("builtins.input", lambda *a: "y")
+    return calls
+
+
+def test_cron_offer_creates_a_no_agent_script_job(tmp_home, fake_cron, capsys):
+    brain_setup._offer_cron_job(tmp_home, {"dream_schedule": "auto",
+                                           "dream_time": "03:30"})
+    assert len(fake_cron["created"]) == 1
+    job = fake_cron["created"][0]
+
+    # no_agent is mandatory: an agent cron job runs skip_memory=True with a
+    # 3-minute interrupt and costs tokens for work whose whole point is offline.
+    assert job["no_agent"] is True
+    assert job["prompt"] is None
+    assert job["schedule"] in ("30 3 * * *", "every 24h")
+    assert job["name"] == brain_setup._CRON_JOB_NAME
+
+    # The script must exist where cron will look for it, and actually invoke
+    # the due-gated entry point.
+    script = tmp_home / "scripts" / job["script"]
+    assert script.is_file()
+    body = script.read_text(encoding="utf-8")
+    assert "brain" in body and "dream" in body and "--if-due" in body
+    assert "Scheduled" in capsys.readouterr().out
+
+
+def test_cron_offer_is_idempotent(tmp_home, fake_cron, capsys):
+    brain_setup._offer_cron_job(tmp_home, {"dream_schedule": "auto"})
+    capsys.readouterr()
+    brain_setup._offer_cron_job(tmp_home, {"dream_schedule": "auto"})
+    assert len(fake_cron["created"]) == 1, "a second setup must not double-schedule"
+    assert "already exists" in capsys.readouterr().out
+
+
+def test_cron_offer_declined_creates_nothing(tmp_home, fake_cron, monkeypatch, capsys):
+    monkeypatch.setattr("builtins.input", lambda *a: "n")
+    brain_setup._offer_cron_job(tmp_home, {"dream_schedule": "auto"})
+    assert fake_cron["created"] == []
+    assert "Skipped" in capsys.readouterr().out
+
+
+def test_cron_creation_failure_teaches_the_manual_command(tmp_home, monkeypatch,
+                                                          capsys):
+    """A scheduler that rejects the job must not leave the user with nothing."""
+    import sys
+    import types
+
+    jobs_mod = types.ModuleType("cron.jobs")
+
+    def boom(*a, **kw):
+        raise RuntimeError("scheduler unavailable")
+
+    jobs_mod.create_job = boom
+    jobs_mod.list_jobs = lambda include_disabled=False: []
+    cron_pkg = types.ModuleType("cron")
+    cron_pkg.jobs = jobs_mod
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.jobs", jobs_mod)
+    monkeypatch.setattr("builtins.input", lambda *a: "y")
+
+    brain_setup._offer_cron_job(tmp_home, {"dream_schedule": "auto"})
+    out = capsys.readouterr().out
+    assert "Could not create" in out
+    assert "dream --if-due" in out, "the manual fallback must be given"

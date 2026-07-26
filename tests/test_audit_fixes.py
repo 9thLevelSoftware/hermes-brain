@@ -394,29 +394,54 @@ def test_forget_demote_below_is_reachable_from_brain_yaml(tmp_home):
     assert load_config(tmp_home)["forget_demote_below"] == pytest.approx(0.25)
 
 
-def test_every_declared_config_key_is_read_somewhere():
-    """Guards against re-introducing a declared-but-unenforced gate like
-    ask_tool: a key in DEFAULTS that nothing reads is either dead or a lie."""
-    import re
+def _source_blob() -> str:
+    """Every first-party module's source, as one string.
+
+    Prunes with os.walk rather than filtering rglob output: a developer venv
+    inside the repo puts tens of thousands of site-packages files in rglob's
+    path, and this test spent ~2 minutes reading them before the filter ran.
+    """
+    import os
     from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    skip = {".git", "tests", "docker", "docs", "__pycache__", ".ruff_cache",
+            ".pytest_cache", "node_modules", "build", "dist"}
+    parts = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if d not in skip and not d.startswith((".venv", "venv", "."))]
+        for name in filenames:
+            if not name.endswith(".py"):
+                continue
+            path = Path(dirpath) / name
+            # config.py DECLARES the keys and brain_setup.py only PROMPTS for
+            # them, so neither counts as a reader. Excluding brain_setup is what
+            # makes this catch a wizard field nothing acts on — exactly how
+            # dream_schedule/dream_time went unnoticed (alignment-audit §F1/§C1).
+            if path.parent == root and name in ("config.py", "brain_setup.py"):
+                continue
+            parts.append(path.read_text(encoding="utf-8", errors="replace"))
+    return "\n".join(parts)
+
+
+def test_every_declared_config_key_is_read_somewhere():
+    """A key in DEFAULTS that nothing reads is either dead or a lie.
+
+    Guards two real regressions: a declared-but-unenforced gate (ask_tool), and
+    a wizard question whose answer nothing acts on (dream_schedule/dream_time,
+    which were prompted at setup and read by zero call sites).
+    """
+    import re
 
     from brain.config import DEFAULTS
 
-    root = Path(__file__).resolve().parent.parent
-    skip_dirs = {".git", "tests", "docker", "__pycache__", ".ruff_cache",
-                 ".pytest_cache", "docs"}
-    haystack = []
-    for path in root.rglob("*.py"):
-        if set(path.relative_to(root).parts) & skip_dirs:
-            continue
-        if path.name == "config.py" and path.parent == root:
-            continue
-        haystack.append(path.read_text(encoding="utf-8", errors="replace"))
-    blob = "\n".join(haystack)
-
+    blob = _source_blob()
     unread = [k for k in DEFAULTS
               if not re.search(rf"""["']{re.escape(k)}["']""", blob)]
-    assert not unread, f"config keys declared but never read: {unread}"
+    assert not unread, (
+        f"config keys declared but never read: {unread} — wire them up, or "
+        f"remove them from DEFAULTS and brain_setup.config_schema()")
 
 
 def test_plugin_manifests_use_the_key_the_host_actually_reads():

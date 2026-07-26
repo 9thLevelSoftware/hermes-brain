@@ -459,9 +459,26 @@ class BrainProvider(MemoryProvider):
     # -- tools -------------------------------------------------------------------
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        if not self._initialized:
-            return []
-        if self._recall_mode == "context":
+        """Tool schemas. Called at TWO different times, for two purposes.
+
+        This must NOT gate on ``self._initialized``, and that was a real bug
+        (docs/design/alignment-audit.md §G6): the host calls this once from
+        ``MemoryManager.add_provider`` to build ``_tool_to_provider`` — the
+        map that ROUTES a tool call back to us — and that happens BEFORE
+        ``initialize()``. Returning ``[]`` there left the routing map empty, so
+        every brain tool the model called came back "Unknown tool: brain_recall"
+        while the schemas still appeared in the agent's advertised list (those
+        are injected later, post-init, by ``inject_memory_provider_tools``).
+        The whole agent-facing tool surface was dead and nothing said so.
+
+        The two call sites want slightly different things and both are served:
+        pre-init the config is ``DEFAULTS`` (permissive), so routing learns every
+        name we could ever answer to; post-init it reflects brain.yaml, so the
+        model is only OFFERED what is enabled. ``tools.dispatch`` re-checks the
+        real gates at call time, so a disabled tool is refused, never silently
+        served.
+        """
+        if self._initialized and self._recall_mode == "context":
             return []  # injection-only: the agent gets memory via the lanes
         from . import tools
 
