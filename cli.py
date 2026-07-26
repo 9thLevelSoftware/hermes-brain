@@ -242,7 +242,15 @@ def _dream_phases() -> tuple[str, ...]:
     return PIPELINE
 
 
-_DREAM_MIN_INTERVAL_HOURS = 6
+# The §4.6 "brain owns memory" matrix — ONE definition, applied by
+# `adopt-memory --apply` and checked for drift by `doctor`. The skills loop,
+# curator and session_search are deliberately absent: they stay untouched.
+_ADOPT_MATRIX: dict[str, object] = {
+    "memory.memory_enabled": False,
+    "memory.user_profile_enabled": False,
+    "memory.nudge_interval": 0,
+    "memory.provider": "brain",
+}
 
 
 def _open_db(home: Path):
@@ -590,6 +598,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         except Exception:
             cfg = dict(config.DEFAULTS)
         _doctor_p2_checks(conn, cfg, report)
+        _doctor_dream_freshness(conn, cfg, report)
 
         conn.close()
     elif future_schema_msg:
@@ -613,11 +622,112 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         report("FAIL", "config", f"load failed: {e} — fix or delete "
                f"{config.config_path(home)} (defaults apply when absent)")
 
+    # 7. Hermes-side drift (§4.6 promised doctor warns on it).
+    _doctor_host_config_checks(home, report)
+
     n_pass = sum(1 for s, _, _ in results if s == "PASS")
     n_warn = sum(1 for s, _, _ in results if s == "WARN")
     n_fail = sum(1 for s, _, _ in results if s == "FAIL")
     print(f"\n{n_pass} pass, {n_warn} warn, {n_fail} fail")
     return 1 if n_fail else 0
+
+
+def _doctor_host_config_checks(home: Path, report) -> None:
+    """Drift between Hermes's config.yaml and what the brain expects (§4.6).
+
+    Two distinct failures, deliberately weighted differently:
+
+    * ``memory.provider != "brain"`` is a FAIL — the plugin is installed and
+      being asked for a health report, but Hermes is not routing memory to it,
+      so nothing in the two lanes is reaching the model. In practice this
+      mostly reports PASS: `hermes <name>` CLI discovery loads the ACTIVE
+      provider's cli.py only (F10), so reaching this check through
+      `hermes brain doctor` usually means the brain already is active. It
+      earns its keep on the other entry points (a dev/`python -m` invocation,
+      a config edited mid-session) and costs one config read.
+    * the rest of the matrix is INFO-only. Keeping the built-ins on during the
+      transition phase is a supported configuration, not a defect — the WARN
+      only fires once the user has adopted the brain-owns-memory phase
+      partially, which is the genuinely inconsistent state.
+    """
+    try:
+        from hermes_cli.config import load_config as h_load  # type: ignore
+    except ImportError:
+        report("PASS", "host-config",
+               "not running inside Hermes — host config not checked")
+        return
+    try:
+        cfg = h_load() or {}
+        mem = cfg.get("memory") if isinstance(cfg, dict) else {}
+        mem = mem if isinstance(mem, dict) else {}
+    except Exception as e:
+        report("WARN", "host-config", f"could not read Hermes config.yaml: {e}")
+        return
+
+    provider = str(mem.get("provider") or "")
+    if provider == "brain":
+        report("PASS", "host-provider", 'memory.provider = "brain"')
+    else:
+        report("FAIL", "host-provider",
+               f"memory.provider is {provider or '(unset)'!r}, not 'brain' — the "
+               f"brain captures nothing; run 'hermes memory setup' and pick brain")
+
+    # Partial adoption: some built-ins off, some on.
+    adopted = {
+        key: mem.get(key.split(".", 1)[1])
+        for key in _ADOPT_MATRIX if key != "memory.provider"
+    }
+    matches = [k for k, v in adopted.items() if v == _ADOPT_MATRIX[k]]
+    if not matches:
+        report("PASS", "host-builtins",
+               "built-in memory still on (transition phase) — "
+               "'hermes brain adopt-memory' hands ownership to the brain")
+    elif len(matches) == len(adopted):
+        report("PASS", "host-builtins", "brain owns memory (§4.6 matrix applied)")
+    else:
+        missing = [f"{k}={adopted[k]!r} (want {_ADOPT_MATRIX[k]!r})"
+                   for k in adopted if k not in matches]
+        report("WARN", "host-builtins",
+               "partially adopted: " + "; ".join(missing) +
+               " — run 'hermes brain adopt-memory --apply' to finish")
+
+
+def _doctor_dream_freshness(conn, cfg: dict, report) -> None:
+    """WARN when nothing has consolidated in a while.
+
+    The dream is cron/manual/on-idle — never auto-spawned — so "no dream ever"
+    is the default state of an install whose scheduling was skipped, and the
+    learning system is silently inert. This check is how that becomes visible.
+    """
+    from .dream.lease import last_dream_finished
+    from .store import db
+
+    schedule = str(cfg.get("dream_schedule", "auto"))
+    last = last_dream_finished(conn)
+    if not last:
+        report("WARN", "dream-freshness",
+               f"no dream has ever completed (dream_schedule={schedule}) — run "
+               f"'hermes brain dream-now', or 'hermes memory setup' to schedule one")
+        return
+    stale_after_days = 3
+    cutoff = db.iso_now()[:10]
+    try:
+        age_days = (_iso_date_ordinal(cutoff) - _iso_date_ordinal(last[:10]))
+    except ValueError:
+        report("PASS", "dream-freshness", f"last dream {last}")
+        return
+    if age_days > stale_after_days:
+        report("WARN", "dream-freshness",
+               f"last dream was {age_days}d ago ({last}, dream_schedule={schedule}) "
+               f"— learning is stalled; run 'hermes brain dream-now'")
+    else:
+        report("PASS", "dream-freshness", f"last dream {last} ({age_days}d ago)")
+
+
+def _iso_date_ordinal(yyyy_mm_dd: str) -> int:
+    import datetime
+
+    return datetime.date.fromisoformat(yyyy_mm_dd).toordinal()
 
 
 def _doctor_p2_checks(conn, cfg: dict, report) -> None:
@@ -1787,36 +1897,12 @@ def _resolve_dream_embedder(cfg):
     return get_embedder(cfg, mode, allow_download=False)
 
 
-def _last_dream_finished(conn):
-    row = conn.execute(
-        "SELECT finished_at FROM shift_runs WHERE finished_at IS NOT NULL "
-        "ORDER BY finished_at DESC LIMIT 1").fetchone()
-    return row["finished_at"] if row else None
-
-
 def _dream_is_due(conn, cfg) -> bool:
-    from .dream.lease import held_by
-    from .store import db
+    """Delegates to dream.lease.is_due — ONE definition of "due" shared by the
+    cron entry point and the provider's opt-in on-idle path."""
+    from .dream.lease import is_due
 
-    if held_by(conn, "dream"):
-        return False
-    last = _last_dream_finished(conn)
-    if not last:
-        return True
-    hours = float(cfg.get("dream_min_interval_hours", _DREAM_MIN_INTERVAL_HOURS))
-    # due once `last + hours` is in the past.
-    return _iso_add_hours(last, hours) < db.iso_now()
-
-
-def _iso_add_hours(iso: str, hours: float) -> str:
-    import time as _time
-
-    try:
-        t = _time.mktime(_time.strptime(iso[:19], "%Y-%m-%dT%H:%M:%S"))
-    except ValueError:
-        return iso
-    t += hours * 3600.0
-    return _time.strftime("%Y-%m-%dT%H:%M:%S", _time.gmtime(t)) + ".000Z"
+    return is_due(conn, cfg)
 
 
 def cmd_dream_now(args: argparse.Namespace) -> int:
@@ -2276,12 +2362,7 @@ def cmd_adopt_memory(args: argparse.Namespace) -> int:
     """Apply the 'brain owns memory' matrix to Hermes config.yaml (§4.6):
     turn OFF the built-in memory/profile/nudges so the brain is authoritative.
     Dry-run by default; --apply writes."""
-    target = {
-        "memory.memory_enabled": False,
-        "memory.user_profile_enabled": False,
-        "memory.nudge_interval": 0,
-        "memory.provider": "brain",
-    }
+    target = dict(_ADOPT_MATRIX)
     print("Brain-owns-memory matrix (skills loop + curator + session_search untouched):")
     for key, val in target.items():
         print(f"  {key:32} -> {val}")

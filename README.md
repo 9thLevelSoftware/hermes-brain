@@ -53,9 +53,41 @@ The learning strategies are **active by default** — modes `off | shadow | dry_
 the mutating strategies (`cases`/`distill`/`consolidate`/`contradict`/`forget`) learn live
 on every dream run. `tune` stays `shadow` (it only ever *proposes* retrieval-weight changes,
 never applies them). Roll any strategy back with `hermes brain dream --disable <strategy>`,
-or neutralize a whole run with `--dry-run`. The dream still runs on **cron + manual only**;
-the brain never spawns background processes on its own, so "active" only takes effect when
-you run a dream.
+or neutralize a whole run with `--dry-run`.
+
+**The brain never spawns a background process.** The dream runs when you schedule it:
+`hermes memory setup` offers a `no_agent` cron job (gateway installs), `dream_schedule:
+on-idle` lets the provider's existing worker run a due shift while a session sits idle
+(CLI-only installs), and `hermes brain dream-now` always works. `hermes brain doctor`
+warns when nothing has consolidated in a while.
+
+## At a glance
+
+| | |
+|---|---|
+| **Storage** | Local — one SQLite file under `$HERMES_HOME/brain/` |
+| **Cost** | Free (optional auxiliary LLM spend for extraction/dreaming, capped by `day_budget_usd`) |
+| **Tools** | 5 — `brain_recall`, `brain_remember`, `brain_outcome`, `brain_manage`, `memories`; plus opt-in `brain_ask` |
+| **Key feature** | Sleep-time consolidation + skill forging — memory that improves rather than accumulates |
+
+`recall_mode` (`hybrid` \| `context` \| `tools`) matches the convention used by Honcho
+(`recallMode`) and Hindsight (`memory_mode`): `hybrid` injects *and* exposes tools,
+`context` injects only, `tools` exposes tools only.
+
+## What leaves your device
+
+Nothing, by default. All memory lives in `$HERMES_HOME/brain/brain.db`; retrieval,
+forgetting and consolidation are local. Two paths can send data off-device, both opt-in:
+
+- **Auxiliary LLM calls** — extraction and dreaming send memory/conversation excerpts to
+  whatever model you configured under `auxiliary.brain_extract` / `auxiliary.brain_consolidate`.
+  A local model keeps this on-device. `extract_mode: off` disables it entirely.
+- **Multi-device sync** (`sync_enabled`, off by default, needs the `[sync]` extra) — pushes
+  **ciphertext only** to a relay that never holds your key: content is encrypted with a key
+  derived from your passphrase (Argon2id/PBKDF2 → Fernet + HMAC) before it leaves. The relay
+  stores opaque blobs. A surface-only deny-list is the load-bearing invariant, re-checked at
+  push time: a scoped, `peer_card`, quarantined or instruction-shaped row **never**
+  serializes, so a synced memory is global by construction.
 
 ## CLI
 
@@ -63,6 +95,7 @@ you run a dream.
 hermes brain status | doctor | search <q> | why <id>
 hermes brain remember/forget/pin/unpin/incognito ...
 hermes brain dream-now [--phase X] [--dry-run]     # run a consolidation shift
+hermes brain context | ask <q> | fact <subject>       # assembled context, cited answers, s-p-o facts
 hermes brain dream --if-due                          # cron entry point
 hermes brain dream --enable/--disable <strategy>     # promote a strategy
 hermes brain insights                                # longitudinal learning metrics
@@ -76,8 +109,10 @@ hermes brain adopt-memory [--apply]                  # hand memory ownership to 
 
 Phases P1–P5 complete: passive capture + FTS, hybrid retrieval + real lane 1 + bootstrap,
 tool surface + sweep extraction, the dream cycle, and the learning flywheel + MCP surface.
-See [`docs/design/`](docs/design/) for the normative design and
-[`docs/design/critique.md`](docs/design/critique.md) for the resolved punch list.
+See [`docs/design/`](docs/design/) for the normative design,
+[`docs/design/critique.md`](docs/design/critique.md) for the resolved punch list, and
+[`docs/design/alignment-audit.md`](docs/design/alignment-audit.md) for the audit against
+the live `hermes-agent` provider contract.
 
 ## Development
 

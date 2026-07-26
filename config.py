@@ -19,6 +19,14 @@ DEFAULTS: dict[str, Any] = {
     "rerank_model": "",          # '' = mxbai-edge-colbert default (fallback answerai); 'stub' for tests
     "lane1_tokens": 1200,        # 800-1500; hard-truncated by the renderer
     "lane2_tokens": 600,         # 0 disables lane 2
+    # How the AGENT reaches memory. Mirrors the cross-provider convention
+    # (Honcho recallMode, Hindsight memory_mode) so a user migrating from
+    # either finds the knob where they expect it:
+    #   hybrid  = injection lanes + tools (default, today's behavior)
+    #   context = lanes only; get_tool_schemas() returns []
+    #   tools   = tools only; lane 1 static, lane 2 empty
+    # Operator surfaces (CLI, MCP) are deliberately unaffected.
+    "recall_mode": "hybrid",     # hybrid | context | tools
     "dream_schedule": "auto",    # cron | on-idle | manual | auto
     "dream_time": "03:30",
     "dream_min_interval_hours": 6,  # dream --if-due no-ops within this window
@@ -42,6 +50,11 @@ DEFAULTS: dict[str, Any] = {
     "query_cache": True,         # in-process recall cache, invalidated on mem_generation
     "mmr_lambda": 0.7,           # MMR diversity/relevance tradeoff (1.0 = pure relevance)
     "intent_weighting": "shadow",  # off | shadow (log proposed deltas) — never applied in v1
+    # Rewrite the raw user turn into a retrieval query via the host's shared
+    # plugins/memory/query_rewrite.py helper (the same one honcho uses). OFF by
+    # default: it is one auxiliary LLM call per turn against day_budget_usd.
+    # Runs on the brain-bg worker only — never the turn path.
+    "query_rewrite": False,
     # -- Phase B: temporal fact layer + event seam --
     "facts_extract": True,       # sweep extracts s-p-o triples alongside memories
     "facts_leg": True,           # facts retrieval leg feeds memory ids into fusion
@@ -51,6 +64,10 @@ DEFAULTS: dict[str, Any] = {
     "contradict_knowledge_update": True,  # deterministic same-(s,p) fact resolution (no LLM)
     "forget_weibull": True,      # per-kind Weibull decay shapes in the forget value score
     # -- Phase D: dialectic "ask" agent --
+    # The Anthropic-memory-tool-shaped `memories` file interface over virtual
+    # views of brain storage (integration.md §3.1 tool #5). Master switch:
+    # with it off, tools.dispatch refuses the tool and no surface advertises it.
+    "memories_tool": True,
     "ask_tool": True,            # expose brain_ask via CLI + MCP (tool trust)
     "ask_tool_agent": False,     # agent-facing brain_ask schema (LLM-in-turn) — OFF by default
     "ask_max_iterations": 6,     # hard cap on the ask tool-loop iterations (deep level)
@@ -118,8 +135,12 @@ def load_config(hermes_home: str | Path | None) -> dict[str, Any]:
     return cfg
 
 
+def mirror_path(hermes_home: str | Path) -> Path:
+    return Path(hermes_home) / "brain" / "config.json"
+
+
 def save_config(hermes_home: str | Path, values: dict[str, Any]) -> None:
-    """Write flat YAML (only known keys; atomic replace)."""
+    """Write flat YAML (only known keys; atomic replace), then the JSON mirror."""
     path = config_path(hermes_home)
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = ["# hermes-brain configuration (flat key: value)"]
@@ -136,3 +157,30 @@ def save_config(hermes_home: str | Path, values: dict[str, Any]) -> None:
     tmp = path.with_suffix(".yaml.tmp")
     tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
     tmp.replace(path)
+    _write_mirror(hermes_home, merged)
+
+
+def _write_mirror(hermes_home: str | Path, merged: dict[str, Any]) -> None:
+    """Mirror the saved config to ``<hermes_home>/brain/config.json``.
+
+    Purely for the Hermes dashboard: hermes_cli/web_server.py's
+    ``_read_memory_provider_existing_values`` prefills the provider form from
+    ``<hermes_home>/<provider>.json`` or ``<hermes_home>/<provider>/config.json``
+    — the second path is exactly ours. Without the mirror the dashboard renders
+    schema DEFAULTS regardless of what brain.yaml says, and saving that form
+    writes those defaults back through save_config, silently discarding the
+    user's real settings.
+
+    brain.yaml remains the single source of truth. NEVER read this file back:
+    a second read path is how the two copies start disagreeing. It is
+    write-only, and best-effort — a failed mirror must not fail a config save.
+    """
+    try:
+        mirror = mirror_path(hermes_home)
+        tmp = mirror.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n",
+                       encoding="utf-8")
+        tmp.replace(mirror)
+    except (OSError, TypeError, ValueError) as e:
+        logger.warning("brain: config.json mirror not written (%s); the Hermes "
+                       "dashboard may show stale defaults", e)

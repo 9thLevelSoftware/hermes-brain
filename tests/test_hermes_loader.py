@@ -167,11 +167,14 @@ def test_get_tool_schemas_match_host_expected_shape(synthetic_brain, tmp_path):
                         agent_context="primary")
     try:
         schemas = provider.get_tool_schemas()
-        assert len(schemas) == 4
+        # Four core tools + the config-gated `memories` file interface
+        # (memories_tool, on by default). brain_ask is NOT here: its
+        # agent-facing exposure is off by default (ask_tool_agent).
+        assert len(schemas) == 5
 
         # The DRIVER's mistake, reproduced: top-level "name" is absent because
-        # the shape is nested — hence [None, None, None, None].
-        assert [s.get("name") for s in schemas] == [None, None, None, None]
+        # the shape is nested — hence a list of Nones.
+        assert [s.get("name") for s in schemas] == [None] * len(schemas)
         # ...but the name IS present one level down, in the host-expected slot.
         assert all(s["type"] == "function" for s in schemas)
         assert all(isinstance(s["function"]["name"], str) for s in schemas)
@@ -186,7 +189,11 @@ def test_get_tool_schemas_match_host_expected_shape(synthetic_brain, tmp_path):
         names = [r["name"] for r in resolved]
         assert names == [
             "brain_recall", "brain_remember", "brain_outcome", "brain_manage",
+            "memories",
         ]
+        # F6: `memory` is a reserved core tool name — shadowing it would make
+        # add_provider reject the whole provider.
+        assert "memory" not in names
 
         # Those resolved names are exactly what the provider dispatches on:
         # a valid name never returns the 'unknown tool' errors-that-teach

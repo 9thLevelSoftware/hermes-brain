@@ -38,6 +38,11 @@ _OUTCOMES = {"worked": "worked", "failed": "failed", "mixed": "partial"}
 
 _ACTIONS = ("forget", "pin", "unpin", "incognito_on", "incognito_off")
 
+# The `memories` tool's command grammar — the Anthropic memory-tool shape.
+# Duplicated here (rather than imported from memfs) to keep module level
+# stdlib-only: the loader eagerly imports this file on every CLI invocation.
+_MEMORIES_COMMANDS = ("view", "create", "str_replace", "insert", "delete", "rename")
+
 _LIMIT_DEFAULT = 8
 _LIMIT_MAX = 25
 _DEEP_FULL_TEXT_TOP = 3
@@ -238,6 +243,84 @@ def get_schemas() -> list[dict]:
     ]
 
 
+def memories_schema() -> dict:
+    """The `memories` tool schema (integration.md §3.1 tool #5).
+
+    Kept out of get_schemas() because exposure is config-gated (memories_tool):
+    it is a second way to reach the same store, and an operator who does not
+    want two write surfaces should be able to say so.
+
+    Param count deliberately exceeds the <=6 budget the other tools hold to:
+    these are the Anthropic memory tool's OWN parameter names, and matching
+    them is the entire point — Claude models are trained on this grammar. Each
+    individual COMMAND still uses at most three of them.
+    """
+    return {
+        "type": "function",
+        "function": {
+            "name": "memories",
+            "description": (
+                "Read and edit long-term memory as markdown files under "
+                "/memories. Files are virtual views over stored memories: "
+                "/memories/profile.md (standing facts and preferences), "
+                "/memories/index.md (read-only summary), and "
+                "/memories/topics/<tag>.md (memories carrying that tag). "
+                "Start with view on /memories to list what exists. Deletes are "
+                "reversible tombstones, and edits supersede rather than erase."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "enum": list(_MEMORIES_COMMANDS),
+                        "description": "the file operation to perform",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "the file or directory, under /memories "
+                                       "— e.g. /memories/topics/deploy.md",
+                    },
+                    "file_text": {
+                        "type": "string",
+                        "description": "create: the file body; one memory per "
+                                       "line (leading '- ' optional)",
+                    },
+                    "old_str": {
+                        "type": "string",
+                        "description": "str_replace: exact text to find; must "
+                                       "match exactly one memory in the file",
+                    },
+                    "new_str": {
+                        "type": "string",
+                        "description": "str_replace: replacement text",
+                    },
+                    "insert_line": {
+                        "type": "integer",
+                        "description": "insert: line number (advisory — these "
+                                       "files are ordered by pinning/recency)",
+                    },
+                    "insert_text": {
+                        "type": "string",
+                        "description": "insert: the memory text to add",
+                    },
+                    "new_path": {
+                        "type": "string",
+                        "description": "rename: the destination topic file",
+                    },
+                },
+                "required": ["command", "path"],
+            },
+        },
+    }
+
+
+def _memories(conn: sqlite3.Connection, args: dict, ctx: ToolContext) -> dict:
+    from .memfs import handle
+
+    return handle(conn, args, ctx)
+
+
 def ask_schema() -> dict:
     """The brain_ask tool schema. Kept separate from get_schemas() because the
     AGENT-FACING exposure is opt-in (config ask_tool_agent, off by default): an
@@ -376,6 +459,11 @@ def dispatch(conn: sqlite3.Connection, tool_name: str, args: dict | None,
     if ctx.config.get("ask_tool", True):
         handlers["brain_ask"] = _ask
     handlers["brain_context"] = _context
+    # Same gate-at-dispatch discipline as brain_ask: with memories_tool off the
+    # tool is not registered, so a call falls through to the unknown-tool error
+    # rather than reaching a surface the operator disabled.
+    if ctx.config.get("memories_tool", True):
+        handlers["memories"] = _memories
     try:
         handler = handlers.get(tool_name)
         if handler is None:

@@ -107,6 +107,49 @@ def call_text(
     return _aux_call(conn, prompt, system, tier, model, max_tokens)
 
 
+def call_query_rewrite(conn: sqlite3.Connection, config: dict[str, Any],
+                       user_message: str) -> str:
+    """Rewrite a raw user turn into a retrieval query via the HOST's shared
+    helper ``plugins/memory/query_rewrite.py``.
+
+    That helper is explicitly provider-agnostic ("any memory provider can pass
+    ``rewrite_memory_query`` as its query rewriter") and runs on the host's own
+    ``auxiliary.memory_query_rewrite`` task slot, so the model and timeout are
+    the operator's to configure — not brain.yaml's.
+
+    It calls ``agent.auxiliary_client`` directly, which would otherwise route
+    brain-initiated spend around this module and out of the daily budget
+    (invariant: llm.py is the SOLE gateway). So we wrap rather than bypass:
+    budget-gate before, meter after. The helper returns no usage object, so the
+    row lands with the char/4 proxy — enough for the gate to trip on a wedged
+    rewriter.
+
+    Returns the rewritten query, or ``""`` meaning "keep the original" (the
+    helper's own contract). Raises ``LLMUnavailable`` like every other call
+    here; the caller falls back to the raw text.
+    """
+    _budget_gate(conn, config)
+    if _test_llm is not None:
+        text = _test_llm(user_message, system=None, max_tokens=96)
+        _meter(conn, "rewrite", "host-query-rewrite", user_message, None, text)
+        return (text or "").strip()
+    try:
+        # Host-only module: absent standalone (tests, MCP, CI).
+        from plugins.memory.query_rewrite import rewrite_memory_query
+    except ImportError:
+        raise LLMUnavailable(
+            "query rewrite needs the host helper plugins/memory/query_rewrite.py; "
+            "unavailable outside a Hermes process"
+        )
+    try:
+        text = rewrite_memory_query(user_message) or ""
+    except Exception as e:
+        _meter(conn, "rewrite", "host-query-rewrite", user_message, None, "")
+        raise LLMUnavailable(f"query rewrite failed ({e}); using the raw query") from e
+    _meter(conn, "rewrite", "host-query-rewrite", user_message, None, text)
+    return text.strip()
+
+
 def _aux_call(conn: sqlite3.Connection, prompt: str, system: str | None,
               tier: str, model: str, max_tokens: int) -> str:
     try:

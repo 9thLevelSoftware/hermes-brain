@@ -52,6 +52,12 @@ def _mcp_tools(config: dict | None = None) -> list[dict]:
     if (config or {}).get("ask_tool", True):
         schemas.append(tools.ask_schema())
     schemas.append(tools.context_schema())
+    # The `memories` file interface is exposed here too: an external agent at
+    # 'tool' trust reads the owner's global memories (the cross-platform money
+    # shot) and its writes go through the same capped/quarantined path as
+    # brain_remember. Same gate as every other surface.
+    if (config or {}).get("memories_tool", True):
+        schemas.append(tools.memories_schema())
     out = []
     for schema in schemas:
         fn = schema["function"]

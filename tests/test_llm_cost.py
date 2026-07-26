@@ -315,3 +315,34 @@ def test_set_llm_for_tests_path_still_uses_proxy(conn):
     assert row["tokens_in"] == db.approx_tokens("s" * 40 + "p" * 40)
     assert row["tokens_out"] == db.approx_tokens("reply text")
     assert row["est_usd"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# call_query_rewrite — the host's shared rewriter, wrapped so its spend is
+# gated and metered like every other brain-initiated call (invariant #5).
+# ---------------------------------------------------------------------------
+
+def test_query_rewrite_is_metered_through_the_gateway(conn):
+    llm.set_llm_for_tests(lambda p, *, system=None, max_tokens=0: "  what did we decide  ")
+    assert llm.call_query_rewrite(conn, _cfg(), "so uh what was that call again") \
+        == "what did we decide"
+    row = _only_ledger(conn)
+    assert row["strategy"] == "rewrite"
+    assert row["tokens_in"] > 0
+
+
+def test_query_rewrite_respects_the_daily_budget(conn):
+    conn.execute(
+        "INSERT INTO llm_ledger (strategy, model, tokens_in, tokens_out, est_usd, ts)"
+        " VALUES ('extract','m',0,0,99.0,?)", (db.iso_now(),))
+    conn.commit()
+    llm.set_llm_for_tests(lambda p, *, system=None, max_tokens=0: "rewritten")
+    with pytest.raises(llm.LLMUnavailable, match="budget"):
+        llm.call_query_rewrite(conn, _cfg(day_budget_usd=1.0), "anything")
+
+
+def test_query_rewrite_without_the_host_helper_is_unavailable(conn):
+    """Standalone (no plugins.memory on the path) must degrade, not raise
+    something the caller doesn't expect."""
+    with pytest.raises(llm.LLMUnavailable, match="host helper"):
+        llm.call_query_rewrite(conn, _cfg(), "anything")
