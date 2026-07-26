@@ -420,15 +420,32 @@ def test_every_declared_config_key_is_read_somewhere():
 
 
 def test_plugin_manifests_use_the_key_the_host_actually_reads():
-    """hermes_cli/plugins.py reads `provides_hooks`; a `hooks:` key is
-    silently discarded."""
+    """`provides_hooks` is the key hermes_cli/plugins.py parses; a bare `hooks:`
+    is silently discarded there.
+
+    The two manifests differ, so the rule differs:
+
+    * ``observer/plugin.yaml`` is a GENERAL plugin loaded by PluginManager,
+      where ``provides_hooks`` is genuinely read — a ``hooks:`` key there is a
+      trap (it looks declarative and does nothing), so it stays banned.
+    * the root manifest is a MEMORY provider. Memory discovery reads only
+      ``description``/``pip_dependencies``, so NEITHER key gates anything; but
+      ``hooks:`` is the format every bundled provider uses and the one the
+      plugin developer guide documents, so the root manifest carries both.
+    """
     from pathlib import Path
 
     root = Path(__file__).resolve().parent.parent
-    for manifest in (root / "plugin.yaml", root / "observer" / "plugin.yaml"):
-        text = manifest.read_text(encoding="utf-8")
-        assert "provides_hooks:" in text, manifest
-        assert not any(line.rstrip() == "hooks:" for line in text.splitlines()), manifest
+
+    observer = root / "observer" / "plugin.yaml"
+    text = observer.read_text(encoding="utf-8")
+    assert "provides_hooks:" in text, observer
+    assert not any(line.rstrip() == "hooks:" for line in text.splitlines()), observer
+
+    text = (root / "plugin.yaml").read_text(encoding="utf-8")
+    assert "provides_hooks:" in text
+    assert any(line.rstrip() == "hooks:" for line in text.splitlines()), \
+        "root plugin.yaml should also carry the documented bundled-provider `hooks:` key"
 
 
 def test_plugin_manifest_lists_every_implemented_hook():

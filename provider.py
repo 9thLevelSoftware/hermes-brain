@@ -73,6 +73,34 @@ _RETRY_MAX_S = 60.0
 _Identity = tuple[str | None, str, str | None]
 _DEFAULT_IDENTITY: _Identity = (None, "known_user", None)
 
+# How the agent reaches memory (config `recall_mode`; see config.DEFAULTS).
+_RECALL_MODES = ("hybrid", "context", "tools")
+
+
+def _host_hermes_home() -> Path | None:
+    """The active profile, for callers the host never `initialize()`d.
+
+    Only ever a FALLBACK: when the host injected hermes_home we use that, so
+    this can never override an explicitly-passed profile (which would land one
+    profile's status on another's screen).
+    """
+    try:
+        from hermes_constants import get_hermes_home  # type: ignore
+
+        return Path(str(get_hermes_home()))
+    except Exception:
+        return None
+
+
+def _resolve_recall_mode(config: dict[str, Any]) -> str:
+    """Validate `recall_mode`, falling back to 'hybrid' on anything unknown —
+    a typo in brain.yaml must not silently switch memory off."""
+    mode = str(config.get("recall_mode", "hybrid") or "hybrid").strip().lower()
+    if mode not in _RECALL_MODES:
+        logger.warning("brain: unknown recall_mode %r — using 'hybrid'", mode)
+        return "hybrid"
+    return mode
+
 
 class BrainProvider(MemoryProvider):
     """Global memory brain for Hermes Agent — P1: passive capture + FTS recall."""
@@ -87,6 +115,7 @@ class BrainProvider(MemoryProvider):
         self._platform = "cli"
         self._active = True          # False for subagent/cron/flush contexts
         self._incognito = False
+        self._recall_mode = "hybrid"
         self._session_identity: dict[str, _Identity] = {}
         self._session_alias: dict[str, str] = {}   # old sid -> new sid (continuations)
         self._lane1 = ""
@@ -103,6 +132,7 @@ class BrainProvider(MemoryProvider):
         self._shutting_down = threading.Event()
         self._last_sweep = 0.0   # worker-thread-only cooldown clock
         self._last_drain = 0.0   # work_queue drain cooldown (observer signals, B3)
+        self._last_idle_dream = 0.0  # opt-in on-idle dream cooldown
         self._lock = threading.Lock()
 
     # -- identity ------------------------------------------------------------
@@ -152,6 +182,10 @@ class BrainProvider(MemoryProvider):
         self._config = {**load_config(self._hermes_home),
                         "hermes_home": str(self._hermes_home)}
         self._incognito = bool(self._config.get("incognito"))
+        # Read ONCE per session: lane 1 must stay byte-stable for the whole
+        # session (invariant #1), so the mode that decides what lane 1 renders
+        # can never be re-read mid-session.
+        self._recall_mode = _resolve_recall_mode(self._config)
 
         # Platform-only trust FIRST — must not depend on a DB connect
         # succeeding (review finding #6).
@@ -175,7 +209,10 @@ class BrainProvider(MemoryProvider):
                 # critique item 17) — OWNER SESSIONS ONLY: the snapshot
                 # carries the owner's profile facts, and non-owner gateway
                 # sessions must never receive them (finding #15).
-                if identity[1] == "owner":
+                # recall_mode 'tools' means the agent reaches memory ONLY
+                # through tool calls, so lane 1 stays the static instructions
+                # block and no snapshot content is rendered into the prompt.
+                if identity[1] == "owner" and self._recall_mode != "tools":
                     from .recall import lane1 as lane1_mod
 
                     lane1_block = lane1_mod.render(
@@ -269,6 +306,8 @@ class BrainProvider(MemoryProvider):
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if not self._initialized or not query:
             return
+        if self._recall_mode == "tools":
+            return  # tools-only: no lane-2 retrieval, so nothing to warm
         self._queue.put(("retrieve", session_id or self._session_id, query))
 
     # -- capture hooks ---------------------------------------------------------
@@ -334,11 +373,20 @@ class BrainProvider(MemoryProvider):
             if self._hermes_home:
                 self._config["hermes_home"] = str(self._hermes_home)
             self._incognito = bool(self._config.get("incognito"))
+            # A reset is the one point where recall_mode may legally change:
+            # it is a new session, so the new lane 1 is a new prefix anyway.
+            self._recall_mode = _resolve_recall_mode(self._config)
             with self._lock:
-                if self._lane1_staged and self._session_identity.get(
+                if self._recall_mode == "tools":
+                    # Tools-only: drop any staged snapshot and fall back to the
+                    # static block, matching what initialize() would render.
+                    self._lane1 = lane1_static()
+                elif self._lane1_staged and self._session_identity.get(
                         new_session_id, _DEFAULT_IDENTITY)[1] == "owner":
                     self._lane1 = self._lane1_staged
                 self._lane1_staged = ""
+            if self._recall_mode == "tools":
+                self._lane2_cache.pop(new_session_id, None)
         elif old and old != new_session_id:
             # Logical continuation (/resume, /branch, compression): MOVE all
             # per-session state — copying leaked one entry per rotation in
@@ -413,9 +461,17 @@ class BrainProvider(MemoryProvider):
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         if not self._initialized:
             return []
+        if self._recall_mode == "context":
+            return []  # injection-only: the agent gets memory via the lanes
         from . import tools
 
         schemas = tools.get_schemas()
+        # The Anthropic-shaped file interface over the same store. On by
+        # default (it costs one schema and inherits trained behavior); the
+        # gate is re-checked in tools.dispatch, so turning it off closes the
+        # surface rather than merely hiding it.
+        if self._config.get("memories_tool", True):
+            schemas = [*schemas, tools.memories_schema()]
         # brain_ask is an LLM-inside-a-turn: expose it to the agent only when
         # explicitly enabled (ask_tool_agent, off by default). ask_tool is the
         # master kill switch across every surface — with it off tools.dispatch
@@ -470,6 +526,78 @@ class BrainProvider(MemoryProvider):
         from .brain_setup import post_setup
 
         post_setup(hermes_home, config)
+
+    def get_status_config(self, provider_config: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Config/health summary for `hermes memory status` (duck-typed host
+        hook — hermes_cli/memory_setup.py:439; cf. openviking/supermemory).
+
+        The host passes ``memory.brain`` from config.yaml, which is always
+        empty for us: brain.yaml is the store. Without this method the status
+        screen shows the brain as a provider with NO configuration at all, so
+        we ignore the argument and report the effective, resolved settings.
+
+        Reads on a SHORT-LIVED connection (never the brain-bg worker's) — the
+        CLI may call this in a process where no worker exists. Never raises:
+        the host prints whatever dict comes back, so failures are reported as
+        a value, not an exception.
+
+        The instance is normally NOT initialized here: `hermes memory status`
+        builds a fresh provider through `load_memory_provider()` purely to
+        interrogate it, and never calls `initialize()`. So the profile is
+        resolved from the host (the same `get_hermes_home()` the host would
+        have injected) rather than assumed — otherwise every field that needs
+        the database is missing on the one surface this method exists for.
+        """
+        from .store import sysinfo
+
+        home = self._hermes_home or _host_hermes_home()
+        # Config first, so a broken DB still yields the useful half.
+        try:
+            cfg = load_config(home) if home else dict(self._config)
+        except Exception as e:
+            return {"error": f"config unreadable: {e}"}
+
+        resolved = sysinfo.resolve_mode(str(cfg.get("mode", "auto")))
+        out: dict[str, Any] = {
+            "tier": f"{cfg.get('mode')} -> {resolved}",
+            "recall_mode": cfg.get("recall_mode"),
+            "lane1_tokens": cfg.get("lane1_tokens"),
+            "lane2_tokens": cfg.get("lane2_tokens"),
+            "dream_schedule": cfg.get("dream_schedule"),
+            "dream_time": cfg.get("dream_time"),
+            "incognito": cfg.get("incognito"),
+            "sync_enabled": cfg.get("sync_enabled"),
+        }
+        if home is None:
+            out["db"] = "(no profile — run 'hermes memory setup')"
+            return out
+        try:
+            out["db"] = str(store_db.db_path(home))
+            conn = store_db.connect(home)
+        except Exception as e:
+            out["db_error"] = str(e)
+            return out
+        try:
+            out["memories"] = conn.execute(
+                "SELECT count(*) AS n FROM memories "
+                "WHERE valid_to IS NULL AND status='active' AND live=1"
+            ).fetchone()["n"]
+            out["episodes"] = conn.execute(
+                "SELECT count(*) AS n FROM episodes").fetchone()["n"]
+            row = conn.execute(
+                "SELECT finished_at, outcome FROM shift_runs "
+                "WHERE finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 1"
+            ).fetchone()
+            out["last_dream"] = (f"{row['finished_at']} ({row['outcome']})" if row
+                                 else "never — run 'hermes brain dream-now'")
+        except Exception as e:
+            out["db_error"] = str(e)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return out
 
     def backup_paths(self) -> list[str]:
         """No extra paths to back up.
@@ -592,6 +720,7 @@ class BrainProvider(MemoryProvider):
                 # worker doesn't sweep every 90s (findings #6/#16).
                 self._maybe_sweep(conn)
                 self._maybe_drain_work_queue(conn)
+                self._maybe_idle_dream(conn)
                 continue
             if job is _SENTINEL:
                 break
@@ -727,6 +856,59 @@ class BrainProvider(MemoryProvider):
         except Exception:
             logger.warning("brain: sweep failed", exc_info=True)
 
+    _IDLE_DREAM_COOLDOWN_S = 900.0
+
+    def _maybe_idle_dream(self, conn) -> None:
+        """Run a due dream shift in-process, but ONLY when the operator opted
+        in with ``dream_schedule: on-idle`` (docs/design/integration.md §1.3).
+
+        Why this exists: cron is gateway-resident (F12), so a CLI-only user
+        has no scheduler at all — and the brain deliberately never spawns a
+        background process (a security decision, do not reintroduce it). Without
+        this path the entire learning system only ever ran when a human typed
+        `hermes brain dream-now`.
+
+        This is NOT a background process: it is the brain-bg worker that already
+        exists, doing work on its own idle tick. Guards, in order — every one of
+        them is load-bearing:
+
+        * opt-in only; ``auto``/``cron``/``manual`` never reach here
+        * capture rules apply (primary context, not incognito)
+        * the queue must be EMPTY — a turn is waiting, and a dream is never
+          urgent. Re-checked because a dream is seconds-to-minutes of work
+        * shutdown in progress => skip; the host allows 5s to drain
+        * ``dream.lease.is_due`` — the same due-check as `dream --if-due`,
+          which also makes a cron run and this path mutually exclusive: whoever
+          takes the lease wins and the other no-ops
+        * a local cooldown so a failing/instant dream can't spin the tick
+
+        ``run_dream`` never raises and always frees the lease; the outer
+        try/except is belt-and-braces for the imports and the due-check.
+        """
+        if str(self._config.get("dream_schedule", "auto")) != "on-idle":
+            return
+        if not self._capture_allowed() or self._shutting_down.is_set():
+            return
+        if self._queue.qsize() > 0:
+            return
+        now = time.monotonic()
+        if self._last_idle_dream and now - self._last_idle_dream < self._IDLE_DREAM_COOLDOWN_S:
+            return
+        self._last_idle_dream = now
+        try:
+            from .dream import run_dream
+            from .dream.lease import is_due
+
+            if not is_due(conn, self._config):
+                return
+            logger.info("brain: idle dream starting (dream_schedule=on-idle)")
+            summary = run_dream(conn, self._config, embedder=self._embedder,
+                                actor="idle")
+            logger.info("brain: idle dream %s: %s", summary.get("shift_id", "-"),
+                        list(summary.get("strategies", {})))
+        except Exception:
+            logger.warning("brain: idle dream failed", exc_info=True)
+
     _DRAIN_COOLDOWN_S = 20.0
     _DRAIN_BATCH = 256
 
@@ -783,6 +965,24 @@ class BrainProvider(MemoryProvider):
             return
 
         principal_id, trust_tier, source_author = self._identity_for(session_id)
+
+        # Optional host-shared query rewrite (config `query_rewrite`, off by
+        # default). We are on the brain-bg worker, well off the turn path, so
+        # an LLM call here costs latency nobody waits on — but it costs money
+        # every turn, hence opt-in. Any failure (no host helper, budget spent,
+        # bad reply) falls back to the raw text: retrieval must never depend
+        # on it.
+        if self._config.get("query_rewrite", False):
+            try:
+                from . import llm as llm_mod
+
+                rewritten = llm_mod.call_query_rewrite(conn, self._config, query_text)
+                if rewritten:
+                    logger.debug("brain: query rewritten for retrieval")
+                    query_text = rewritten
+            except Exception:
+                logger.debug("brain: query rewrite unavailable; using raw query",
+                             exc_info=True)
 
         # Lane 2 has two subsections within one budget: learned guidance
         # (strategy/guardrail items + cases, retrieved by similarity × proven

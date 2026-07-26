@@ -31,6 +31,44 @@ RUN echo "=== bootstrap ===" && hermes brain bootstrap 2>&1 | tail -15 || echo "
 RUN echo "=== status ===" && hermes brain status 2>&1 | tail -25 || echo "[status exit nonzero]"
 RUN echo "=== dream-now (LLM strategies degrade) ===" && hermes brain dream-now 2>&1 | tail -25 || echo "[dream exit nonzero]"
 
+# 1b. Host-surface conformance (docs/design/alignment-audit.md B1/B2, C3).
+#     `hermes memory status` interrogates the provider through get_status_config
+#     on an instance it never initializes — a real end-to-end check that the
+#     brain reports itself rather than showing up as a configuration-less black
+#     box. grep -q makes a regression a build failure, not a log line.
+RUN echo "=== memory status ===" && hermes memory status 2>&1 | tee /tmp/mstatus.txt | tail -30
+RUN grep -q "recall_mode" /tmp/mstatus.txt \
+ && grep -q "last_dream" /tmp/mstatus.txt \
+ && grep -q "brain/brain.db" /tmp/mstatus.txt \
+ && echo "[ok] get_status_config reaches hermes memory status"
+# The dashboard prefills its provider form from <home>/brain/config.json; without
+# the mirror it renders schema defaults and saving discards the real config.
+RUN python - <<'PY'
+import importlib.util, json, pathlib, sys
+
+p = pathlib.Path("/hermes-home/brain/config.json")
+root = pathlib.Path("/hermes-home/plugins/brain")
+spec = importlib.util.spec_from_file_location(
+    "brain", root / "__init__.py", submodule_search_locations=[str(root)])
+mod = importlib.util.module_from_spec(spec); sys.modules["brain"] = mod
+spec.loader.exec_module(mod)
+from brain import config as c
+c.save_config("/hermes-home", {"recall_mode": "context"})
+assert p.exists(), "dashboard config.json mirror was not written"
+assert json.loads(p.read_text())["recall_mode"] == "context"
+assert c.load_config("/hermes-home")["recall_mode"] == "context"
+c.save_config("/hermes-home", {"recall_mode": "hybrid"})
+print("[ok] dashboard config.json mirror round-trips")
+PY
+
+# 1c. The `memories` tool (alignment-audit C4) must be advertised on the MCP
+#     surface and must refuse a path outside /memories.
+RUN printf '%s\n%s\n' \
+      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+      '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+    | hermes brain mcp 2>/dev/null | grep -q '"memories"' \
+ && echo "[ok] memories tool advertised over MCP"
+
 # 2. Drive the MemoryProvider hook lifecycle through Hermes's OWN memory loader.
 COPY hermes_provider_smoke.py /hermes_provider_smoke.py
 RUN python /hermes_provider_smoke.py

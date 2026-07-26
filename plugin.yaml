@@ -10,11 +10,28 @@ author: "NousResearch (Hermes-Brain)"
 # lazy-installed, never required for the FTS floor tier.
 pip_dependencies: []
 requires_env: []
-# `provides_hooks` is the key hermes_cli/plugins.py actually parses (a `hooks:`
-# key is silently discarded). It is metadata only — MemoryProvider hooks are
-# invoked as plain methods on the instance by agent/memory_manager.py, never
-# through the hook registry — so this list documents the surface rather than
-# gating it. Keep it complete: it is what a reader trusts.
+# Two hook lists on purpose, both metadata-only:
+#   `hooks:`          — the format every BUNDLED memory provider uses
+#                       (plugins/memory/{honcho,hindsight,holographic}/plugin.yaml)
+#                       and the one the plugin developer guide documents.
+#   `provides_hooks:` — the key hermes_cli/plugins.py parses for general plugins.
+# Neither gates anything on the memory path: discovery reads only `description`
+# and `pip_dependencies` (plugins/memory/__init__.py, hermes_cli/memory_setup.py),
+# and MemoryProvider hooks are invoked as plain methods on the instance by
+# agent/memory_manager.py, never through the hook registry. Keep both complete:
+# they are what a reader trusts.
+hooks:
+  - system_prompt_block
+  - prefetch
+  - queue_prefetch
+  - sync_turn
+  - on_turn_start
+  - on_session_end
+  - on_session_switch
+  - on_pre_compress
+  - on_memory_write
+  - on_delegation
+  - shutdown
 provides_hooks:
   - system_prompt_block
   - prefetch

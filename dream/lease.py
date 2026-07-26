@@ -11,6 +11,7 @@ brain and portable to native Windows.
 
 from __future__ import annotations
 
+import calendar
 import logging
 import sqlite3
 import time
@@ -83,3 +84,50 @@ def held_by(conn: sqlite3.Connection, name: str) -> str | None:
     if (row["expires_at"] or "") < db.iso_now():
         return None
     return row["holder"]
+
+
+# ---------------------------------------------------------------------------
+# "is a dream due?" — shared by every trigger
+# ---------------------------------------------------------------------------
+
+DEFAULT_MIN_INTERVAL_HOURS = 6
+
+
+def last_dream_finished(conn: sqlite3.Connection) -> str | None:
+    row = conn.execute(
+        "SELECT finished_at FROM shift_runs WHERE finished_at IS NOT NULL "
+        "ORDER BY finished_at DESC LIMIT 1").fetchone()
+    return row["finished_at"] if row else None
+
+
+def _iso_add_hours(iso: str, hours: float) -> str:
+    """ISO string + hours, staying in the lexically comparable text domain.
+
+    Uses ``calendar.timegm``, not ``time.mktime``: every timestamp the brain
+    writes is UTC (``db.iso_now``), and mktime would reinterpret it as LOCAL
+    time — skewing the due-check by the machine's UTC offset, so a 6h interval
+    fired hours early or late depending on the timezone.
+    """
+    try:
+        base = time.strptime(iso[:19], "%Y-%m-%dT%H:%M:%S")
+    except (ValueError, TypeError):
+        return iso
+    return time.strftime("%Y-%m-%dT%H:%M:%S",
+                         time.gmtime(calendar.timegm(base) + hours * 3600))
+
+
+def is_due(conn: sqlite3.Connection, config: dict) -> bool:
+    """True when a dream shift may start now.
+
+    ONE implementation for every trigger — `hermes brain dream --if-due` (cron)
+    and the provider's opt-in on-idle path — so the two can never disagree
+    about what "due" means. A held lease reads as not-due, which is also what
+    makes triple-triggering harmless: the loser simply no-ops.
+    """
+    if held_by(conn, "dream"):
+        return False
+    last = last_dream_finished(conn)
+    if not last:
+        return True
+    hours = float(config.get("dream_min_interval_hours", DEFAULT_MIN_INTERVAL_HOURS))
+    return _iso_add_hours(last, hours) < db.iso_now()

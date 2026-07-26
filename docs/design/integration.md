@@ -76,6 +76,23 @@ These are load-bearing; the implementer should re-confirm each at build time (§
 3. **Manual:** `hermes brain dream-now` (runs foreground with progress output).
 4. `--if-due` re-checks the watermark *inside* the lock so triple-triggering is harmless.
 
+> **AMENDED 2026-07-25 (alignment-audit.md C1).** Item 2 above was **reversed**:
+> the brain never spawns a background process, a deliberate security decision.
+> Nothing replaced it, so until this audit `dream_schedule`/`dream_time` were
+> collected by the wizard and read by nothing — the learning system ran only
+> when a human typed `hermes brain dream-now`.
+>
+> As shipped:
+> * **Item 1 is implemented** — `brain_setup._offer_cron_job` creates the
+>   `no_agent=True` job. The script is `brain-dream.py`, not `.sh`:
+>   `cron/scheduler.py` picks the interpreter by extension (bash for `.sh`),
+>   and a Python script needs no bash on a Windows host.
+> * **Item 2 is replaced by `dream_schedule: on-idle`** — opt-in, and it runs a
+>   due shift on the brain-bg worker that *already exists*, on its idle tick
+>   (`provider._maybe_idle_dream`). No process is spawned.
+> * Item 4 holds, via `dream/lease.py:is_due` — one due-check shared by both
+>   triggers, where a held lease reads as not-due.
+
 ### 1.4 SQLite multi-process discipline
 
 - **One DB:** `get_hermes_home()/brain/brain.db`, `PRAGMA journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`, `wal_autocheckpoint` default; dream process runs `PRAGMA wal_checkpoint(TRUNCATE)` at end.
@@ -260,10 +277,11 @@ dream_model       default ""                                              (auxil
 bootstrap_import  choices [yes, no]                      default yes      (MEMORY.md/USER.md + state.db backfill on first run)
 memories_tool     default true                                            (the Anthropic-shaped file tool)
 ```
-NOTE (audit 2026-07-24): `memories_tool` is NOT currently in `config.py:DEFAULTS`.
-The phase-3 `memories` tool was deferred (critique item 8) and the placeholder key
-was removed because `load_config` drops undeclared keys, so it read as a live gate
-that did nothing. Re-add it to `DEFAULTS` when the tool is actually built.
+NOTE (2026-07-25): the `memories` tool shipped (alignment-audit.md C4), so
+`memories_tool` is a live key in `config.py:DEFAULTS` again. The wizard also
+now collects `recall_mode` (`hybrid|context|tools`, the cross-provider
+convention) and `query_rewrite` (off by default).
+
 No secrets → nothing to `.env`; `save_config()` writes `~/.hermes/brain/brain.yaml`. `post_setup(hermes_home, config)` (F9) then: creates dirs, downloads/validates the embedding model with a progress bar and an explicit skip option (skip → fts-only until `hermes brain doctor --fix`), runs bootstrap if accepted, offers the cron job (§1.3), sets `memory.provider: "brain"`, and prints the built-ins matrix (§4.6).
 
 Model files live in a **shared, non-backed-up cache**: `~/.cache/hermes-brain/models/` (Windows `%LOCALAPPDATA%\hermes-brain\models`), shared across profiles, re-downloadable — deliberately outside HERMES_HOME so `hermes backup` archives memories, not 300MB of ONNX (F15). `backup_paths()` returns `[]`; all state is under HERMES_HOME already.
@@ -274,7 +292,7 @@ Model files live in a **shared, non-backed-up cache**: `~/.cache/hermes-brain/mo
 - `search <query> [--kind --project --deep]` — same retrieval as `brain_recall`, human-rendered.
 - `why <id>` — full provenance chain: source turn/session/platform, dedup merges, dream runs that touched it, outcome links. (The auditability answer to "why does it believe this?")
 - `remember / forget <id> [--hard] / pin <id>` — human-side writes; `forget --hard` purges immediately; plain `forget` tombstones (§3.1).
-- `export [--format jsonl|md] [--out dir]` / `import <file>` — plain-file exports: JSONL (lossless, re-importable) + a human-readable markdown snapshot tree (`profile.md`, `warnings.md`, `topics/*.md`) into `~/.hermes/brain/exports/<date>/`.
+- `export [--out dir]` / `import <file> [--trust-owner]` — plain-file exports: JSONL (lossless, re-importable) + a human-readable markdown snapshot tree (`profile.md`, `warnings.md`, `topics/*.md`) into `~/.hermes/brain/exports/<date>/`. (Shipped without the sketched `--format`: the two formats are complementary, so `export` always writes both.)
 - `doctor [--fix]` — integrity check (PRAGMA quick_check), FTS/vec index consistency, model presence/hash, stale locks, config drift vs §4.6 matrix, orphaned watermarks.
 - `dream-now [--phase consolidate|distill|forget|skills] [--dry-run]` and internal `dream --if-due --quiet`.
 - `bootstrap [--daemon <path>]` — re-runnable first-run import; `--daemon` triggers Daem0n import (below).

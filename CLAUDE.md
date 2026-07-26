@@ -71,7 +71,7 @@ Hybrid retrieval, degrading stage-by-stage: FTS/BM25 and vector-KNN (int8, 256-d
 
 ## The learning system (dream cycle)
 
-`dream/` runs sleep-time work in a `hermes brain dream` process — **cron + manual only; the brain never auto-spawns background processes** (a deliberate security decision — do not add process-spawning to `provider.py`). Mutual exclusion is the `brain_lease` DB row (no lockfiles; Windows-safe).
+`dream/` runs sleep-time work in a `hermes brain dream` process. **The brain never auto-spawns background processes** (a deliberate security decision — do not add process-spawning to `provider.py`). Three triggers, all explicit: a `no_agent=True` cron script job offered by `brain_setup._offer_cron_job` at setup; the opt-in `dream_schedule: on-idle` path, which runs a due shift on the brain-bg worker that *already exists* during its idle tick (`provider._maybe_idle_dream` — no new process); and manual `dream-now`. `dream/lease.py:is_due` is the ONE due-check shared by every trigger, so a held lease makes them mutually exclusive rather than racing. Mutual exclusion is the `brain_lease` DB row (no lockfiles; Windows-safe).
 
 - `shift.py` — the per-run `Shift` context: `PIPELINE` (ordered strategy names), `DEFAULT_MODES`, plus preemption (`tick`/`keepalive`), budget, and mode gating.
 - `run.py` — the phase machine: acquire lease → run pipeline → idempotent cursor → release. `_strategy_fn` dispatches (and mode-gates) each strategy.
@@ -88,6 +88,7 @@ Hybrid retrieval, degrading stage-by-stage: FTS/BM25 and vector-KNN (int8, 256-d
 - Instruction-shaped / untrusted content is **quarantined** — never rendered into lane 1 or lane 2; retrievable only via explicit `brain_recall` with a flag.
 - Strategy items are planning-eligible, so `distill`/`peers` only run on **owner-trusted** episodes.
 - The **MCP server** (`mcp_server.py`, stdio JSON-RPC, no SDK) exposes the brain at `tool` trust: reads see the owner's global/scoped memories (the cross-platform "money shot"); writes are capped, quarantined when instruction-shaped, never lane-1 eligible. stdio-only is an invariant; it never runs consolidation.
+- The **`memories` tool** (`memfs/`, config `memories_tool`) is an Anthropic-memory-tool-shaped file interface over **virtual** `/memories/*.md` views of the same store (`profile.md`, read-only `index.md`, `topics/<tag>.md`). It is a *second* read/write path, so it re-applies scope on every read, keeps `peer_card` and the dream-owned internal kinds unreachable, rejects any path outside `/memories` (traversal is refused, never normalized away), and funnels **every** write through `tools._remember` so the trust cap, quarantine, dedup and event seam are identical to `brain_remember`. `delete` is a soft tombstone. Implementation lives in a subpackage because root `*.py` are eagerly imported (invariant #1); only the schema is in `tools.py`.
 - The **observer plugin** (`observer/`) registers `post_tool_call`/`subagent_stop` host hooks that enqueue lightweight signals into the `work_queue` table (drained by the brain-bg worker); it never blocks a turn, never opens the long-lived connection, and honors a live `BRAIN_OBSERVER_DISABLE` kill switch. Its `pre_llm_call` context-injection lane ships OFF.
 
 ## Skill-forge (`skillforge/`)
@@ -107,7 +108,20 @@ hermes brain review [--approve/--reject <uid>]       # proposals + quarantine qu
 hermes brain skills list|forge|approve|reject        # forged-skill lifecycle
 hermes brain mcp                                      # stdio MCP server for external agents
 hermes brain adopt-memory [--apply]                  # hand memory ownership to the brain
+hermes brain context | ask <q> | fact <s> | eval     # context block, cited answers, s-p-o facts
+hermes brain export | import | sync init|push|pull|status
 ```
+
+## Host-surface conformance
+
+Beyond the `MemoryProvider` ABC, the host duck-types a few optional provider methods — implement them or the brain shows up as a black box on surfaces that are not the CLI:
+
+- **`get_status_config(provider_config)`** (`hermes_cli/memory_setup.py`) backs `hermes memory status`. The host passes `memory.brain` from config.yaml, which is always empty for us — brain.yaml is the store — so the arg is ignored and the *effective* settings are reported instead. Must never raise.
+- **The Hermes dashboard** (`hermes_cli/web_server.py`) prefills its provider form from `$HERMES_HOME/<name>.json` or `$HERMES_HOME/<name>/config.json`. `config.save_config` therefore writes a JSON **mirror** at `$HERMES_HOME/brain/config.json` alongside brain.yaml — without it the dashboard renders schema defaults and saving that form silently overwrites the user's real config. brain.yaml stays the single source of truth: **never read the mirror back**.
+- **`recall_mode`** (`hybrid | context | tools`) mirrors Honcho's `recallMode` / Hindsight's `memory_mode`. Read ONCE at `initialize()` — it decides what lane 1 renders, so re-reading it mid-session would break byte-stability.
+- **`plugins/memory/query_rewrite.py`** is a host-shared, provider-agnostic query rewriter (config `query_rewrite`, off by default). It calls `agent.auxiliary_client` directly, which would route spend around the budget gate — so it is wrapped by `llm.call_query_rewrite` (gate before, meter after), never called directly.
+
+`docs/design/alignment-audit.md` is the numbered record of what was checked and why each call was made.
 
 ## "Best-of-three" subsystems (Mnemosyne + Honcho ports)
 

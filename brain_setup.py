@@ -41,6 +41,11 @@ def config_schema() -> list[dict[str, Any]]:
         {"key": "lane2_tokens",
          "description": "Per-turn recall injection budget (0 disables lane 2)",
          "default": DEFAULTS["lane2_tokens"]},
+        {"key": "recall_mode",
+         "description": "How the agent reaches memory (hybrid = inject + tools, "
+                        "context = inject only, tools = tools only)",
+         "choices": ["hybrid", "context", "tools"],
+         "default": DEFAULTS["recall_mode"]},
         {"key": "embed_model",
          "description": "Embedding model (embeddinggemma-300m is license-gated: "
                         "needs HF_TOKEN)",
@@ -51,6 +56,16 @@ def config_schema() -> list[dict[str, Any]]:
                         "(auto = on when the model is present; full tier only)",
          "choices": ["auto", "off"],
          "default": DEFAULTS["rerank"]},
+        {"key": "memories_tool",
+         "description": "Expose the Anthropic-shaped 'memories' file tool "
+                        "(/memories/*.md views over stored memories)",
+         "choices": ["yes", "no"],
+         "default": "yes" if DEFAULTS["memories_tool"] else "no"},
+        {"key": "query_rewrite",
+         "description": "LLM-rewrite each turn into a retrieval query "
+                        "(one auxiliary call per turn; costs budget)",
+         "choices": ["no", "yes"],
+         "default": "yes" if DEFAULTS["query_rewrite"] else "no"},
         {"key": "dream_schedule",
          "description": "When the dream cycle runs (auto = cron if gateway detected)",
          "choices": ["auto", "cron", "on-idle", "manual"],
@@ -125,6 +140,7 @@ def post_setup(hermes_home: str, config: dict[str, Any]) -> None:
         if conn is not None:
             conn.close()
 
+    _offer_cron_job(home, cfg)
     _register_aux_slots(config)
     _activate_provider(config)
     print(_TRANSITION_MATRIX)
@@ -230,6 +246,123 @@ def _materialize_lane1(conn, cfg: dict[str, Any]) -> None:
         print("  lane 1 index materialized.")
     except Exception as e:
         print(f"  lane 1 materialize failed: {e} — run 'hermes brain refresh-index' later.")
+
+
+# ---------------------------------------------------------------------------
+# Dream scheduling (docs/design/integration.md §1.3)
+# ---------------------------------------------------------------------------
+
+# The dream runs as a `no_agent=True` cron SCRIPT job, never an agent session:
+# agent cron jobs run skip_memory=True with a 3-minute interrupt and cost
+# tokens for a job whose whole point is to run offline (F12).
+_CRON_JOB_NAME = "hermes-brain dream"
+# .py, not the .sh the design sketched: cron/scheduler.py picks the interpreter
+# by extension (bash for .sh/.bash, Python otherwise), and a Python script needs
+# no bash on Windows hosts. Relative names resolve under HERMES_HOME/scripts/.
+_CRON_SCRIPT_NAME = "brain-dream.py"
+_CRON_SCRIPT = '''\
+"""Nightly hermes-brain consolidation. Created by `hermes memory setup`.
+
+`--if-due` re-checks the interval watermark inside the dream lease, so extra
+runs (a manual dream-now, a second scheduler) are harmless no-ops.
+"""
+import subprocess
+import sys
+
+sys.exit(subprocess.run(
+    ["hermes", "brain", "dream", "--if-due", "--quiet"], check=False).returncode)
+'''
+
+
+def _cron_schedule_for(dream_time: str) -> str:
+    """'03:30' -> a cron expression, falling back to a plain interval.
+
+    Cron expressions need croniter (cron/jobs.py:parse_schedule raises without
+    it), which is not a guaranteed dependency — so degrade to 'every 24h'
+    rather than failing the whole setup over a scheduling nicety.
+    """
+    try:
+        hh, _, mm = str(dream_time or "").partition(":")
+        hour, minute = int(hh), int(mm)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError(dream_time)
+    except ValueError:
+        return "every 24h"
+    try:
+        import croniter  # noqa: F401
+    except ImportError:
+        return "every 24h"
+    return f"{minute} {hour} * * *"
+
+
+def _offer_cron_job(home: Path, cfg: dict[str, Any]) -> None:
+    """Offer to schedule the nightly dream (§1.3 step 1). Never raises.
+
+    Without this the learning system only ever runs when a human types
+    `hermes brain dream-now`: `dream_schedule`/`dream_time` were collected by
+    the wizard and read by nothing.
+
+    Cron is gateway-resident (F12), so `cron.jobs` is absent for CLI-only
+    installs — there we point at `dream_schedule: on-idle`, which the provider's
+    own worker honours without spawning anything.
+    """
+    schedule_pref = str(cfg.get("dream_schedule", "auto"))
+    if schedule_pref == "manual":
+        print("\n  dream_schedule=manual — no job created; run "
+              "'hermes brain dream-now' when you want a consolidation shift.")
+        return
+    if schedule_pref == "on-idle":
+        print("\n  dream_schedule=on-idle — the provider's background worker "
+              "runs one bounded strategy while a session sits idle.\n"
+              "  No cron job needed.")
+        return
+
+    try:
+        from cron.jobs import create_job, list_jobs
+    except ImportError:
+        print("\n  No cron scheduler on this install (it is gateway-resident).\n"
+              "  For automatic learning either set 'dream_schedule: on-idle' in\n"
+              f"  {Path(home) / 'brain' / 'brain.yaml'}, or schedule this yourself:\n"
+              "    hermes brain dream --if-due --quiet")
+        return
+
+    try:
+        for job in list_jobs(include_disabled=True) or []:
+            if str(job.get("name") or "") == _CRON_JOB_NAME:
+                print(f"\n  Nightly dream cron job already exists "
+                      f"(id {job.get('id')}) — leaving it alone.")
+                return
+    except Exception as e:
+        logger.debug("brain: could not list cron jobs (%s)", e)
+
+    dream_time = str(cfg.get("dream_time", "03:30"))
+    schedule = _cron_schedule_for(dream_time)
+    try:
+        answer = input(f"\n  Schedule the nightly dream at {dream_time} "
+                       f"({schedule})? [Y/n] ")
+    except (EOFError, KeyboardInterrupt, OSError):
+        answer = "n"
+    if answer.strip().lower() in ("n", "no"):
+        print("  Skipped — run 'hermes brain dream-now' manually, or re-run "
+              "'hermes memory setup' later.")
+        return
+
+    try:
+        scripts_dir = Path(home) / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / _CRON_SCRIPT_NAME).write_text(_CRON_SCRIPT, encoding="utf-8")
+        job = create_job(
+            None,                    # no_agent: the script IS the job
+            schedule,
+            name=_CRON_JOB_NAME,
+            script=_CRON_SCRIPT_NAME,
+            no_agent=True,
+        )
+        print(f"  Scheduled: {_CRON_JOB_NAME} (id {job.get('id')}, {schedule})\n"
+              f"  Disable any time with 'hermes cron' or delete the job.")
+    except Exception as e:
+        print(f"  Could not create the cron job ({e}).\n"
+              f"  Schedule this yourself instead:  hermes brain dream --if-due --quiet")
 
 
 # Auxiliary task slots the brain routes sleep-time LLM work through (mirrors
