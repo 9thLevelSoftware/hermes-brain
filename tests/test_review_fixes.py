@@ -178,7 +178,9 @@ def test_incognito_retrieve_writes_nothing(tmp_home):
     boot = db.connect(tmp_home)
     seed_memory(boot, "the incognito sentinel fact about walruses")
     boot.close()
-    save_config(tmp_home, {"incognito": True})
+    # fts-only: this asserts incognito writes NOTHING, so it must not also
+    # wait on a real ONNX embedder loading on the worker.
+    save_config(tmp_home, {"incognito": True, "mode": "fts-only"})
 
     p = BrainProvider()
     p.initialize("incog-1", hermes_home=str(tmp_home), platform="cli")

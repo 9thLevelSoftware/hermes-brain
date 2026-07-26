@@ -96,6 +96,10 @@ hermes brain status | doctor | search <q> | why <id>
 hermes brain remember/forget/pin/unpin/incognito ...
 hermes brain dream-now [--phase X] [--dry-run]     # run a consolidation shift
 hermes brain context | ask <q> | fact <subject>       # assembled context, cited answers, s-p-o facts
+hermes brain why-not <query> <id>                    # why a memory did NOT surface
+hermes brain eval --generate | --sample K | --compare # measure retrieval on your own corpus
+hermes brain weights show | reset                    # active retrieval-leg weights
+hermes brain import-provider <name> [--apply]        # migrate from another memory provider
 hermes brain dream --if-due                          # cron entry point
 hermes brain dream --enable/--disable <strategy>     # promote a strategy
 hermes brain insights                                # longitudinal learning metrics
@@ -114,10 +118,32 @@ See [`docs/design/`](docs/design/) for the normative design,
 [`docs/design/alignment-audit.md`](docs/design/alignment-audit.md) for the audit against
 the live `hermes-agent` provider contract.
 
+## Is it actually working?
+
+Every retrieval leg degrades independently and silently — a missing model, an
+absent extension, an empty index — which is correct behavior and terrible
+observability. Two commands answer it:
+
+```bash
+hermes brain doctor      # 'legs' line: fts=yes vec=no rerank=no graph=no facts=no
+hermes brain eval --generate --limit 150   # paraphrase queries from YOUR memories
+hermes brain eval --sample 10              # spot-check them before trusting a number
+hermes brain eval --compare                # P@k, MRR, paired win/loss per leg config
+```
+
+The comparison reports a configuration whose leg is unavailable as **skipped**,
+never as scoring zero improvement — an absent stage that quietly scores like the
+baseline is indistinguishable from a stage that ran and did nothing.
+
+**No claim is made here that the vector/rerank/graph stack beats plain BM25 on
+your data.** It has not been measured on a real corpus with a real model. The
+tooling above exists so you can find out rather than assume.
+
 ## Development
 
 ```bash
-pip install -e .[dev]
+pip install -e .[dev]     # pytest + ruff
+pip install -e .[full]    # onnx + tokenizers + sqlite-vec + numpy
 pytest
 ```
 

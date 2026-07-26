@@ -233,3 +233,153 @@ were actually confirmed rather than skipped:
   (Storage / Cost / Tools / Key feature) for anyone comparing.
 - **E2.** No attempt was made to reconcile `docs/research/`. It is a source
   corpus, not a specification of this product.
+
+---
+
+# Pre-install hardening — 2026-07-26
+
+The audit above was conducted against source. This section records what running
+the plugin against **real data** found, which was a different and more useful
+class of bug. Findings are numbered §F for citation from code.
+
+## F1. Bootstrap imported ~9% of history — **fixed**
+
+Measured on a real `state.db`: 49 sessions, 290 user messages, **26 turns
+imported**.
+
+| Stage | Turns |
+|---|---|
+| As shipped | 26 |
+| Ignoring the `ended_at IS NULL` skip | 57 |
+| Also ignoring the `active=0` skip | 95 |
+| User messages present | 290 |
+
+Three independent losses:
+
+1. **22 of 49 sessions had `ended_at IS NULL` and were skipped permanently**,
+   holding 210 of 290 user messages. Hermes stamps `ended_at` only on a clean
+   close, so "still running" also meant "abandoned months ago". The original
+   skip is correct in principle — watermarking a live session freezes a partial
+   transcript forever — but there was no reaper. Added
+   `_session_is_abandoned()`: an open session whose newest message is older than
+   `bootstrap_stale_days` (default 7) is imported; a genuinely live one is still
+   withheld.
+2. **Consecutive user messages overwrote each other** in `_pair_turns`. Real
+   transcripts are full of follow-ups sent before the assistant replies, and
+   every one silently discarded its predecessor. They are now joined.
+3. **Trailing user messages with no reply were discarded entirely** — 156 of
+   290. Often the most useful rows in the file (the last thing asked for). They
+   now emit a turn with an empty assistant side.
+
+`active=0` (compacted) rows are also imported now, behind
+`bootstrap_include_compacted`. Skipping them is right for live capture and
+backwards for bootstrap: compacted history is exactly what an external memory
+system exists to preserve.
+
+**Result: 26 to 52 turns**, plus 47 more in one genuinely-live session that
+import when it closes. Note this is NOT the ">200" first predicted — that
+target confused user messages with pairable turns. 1006 of 1383 assistant
+messages are blank tool-call rows, so ~95 pairs is the true ceiling, and the fix
+now reaches all of it that is not still live.
+
+`hermes brain bootstrap` prints coverage, so a thin import is visible instead of
+looking identical to a complete one.
+
+## F2. Retrieval legs degraded silently — **fixed**
+
+The rerank models on the test machine were **empty directories**, so
+`rerank: auto` resolved to `None` and the stage never ran, with nothing anywhere
+saying so. Doctor check 8 only ever validated the *embedding* model.
+
+Added `rerank-model`, `tier-deps` (warns when the tier resolves to `full` but
+onnxruntime/tokenizers/numpy/sqlite-vec are missing, i.e. silently fts-only),
+and a **`legs`** line in both `doctor` and `status` naming what retrieval will
+actually do: `fts=yes vec=no rerank=no graph=no facts=no`. Each leg degrades
+independently and correctly; the aggregate was invisible.
+
+## F3. Retrieval had never been measured — **fixed (tooling), open (result)**
+
+Six legs shipped with zero evidence any beat plain BM25. A first label-free
+measurement (95 episodes, 71 same-session-proxy queries) gave FTS-only
+recall@5 0.755 / MRR 0.918 versus 0.727 / 0.889 with vectors — **87% of queries
+identical, 5 wins, 4 losses.** That is noise, and the benchmark favored FTS by
+construction (same-session turns share identifiers verbatim).
+
+Two methodology lessons are now enforced in `evalkit/`:
+
+* **Paraphrase queries.** A query lifted verbatim from indexed text hands BM25
+  an exact-token match and measures nothing. `generate._too_similar` rejects a
+  "paraphrase" that reuses the source's long tokens.
+* **Paired counts, not just means.** The "-3.7%" headline was two queries out of
+  71. `compare.format_report` prints win/loss/tie and calls out small n.
+
+A configuration whose leg is unavailable is reported **skipped with a reason**,
+never scored — an absent reranker quietly scoring like the baseline is how a
+stage that never executed got read as "no improvement". That includes an
+embedder with an empty vector index.
+
+**The result itself remains open**: nobody has yet run `--generate` against a
+real model on a real corpus. Until then, no claim about the vector stack —
+positive or negative — is supported.
+
+## F4. Two subsystems could not work by construction — **fixed**
+
+`dream/tune.py` fitted per-leg weights from the injection-to-outcome labels,
+wrote them to a proposal, and let you approve it — while `fusion.rrf()` had **no
+weight parameter** and `review --approve` set `status='approved'` and returned.
+The brain learned what worked, asked permission, and discarded the answer.
+`recall/intent.py` was worse: shadow-only, logging to `audit_log`, with no
+proposal, no review surface, and no consumer anywhere.
+
+Fixed by finishing them, not by deleting or papering over:
+
+* `fusion.rrf(rankings, weights=...)` — the missing consumer. Uniform weights
+  are asserted byte-identical to no weights.
+* `recall/weights.py` — validated weights in a meta row, bumping the generation
+  counter so `query_cache` cannot serve pre-weight results.
+* `review --approve` applies them and prints before/after; a proposal with no
+  fitted weights is **refused** rather than reporting a success that does
+  nothing. `hermes brain weights show|reset`.
+* `intent_weighting: active` applies per-query multipliers on top of the
+  approved base weights.
+
+Two translations in `weights.from_proposal` are load-bearing: `fit_weights`
+names the graph leg `ppr`, and its weights are **convex** (~0.33 each) — applied
+literally that is a uniform down-scale, and RRF ranking is invariant under a
+uniform scale, so approving would provably have changed nothing.
+
+**The invariant is intact**: `tune` remains `shadow`, is never auto-applied, and
+only an explicit human approve moves retrieval.
+
+## F5. Adoption gaps — **partially fixed**
+
+* **`hermes brain import-provider`** (`bootstrap/providers.py`) with adapters
+  for `holographic` (plain SQLite) and `jsonl` (the universal path). Everything
+  else — byterover, mem0, openviking, honcho, retaindb, supermemory — is
+  **deliberately not adapted**: their data needs a CLI binary, a running server,
+  a configured vector store, or cloud credentials. Each refusal names the export
+  route in. This is narrower than first planned; a half-working importer that
+  silently drops rows is worse than a documented export step. Imports land at
+  `agent` trust (never `owner`) with `source=import:<provider>`.
+* **`hermes brain why-not <query> <uid>`** — `why` explains a memory you already
+  found; this explains the one you did not. Reports structural exclusions first
+  (status, scope, kind), then rank in the real search, then the lifecycle
+  modulation that demoted it.
+* **Cross-profile linking is NOT built.** Attaching a sibling profile's brain.db
+  read-only at search time touches the scope-enforcement path, which is the most
+  security-sensitive code in the repo, and doing it properly needs its own
+  adversarial pass. Deferred rather than rushed.
+
+## F6. `pip install -e .` was broken — **fixed**
+
+No `[tool.setuptools]` section, so flat-layout auto-discovery found a dozen
+top-level packages, could not choose, and aborted **before** reading
+`optional-dependencies` — making the documented `.[dev]` and `.[full]` extras
+unreachable. Declared explicitly that nothing installs: the host loads the
+plugin by path, there are no entry points, and a second importable copy would
+create the dual-identity problem `_compat.py` exists to avoid.
+
+Side effect worth noting: with `[full]` installable, ~50 previously-skipped
+tests now run, and three provider tests had to pin `mode: fts-only` — they were
+implicitly relying on no embedder being present, and a real ONNX load blew their
+poll deadlines.

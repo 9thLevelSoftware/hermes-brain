@@ -188,6 +188,19 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
                          help="set a strategy's mode to off")
 
     # -- P5: learning surface --------------------------------------------------
+    p_imp_p = cmds.add_parser("import-provider",
+                              help="import memory from another Hermes memory provider")
+    p_imp_p.add_argument("provider", help="holographic | jsonl (others: see --help output)")
+    p_imp_p.add_argument("--path", default=None,
+                         help="source file (default: the provider's usual location)")
+    p_imp_p.add_argument("--apply", action="store_true",
+                         help="write the import (default: dry-run)")
+
+    p_whynot = cmds.add_parser("why-not",
+                               help="why a memory did NOT surface for a query")
+    p_whynot.add_argument("query", help="the search query")
+    p_whynot.add_argument("uid", help="uid prefix of the memory you expected")
+
     p_w = cmds.add_parser("weights", help="active retrieval-leg weights (show | reset)")
     w_sub = p_w.add_subparsers(dest="weights_command")
     w_sub.add_parser("show", help="show the active per-leg weights and their source")
@@ -240,6 +253,7 @@ def brain_command(args: argparse.Namespace) -> int:
         "incognito": cmd_incognito, "dream-now": cmd_dream_now, "dream": cmd_dream,
         "insights": cmd_insights, "review": cmd_review, "skills": cmd_skills,
         "sync": cmd_sync, "weights": cmd_weights,
+        "import-provider": cmd_import_provider, "why-not": cmd_why_not,
         "mcp": cmd_mcp, "adopt-memory": cmd_adopt_memory,
     }.get(cmd)
     if handler is None:
@@ -999,6 +1013,199 @@ def _approve_tuning(conn, home: Path, row) -> int:
           "  hermes brain eval --compare        (before/after on your query set)\n"
           "  hermes brain weights reset         (revert to uniform)")
     return 0
+
+
+def cmd_import_provider(args: argparse.Namespace) -> int:
+    """Import memory from another Hermes memory provider (dry-run by default)."""
+    from .bootstrap.providers import PROVIDERS, UNSUPPORTED, import_provider
+
+    home = _hermes_home()
+    conn = _open_db(home)
+    if conn is None:
+        return 1
+    try:
+        counts = import_provider(conn, args.provider, hermes_home=home,
+                                 path=args.path, apply=args.apply)
+    finally:
+        conn.close()
+
+    if "error" in counts:
+        print(counts["error"], file=sys.stderr)
+        name = (args.provider or "").strip().lower()
+        if name not in UNSUPPORTED and name not in PROVIDERS:
+            print(f"  supported directly: {', '.join(PROVIDERS)}\n"
+                  f"  others (export first, then --provider jsonl): "
+                  f"{', '.join(sorted(UNSUPPORTED))}", file=sys.stderr)
+        return 1
+
+    for key in ("provider", "source", "imported", "skipped", "malformed"):
+        if key in counts:
+            print(f"{key:<12} {counts[key]}")
+    if not args.apply:
+        print("\nDry run — nothing was written. Re-run with --apply to keep it.")
+    else:
+        print(f"\nImported at 'agent' trust with provenance import:{counts['provider']}.\n"
+              "  Review anything surprising: hermes brain search <term>")
+    return 0
+
+
+def cmd_why_not(args: argparse.Namespace) -> int:
+    """Explain why a memory did NOT surface for a query.
+
+    `why <id>` answers "what is this memory and where did it come from", which
+    is the easy direction. When recall disappoints the question is about the
+    row that DIDN'T appear, and nothing answered that (alignment-audit.md §F5).
+    """
+    from .recall import weights as weights_mod
+    from .recall.search import search
+    from .store import db
+
+    home = _hermes_home()
+    conn = _open_db(home)
+    if conn is None:
+        return 1
+    try:
+        prefix = str(args.uid).strip().upper()
+        row = conn.execute(
+            "SELECT * FROM memories WHERE uid LIKE ? ORDER BY id DESC LIMIT 1",
+            (prefix + "%",)).fetchone()
+        # Episodes are half of what recall returns, so "why didn't this turn
+        # come back?" is as common a question as the memory version.
+        episode = None
+        if row is None:
+            episode = conn.execute(
+                "SELECT * FROM episodes WHERE uid LIKE ? ORDER BY id DESC LIMIT 1",
+                (prefix + "%",)).fetchone()
+        if row is None and episode is None:
+            print(f"No memory or episode with uid prefix {prefix!r}.\n"
+                  "  Remedy: ids come from 'hermes brain search' results.",
+                  file=sys.stderr)
+            return 1
+
+        if episode is not None:
+            return _why_not_episode(conn, args, episode, home)
+
+        print(f"memory        {row['uid'][:8]}  kind={row['kind']}  status={row['status']}")
+        print(f"content       {' '.join((row['content'] or '')[:160].split())}")
+        print()
+
+        # 1. Structural exclusions — these beat every ranking consideration.
+        blockers = []
+        if row["status"] != "active":
+            blockers.append(f"status is {row['status']!r}, not 'active' — "
+                            f"tombstoned and quarantined rows never reach the lanes")
+        if row["valid_to"] is not None:
+            blockers.append("superseded (valid_to set) — a newer version replaced it")
+        if not row["live"]:
+            blockers.append("live=0 — demoted by the forget pass")
+        if row["kind"] in ("peer_card", "strategy", "guardrail", "case"):
+            blockers.append(f"kind={row['kind']!r} is excluded from generic recall "
+                            f"(internal/dream-owned)")
+        if row["scope_user"]:
+            blockers.append(f"scoped to principal {row['scope_user']!r} — only that "
+                            f"caller (and the owner) can retrieve it")
+        if blockers:
+            print("EXCLUDED before ranking:")
+            for b in blockers:
+                print(f"  - {b}")
+            print()
+
+        # 2. Ranking: run the real search and locate it.
+        from . import config as config_mod
+
+        embedder, reranker = _eval_embedder_and_reranker(config_mod.load_config(home))
+        hits = search(conn, args.query, limit=50, include_episodes=True,
+                      episode_limit=50, trust_tier="owner",
+                      embedder=embedder, reranker=reranker)
+        rank = next((i for i, h in enumerate(hits, 1) if h.uid == row["uid"]), None)
+        if rank:
+            print(f"RANKING       found at position {rank} of {len(hits)} "
+                  f"(score {hits[rank - 1].score:.3f}, via {hits[rank - 1].source})")
+            print("  It IS retrievable — but lane 2 injects only the top few, so "
+                  "anything past that is crowded out by higher-scoring rows.")
+        else:
+            print(f"RANKING       not in the top {len(hits)} for this query")
+            toks = set(_why_not_tokens(args.query))
+            overlap = toks & set(_why_not_tokens(row["content"] or ""))
+            print(f"  shared query terms: {', '.join(sorted(overlap)) or '(none)'}")
+            if not overlap:
+                print("  No lexical overlap — the keyword leg cannot match it. It "
+                      "needs the vector leg (check 'legs' in 'hermes brain doctor').")
+
+        # 3. Lifecycle modulation that could have demoted it.
+        print()
+        print("MODULATION")
+        print(f"  pinned={bool(row['pinned'])}  outcome={row['outcome']}  "
+              f"helpful={row['helpful_count']}  harmful={row['harmful_count']}")
+        if row["harmful_count"] and row["harmful_count"] > row["helpful_count"]:
+            print("  - marked harmful more often than helpful; its score is damped")
+        if row["half_life_days"]:
+            age = (db.iso_now()[:10], row["valid_from"][:10])
+            print(f"  - decays with a {row['half_life_days']}d half-life "
+                  f"(recorded {age[1]}, today {age[0]})")
+        active = weights_mod.load(conn)
+        if weights_mod.is_active(conn):
+            print(f"  - approved leg weights are active: "
+                  f"{', '.join(f'{k}={v:g}' for k, v in active.items())}")
+        return 0
+    finally:
+        conn.close()
+
+
+def _why_not_episode(conn, args: argparse.Namespace, row, home: Path) -> int:
+    """why-not for a raw conversation turn.
+
+    Episodes have their own exclusion rules — attribution scoping rather than
+    scope_user, and a flat 0.6x score factor so distilled memories outrank raw
+    turns — so they need their own explanation, not the memory one reworded.
+    """
+    from . import config as config_mod
+    from .recall.search import search
+
+    print(f"episode       {row['uid'][:8]}  session={row['session_id'][:20]}  "
+          f"turn={row['turn_no']}")
+    print(f"user          {' '.join((row['user_content'] or '')[:140].split())}")
+    print()
+
+    blockers = []
+    if (row["trust_tier"] or "") == "untrusted":
+        blockers.append("trust_tier='untrusted' — excluded from the episode leg "
+                        "for every caller")
+    if blockers:
+        print("EXCLUDED before ranking:")
+        for b in blockers:
+            print(f"  - {b}")
+        print()
+
+    embedder, reranker = _eval_embedder_and_reranker(config_mod.load_config(home))
+    hits = search(conn, args.query, limit=50, include_episodes=True,
+                  episode_limit=50, trust_tier="owner",
+                  embedder=embedder, reranker=reranker)
+    rank = next((i for i, h in enumerate(hits, 1) if h.uid == row["uid"]), None)
+    if rank:
+        print(f"RANKING       found at position {rank} of {len(hits)} "
+              f"(score {hits[rank - 1].score:.3f}, via {hits[rank - 1].source})")
+    else:
+        print(f"RANKING       not in the top {len(hits)} for this query")
+        toks = set(_why_not_tokens(args.query))
+        body = f"{row['user_content'] or ''} {row['assistant_content'] or ''}"
+        overlap = toks & set(_why_not_tokens(body))
+        print(f"  shared query terms: {', '.join(sorted(overlap)) or '(none)'}")
+        if not overlap:
+            print("  No lexical overlap — the keyword leg cannot match it; it needs "
+                  "the vector leg (check 'legs' in 'hermes brain doctor').")
+    print()
+    print("MODULATION")
+    print(f"  salience={row['salience']:.2f}")
+    print("  - episodes are scored at 0.6x so distilled memories outrank raw turns")
+    print("  - a caller's OWN current session is excluded from the episode leg")
+    return 0
+
+
+def _why_not_tokens(text: str) -> list[str]:
+    from .recall.search import _tokens
+
+    return _tokens(text or "")
 
 
 def cmd_weights(args: argparse.Namespace) -> int:

@@ -506,8 +506,14 @@ def test_doctor_warns_when_rerank_model_files_are_missing(home, capsys):
     _run(["doctor"])
     out = capsys.readouterr().out
     assert "rerank-model" in out
-    # Either the model is genuinely present on this machine, or we warn.
-    assert ("rerank stage is silently skipped" in out) or ("present" in out)
+    # Three legitimate outcomes, all of which must SAY something:
+    #   - the model is on disk           -> "present"
+    #   - it is missing                  -> the silent-skip warning
+    #   - the tier downgraded (floor image: no onnxruntime, so 'full' resolves
+    #     to fts-only) -> there is no rerank stage to check at all
+    assert any(s in out for s in ("rerank stage is silently skipped",
+                                 "present",
+                                 "has no rerank stage"))
 
 
 def test_doctor_rerank_check_respects_the_off_switch(home, capsys):
@@ -522,3 +528,73 @@ def test_doctor_reports_legs_and_never_crashes_on_a_fresh_brain(home, capsys):
     out = capsys.readouterr().out
     assert "[" in out and "legs" in out
     assert rc in (0, 1)  # WARNs are fine; a FAIL is allowed to exit 1
+
+
+# ---------------------------------------------------------------------------
+# why-not — the diagnostic for the memory that DIDN'T surface
+# ---------------------------------------------------------------------------
+
+def test_why_not_reports_rank_when_the_memory_is_retrievable(home, capsys):
+    conn = db.connect(home)
+    seed_memory(conn, "the deploy pipeline runs on buildkite")
+    uid = conn.execute("SELECT uid FROM memories").fetchone()["uid"]
+    conn.close()
+
+    assert _run(["why-not", "deploy pipeline", uid[:8]]) == 0
+    out = capsys.readouterr().out
+    assert "RANKING" in out and "found at position" in out
+
+
+def test_why_not_explains_a_structural_exclusion(home, capsys):
+    """Status/scope beat every ranking consideration — say so first."""
+    conn = db.connect(home)
+    seed_memory(conn, "quarantined instruction-shaped content", status="quarantined")
+    uid = conn.execute("SELECT uid FROM memories").fetchone()["uid"]
+    conn.close()
+
+    assert _run(["why-not", "quarantined content", uid[:8]]) == 0
+    out = capsys.readouterr().out
+    assert "EXCLUDED before ranking" in out and "quarantined" in out
+
+
+def test_why_not_flags_a_scoped_row(home, capsys):
+    conn = db.connect(home)
+    mem_id = seed_memory(conn, "a peer's private preference")
+    conn.execute("UPDATE memories SET scope_user='peer-1' WHERE id=?", (mem_id,))
+    conn.commit()
+    uid = conn.execute("SELECT uid FROM memories").fetchone()["uid"]
+    conn.close()
+
+    assert _run(["why-not", "private preference", uid[:8]]) == 0
+    assert "scoped to principal" in capsys.readouterr().out
+
+
+def test_why_not_reports_no_lexical_overlap(home, capsys):
+    conn = db.connect(home)
+    seed_memory(conn, "the deploy pipeline runs on buildkite")
+    uid = conn.execute("SELECT uid FROM memories").fetchone()["uid"]
+    conn.close()
+
+    assert _run(["why-not", "unrelated zebra xylophone", uid[:8]]) == 0
+    out = capsys.readouterr().out
+    assert "shared query terms" in out
+    assert "(none)" in out or "keyword leg cannot match" in out
+
+
+def test_why_not_unknown_uid_teaches(home, capsys):
+    assert _run(["why-not", "anything", "ZZZZZZZZ"]) == 1
+
+
+def test_why_not_works_for_episodes_too(home, capsys):
+    """Episodes are half of what recall returns — 'why didn't this turn come
+    back' is as common a question as the memory version."""
+    conn = db.connect(home)
+    seed_episode(conn, "how do I vent the flux capacitor",
+                 "vent it before charging", session_id="s-why")
+    uid = conn.execute("SELECT uid FROM episodes").fetchone()["uid"]
+    conn.close()
+
+    assert _run(["why-not", "flux capacitor", uid[:8]]) == 0
+    out = capsys.readouterr().out
+    assert "episode" in out and "RANKING" in out
+    assert "0.6x" in out, "the episode score factor should be explained"
