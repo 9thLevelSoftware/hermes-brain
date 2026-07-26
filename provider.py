@@ -1084,21 +1084,30 @@ class BrainProvider(MemoryProvider):
             # is the cache-safe hot path; a second database read on every turn
             # is latency and blast radius for a feature whose value is mostly
             # on-demand. Owner sessions only — enforced inside search_linked.
+            linked_used = False
             if self._config.get("link_lane2", False):
                 try:
                     from .recall.linked import search_linked
 
-                    hits = search_linked(
+                    merged = search_linked(
                         conn, query_text, local_hits=hits, trust_tier=trust_tier,
                         limit=8,
                         link_weight=float(self._config.get("link_weight", 0.85)),
                         embedder=self._embedder, reranker=self._reranker,
                         exclude_kinds=exclude_kinds,
                     )
+                    linked_used = any(getattr(h, "profile", None) for h in merged)
+                    hits = merged
                 except Exception:
                     logger.debug("brain: linked lane-2 skipped", exc_info=True)
             hits = _diversify(hits, mmr_lambda, 8)
-            if use_cache:
+            # Results containing linked rows are NOT cached. query_cache is
+            # keyed on the LOCAL mem_generation, which a write in another
+            # profile cannot bump and which adding/removing a link does not
+            # touch — so a long-running gateway would keep serving memories
+            # from an unlinked profile, or miss newly linked ones, indefinitely
+            # (PR #9 review, P2). Correctness beats one cache hit per turn.
+            if use_cache and not linked_used:
                 self._query_cache.put(query_text, kinds=None, scope=cache_scope, hits=hits)
         facts_block = lane2_block(hits, remaining)
         block = "\n".join(p for p in (gblock, facts_block) if p)

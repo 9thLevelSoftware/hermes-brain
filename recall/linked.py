@@ -132,7 +132,7 @@ def _merge(local_hits: list, per_profile: list[tuple[str, list]],
     fused = fusion.rrf(rankings, weights=weights)
     ordered = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)
 
-    out = []
+    ranked = []
     for item_key, score in ordered:
         hit = by_key.get(item_key)
         if hit is None:
@@ -142,8 +142,44 @@ def _merge(local_hits: list, per_profile: list[tuple[str, list]],
         # scores that produced these ranks are not comparable and must not be
         # carried forward as if they were.
         hit.score = score
-        out.append(hit)
-    return out[:limit]
+        ranked.append(hit)
+    return _reserve_linked_slots(ranked, limit)
+
+
+# Share of the limit guaranteed to linked profiles when they have anything to
+# offer. A quarter: enough that cross-profile recall is real, small enough that
+# the local profile still dominates its own results.
+_LINKED_RESERVE_FRACTION = 4
+
+
+def _reserve_linked_slots(ranked: list, limit: int) -> list:
+    """Guarantee linked profiles a minority share of the result slots.
+
+    Score ordering alone silently starves them. With RRF k=60 and the default
+    0.85 discount, the best linked hit scores 0.85/61 = 0.01393 while the
+    EIGHTH local hit scores 1/68 = 0.01471 — so on any query where the local
+    profile fills the default limit, every linked hit is truncated away
+    regardless of how relevant it is, and cross-profile recall is effectively
+    dead (PR #9 review, P1).
+
+    Raising `link_weight` is not a fix: whether linked rank 1 clears local rank
+    N depends on the limit (w > (k+1)/(k+N)), so any fixed weight is a
+    coincidence that breaks when the caller changes `limit`. Reserving slots is
+    a policy, and policies survive parameter changes.
+    """
+    head = ranked[:limit]
+    if len(ranked) <= limit:
+        return head
+    if any(getattr(h, "profile", None) for h in head):
+        return head            # linked results already made the cut on merit
+    linked = [h for h in ranked[limit:] if getattr(h, "profile", None)]
+    if not linked:
+        return head            # nothing linked to promote
+    reserve = max(1, limit // _LINKED_RESERVE_FRACTION)
+    promoted = linked[:reserve]
+    # Drop the weakest local hits to make room, preserving fused order.
+    kept = head[:max(0, limit - len(promoted))]
+    return kept + promoted
 
 
 def local_only(hits: list) -> list:

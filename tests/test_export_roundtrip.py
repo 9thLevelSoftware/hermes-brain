@@ -199,3 +199,115 @@ def test_memories_only_import_still_works(home, tmp_path, monkeypatch, capsys):
         assert conn.execute("SELECT count(*) FROM memories").fetchone()[0] >= 1
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# PR #9 review, P1: id references must be REMAPPED, not carried over
+# ---------------------------------------------------------------------------
+
+def _populate_with_references(home):
+    """A brain whose rows reference each other by rowid, which is exactly what
+    an import into a NON-EMPTY database must not carry across verbatim."""
+    conn = db.connect(home)
+    try:
+        live = seed_memory(conn, "the VPS is a Hetzner CX32")
+        old = seed_memory(conn, "the VPS is a Hetzner CX22")
+        conn.execute("UPDATE memories SET valid_to=?, superseded_by=? WHERE id=?",
+                     (db.iso_now(), live, old))
+        other = seed_memory(conn, "the deploy runbook lives in the wiki")
+        conn.execute(
+            "INSERT INTO edges (src_id, dst_id, edge_type, created_by, valid_from,"
+            " recorded_at) VALUES (?,?,'related_to','test',?,?)",
+            (live, other, db.iso_now(), db.iso_now()))
+        from brain.store import entities
+
+        ent = entities.link(conn, "Hetzner", live)
+        conn.execute(
+            "INSERT INTO facts (subject, predicate, object, memory_id, entity_id,"
+            " valid_from, recorded_at) VALUES ('vps','is_a','CX32',?,?,?,?)",
+            (live, ent, db.iso_now(), db.iso_now()))
+        conn.commit()
+        return {"live": live, "old": old, "other": other}
+    finally:
+        conn.close()
+
+
+def _restore_into(source_dir, target, monkeypatch):
+    monkeypatch.setattr(cli, "_hermes_home", lambda: target)
+    return _run(["import", str(source_dir / "manifest.json")])
+
+
+def test_full_import_remaps_ids_into_a_nonempty_database(home, tmp_path,
+                                                         monkeypatch, capsys):
+    """Into a NON-empty target the new rowids differ from the exported ones, so
+    every reference must be rewritten or it points at an unrelated row."""
+    _populate_with_references(home)
+    out_dir = home / "full"
+    _run(["export", "--out", str(out_dir), "--full"])
+    capsys.readouterr()
+
+    target = tmp_path / "nonempty"
+    target.mkdir()
+    pre = db.connect(target)
+    try:
+        # Occupy low rowids so the imported rows land on DIFFERENT numbers.
+        for i in range(7):
+            seed_memory(pre, f"pre-existing unrelated memory {i}")
+        pre.commit()
+    finally:
+        pre.close()
+
+    assert _restore_into(out_dir, target, monkeypatch) == 0
+    conn = db.connect(target)
+    try:
+        live = conn.execute(
+            "SELECT id FROM memories WHERE content LIKE '%CX32%'").fetchone()["id"]
+        other = conn.execute(
+            "SELECT id FROM memories WHERE content LIKE '%runbook%'").fetchone()["id"]
+        old = conn.execute(
+            "SELECT id, superseded_by FROM memories WHERE content LIKE '%CX22%'"
+        ).fetchone()
+
+        assert old["superseded_by"] == live, "version chain must follow the new id"
+        edge = conn.execute("SELECT src_id, dst_id FROM edges").fetchone()
+        assert (edge["src_id"], edge["dst_id"]) == (live, other)
+        fact = conn.execute("SELECT memory_id, entity_id FROM facts").fetchone()
+        assert fact["memory_id"] == live
+        ent_id = conn.execute("SELECT id FROM entities").fetchone()["id"]
+        assert fact["entity_id"] == ent_id
+        mention = conn.execute(
+            "SELECT entity_id, memory_id FROM entity_mentions").fetchone()
+        assert (mention["entity_id"], mention["memory_id"]) == (ent_id, live)
+    finally:
+        conn.close()
+
+
+def test_full_import_of_uidless_tables_is_idempotent(home, tmp_path,
+                                                     monkeypatch, capsys):
+    """facts/edges/entity_mentions have no uid; without a per-table identity a
+    second import duplicated every one while reporting a clean restore."""
+    _populate_with_references(home)
+    out_dir = home / "full"
+    _run(["export", "--out", str(out_dir), "--full"])
+    capsys.readouterr()
+
+    target = tmp_path / "twice"
+    target.mkdir()
+    _restore_into(out_dir, target, monkeypatch)
+    capsys.readouterr()
+    _restore_into(out_dir, target, monkeypatch)
+    capsys.readouterr()
+
+    conn = db.connect(target)
+    try:
+        for table in ("memories", "episodes", "facts", "edges",
+                      "entity_mentions", "entities"):
+            n = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            src = db.connect(home)
+            try:
+                expect = src.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            finally:
+                src.close()
+            assert n == expect, f"{table}: {n} rows after two imports, expected {expect}"
+    finally:
+        conn.close()

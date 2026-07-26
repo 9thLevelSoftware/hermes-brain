@@ -579,3 +579,63 @@ endings, and `docker/adversarial/Dockerfile.live` failed with
 heredocs. Eight files were normalized back to LF. Worth remembering that
 `.gitattributes` normalizes on commit but the **working tree** is what Docker
 builds from.
+
+## G8. Codex review on PR #9 — six findings, all legitimate
+
+Automated review found six real issues, three P1. Two were corruption bugs in
+code written in this same pass. Recorded because the pattern is instructive:
+every one of them was in a path my own tests exercised only in the *easy*
+configuration.
+
+**P1 — linked hits could never survive the fusion limit.** With RRF `k=60` and
+the default `link_weight=0.85`, the best linked hit scores `0.85/61 = 0.01393`
+while the EIGHTH local hit scores `1/68 = 0.01471`. On any query where the local
+profile fills the default limit, every linked hit was truncated away regardless
+of relevance — cross-profile recall was effectively local-only on a populated
+profile. My tests missed it because they used tiny local corpora.
+
+Raising the weight is not a fix: linked rank 1 clears local rank N only when
+`w > (k+1)/(k+N)`, so any fixed weight is a coincidence that breaks when the
+caller changes `limit`. `_reserve_linked_slots` guarantees linked profiles a
+quarter of the slots when they have anything to offer — a policy survives
+parameter changes; arithmetic does not.
+
+**P1 — the full import did not remap row-ID references.** Excluding `id` on
+insert generates new rowids, but `memories.supersedes_id`/`superseded_by`,
+`facts.memory_id`/`entity_id`/`superseded_by`, `entity_mentions.*` and
+`edges.src_id`/`dst_id` were carried over verbatim, pointing at unrelated rows
+or at nothing. Silent corruption of exactly the version history, facts and
+graph that `--full` exists to preserve — and invisible when restoring into an
+EMPTY database, which is all my round-trip test did. Now imports in dependency
+order, builds an old→new map per table, and resolves self-references in a
+second pass.
+
+**P1 — UID-less tables duplicated on re-import.** The idempotency check keyed on
+`uid`, which `facts`, `entity_mentions` and `edges` do not have, so a second
+import duplicated every one while the CLI reported a clean idempotent restore.
+Each table now declares its identity: `canonical` for entities, the PK for
+mentions, the UNIQUE tuple for edges, and `(subject, predicate, object,
+valid_from, recorded_at)` for facts.
+
+**P2 — lane-2 cache could serve unlinked memories forever.** `query_cache` keys
+on the LOCAL `mem_generation`, which a write in another profile cannot bump and
+which linking/unlinking does not touch. Merged results are no longer cached at
+all: correctness beats one cache hit per turn, and a fingerprint over remote
+databases would still not see their writes.
+
+**P2 — deep recall seeded the local graph with linked rowids.** The same class
+as the `log_retrieval` guard, missed one call site over: `brain_recall(depth=
+"deep")` passed every memory hit id to `entities.co_mentioned()` on the LOCAL
+connection, so a linked rowid colliding with a local memory id would present
+unrelated local neighbours as related to the linked hit.
+
+**P2 — a relative `--home` was persisted verbatim.** It validated against the
+CLI's cwd, then a gateway started elsewhere would resolve a different path and
+degrade to local-only recall with no error. The resolved absolute path is
+stored.
+
+The through-line: the rowid-collision hazard has now surfaced in **three**
+places (`log_retrieval`, deep traversal, full import). Any code that takes an
+id from one database and uses it against another is wrong by default;
+`Hit.profile is None` and the import id-maps are the two guards, and new call
+sites need to be checked against them.

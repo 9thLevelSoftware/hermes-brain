@@ -7,6 +7,7 @@ file is about the mechanics being right.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 import pytest
 from brain import cli
@@ -180,3 +181,65 @@ def test_cli_search_includes_linked_profiles(home, other_home, capsys):
     assert _run(["search", "buildkite"]) == 0
     out = capsys.readouterr().out
     assert "@coder" in out, "linked hits must be labelled in search output"
+
+
+# ---------------------------------------------------------------------------
+# PR #9 review, P1: linked hits must survive the fusion limit
+# ---------------------------------------------------------------------------
+
+def test_linked_hits_are_not_starved_by_a_full_local_result_set():
+    """Score ordering alone silently kills cross-profile recall.
+
+    RRF k=60 with the default 0.85 discount: the best linked hit scores
+    0.85/61 = 0.01393, the EIGHTH local hit scores 1/68 = 0.01471. On any query
+    where the local profile fills the default limit, every linked hit is
+    truncated away no matter how relevant it is.
+    """
+    local = [_hit(f"L{i}", 0.9) for i in range(20)]
+    linked = [_hit("REMOTE1", 0.95, profile="coder")]
+    merged = _merge(local, [("coder", linked)], 0.85, 8)
+
+    assert len(merged) == 8
+    assert any(h.profile == "coder" for h in merged), \
+        "a linked hit must reach the results even when local fills the limit"
+    # ...and the local profile still dominates its own results.
+    assert sum(1 for h in merged if h.profile is None) >= 6
+
+
+def test_reservation_scales_with_the_limit():
+    local = [_hit(f"L{i}", 0.9) for i in range(40)]
+    linked = [_hit(f"R{i}", 0.9, profile="c") for i in range(10)]
+    merged = _merge(local, [("c", linked)], 0.85, 20)
+    n_linked = sum(1 for h in merged if h.profile)
+    assert 1 <= n_linked <= 20 // 4
+    assert len(merged) == 20
+
+
+def test_no_reservation_when_linked_hits_already_rank():
+    """If they earned their place, nothing is displaced."""
+    local = [_hit("L1", 0.9)]
+    linked = [_hit("R1", 0.95, profile="c")]
+    merged = _merge(local, [("c", linked)], 0.85, 8)
+    assert len(merged) == 2
+
+
+def test_reservation_never_invents_linked_hits():
+    local = [_hit(f"L{i}", 0.9) for i in range(20)]
+    merged = _merge(local, [], 0.85, 8)
+    assert len(merged) == 8 and all(h.profile is None for h in merged)
+
+
+# ---------------------------------------------------------------------------
+# PR #9 review, P2: absolute link paths
+# ---------------------------------------------------------------------------
+
+def test_link_stores_an_absolute_path(conn, other_home, monkeypatch, tmp_path):
+    """A relative --home validates against the CLI's cwd but would then be
+    resolved from a different directory by the gateway, silently degrading to
+    local-only recall."""
+    import os
+
+    monkeypatch.chdir(other_home.parent)
+    entry = links_mod.add(conn, "rel", other_home.name)
+    assert os.path.isabs(entry["hermes_home"])
+    assert db.db_path(Path(entry["hermes_home"])).is_file()

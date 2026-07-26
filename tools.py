@@ -743,7 +743,12 @@ def _recall(conn: sqlite3.Connection, args: dict, ctx: ToolContext) -> dict:
             if i < _DEEP_FULL_TEXT_TOP and hit.text:
                 entry["text"] = hit.text
             results.append(entry)
-            if hit.kind == "memory":
+            # `hit.profile is None` is the same rowid guard as
+            # search.log_retrieval: a linked hit's `id` is a rowid in ANOTHER
+            # database. Seeding the LOCAL graph with it would traverse whatever
+            # local memory happens to share that number and present the result
+            # as "related to" the linked hit (PR #9 review, P2).
+            if hit.kind == "memory" and getattr(hit, "profile", None) is None:
                 seed_ids.append(hit.id)
 
         # Graph traversal: memories sharing an entity with the results, scoped

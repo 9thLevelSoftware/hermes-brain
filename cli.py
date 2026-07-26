@@ -2412,6 +2412,66 @@ _FULL_EXPORT_TABLES = ("memories", "episodes", "facts", "entities",
                        "entity_mentions", "edges")
 FULL_EXPORT_VERSION = 1
 
+# Import order matters: a table must land AFTER everything it references, so
+# the old->new id map is populated before anything needs it.
+_FULL_IMPORT_ORDER = ("memories", "episodes", "entities", "entity_mentions",
+                      "edges", "facts")
+
+# column -> table it references. Self-references (a table pointing at itself)
+# are resolved in a second pass, because the target row may be exported after
+# the row that points at it.
+_FULL_IMPORT_REFS: dict[str, dict[str, str]] = {
+    "memories": {"supersedes_id": "memories", "superseded_by": "memories"},
+    "entity_mentions": {"entity_id": "entities", "memory_id": "memories"},
+    "edges": {"src_id": "memories", "dst_id": "memories"},
+    "facts": {"memory_id": "memories", "entity_id": "entities",
+              "superseded_by": "facts"},
+}
+
+# How a row is RECOGNIZED as already present, per table. `uid` where there is
+# one; a natural key otherwise. Without this, re-importing a snapshot silently
+# duplicated every fact, mention and edge while reporting an idempotent
+# restore (PR #9 review, P1). Columns here are read AFTER reference remapping,
+# so the comparison is against ids that exist in THIS database.
+_FULL_IMPORT_IDENTITY: dict[str, tuple[str, ...]] = {
+    "memories": ("uid",),
+    "episodes": ("uid",),
+    "entities": ("canonical",),                       # UNIQUE in schema.sql
+    "entity_mentions": ("entity_id", "memory_id"),    # PK
+    "edges": ("src_id", "dst_id", "edge_type", "valid_from"),   # UNIQUE
+    # facts has no uid and no uniqueness constraint; the triple plus its
+    # validity window is the stable identity of an exported row.
+    "facts": ("subject", "predicate", "object", "valid_from", "recorded_at"),
+}
+
+
+def _existing_row_id(conn, table: str, rec: dict):
+    """rowid of an already-present row matching this record's identity, else None.
+
+    Returns the id so the caller can map old->new even for a SKIPPED row: a
+    later table referencing it must still resolve to the row that is really
+    there.
+    """
+    keys = _FULL_IMPORT_IDENTITY.get(table)
+    if not keys:
+        return None
+    values = [rec.get(k) for k in keys]
+    if all(v is None for v in values):
+        return None
+    where = " AND ".join(f"{k} IS ?" for k in keys)
+    # entity_mentions is WITHOUT ROWID and has no `id` column at all, so there
+    # is no id to return — 1 just means "present". Nothing references it, and
+    # its exported rows carry no `id`, so no idmap entry is created either.
+    try:
+        has_id = any(r["name"] == "id" for r in
+                     conn.execute(f"PRAGMA table_info({table})").fetchall())
+        select = "id" if has_id else "1"
+        row = conn.execute(
+            f"SELECT {select} FROM {table} WHERE {where} LIMIT 1", values).fetchone()
+    except Exception:
+        return None
+    return row[0] if row else None
+
 
 def _export_full(conn, out_dir: Path) -> dict[str, int]:
     """Write every table a brain's knowledge lives in, plus a manifest.
@@ -2536,20 +2596,34 @@ _INSTRUCTION_SHAPED_RE = re.compile(
 
 
 def _import_full(conn, manifest_path: Path) -> dict[str, int]:
-    """Restore a `--full` export, preserving uids so a round trip is genuinely
-    identity-preserving.
+    """Restore a `--full` export.
 
-    Row IDS are deliberately NOT preserved (they are rowids, and colliding with
-    existing rows would corrupt the target); a uid that already exists is
-    skipped rather than duplicated, which makes re-import idempotent.
+    Row IDs are NOT preserved — they are rowids, and reusing them would collide
+    with rows already in the target. But every id-REFERENCING column has to be
+    rewritten to match, or the restore silently corrupts what it claims to have
+    restored: `memories.supersedes_id`/`superseded_by`, `facts.memory_id`/
+    `entity_id`/`superseded_by`, `entity_mentions.*` and `edges.src_id`/`dst_id`
+    would otherwise point at unrelated rows or at nothing (PR #9 review, P1).
+    So we build an old->new map per table and remap as we go.
+
+    Idempotency needs a per-table identity, not just `uid`: `facts`,
+    `entity_mentions` and `edges` have no uid, so a second import of the same
+    snapshot would duplicate every one of them while the CLI reported a clean
+    idempotent restore (PR #9 review, P1). Each table below declares how it is
+    recognized.
     """
+    from .store import db
+
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("format") != "hermes-brain-full-export":
         raise ValueError(f"{manifest_path} is not a full-export manifest")
     out_dir = manifest_path.parent
     counts: dict[str, int] = {}
+    # old id -> new id, per table. Populated for SKIPPED rows too, so a
+    # reference to an already-present row still resolves.
+    idmap: dict[str, dict[int, int]] = {t: {} for t in _FULL_EXPORT_TABLES}
 
-    for table in _FULL_EXPORT_TABLES:
+    for table in _FULL_IMPORT_ORDER:
         src = out_dir / f"{table}.jsonl"
         if not src.exists():
             continue
@@ -2560,12 +2634,15 @@ def _import_full(conn, manifest_path: Path) -> dict[str, int]:
             continue
         if not cols:
             continue
-        has_uid = "uid" in cols
+
+        refs = _FULL_IMPORT_REFS.get(table, {})
         insert_cols = [c for c in cols if c != "id"]
         placeholders = ",".join("?" * len(insert_cols))
         sql = (f"INSERT INTO {table} ({','.join(insert_cols)}) "
                f"VALUES ({placeholders})")
+        deferred: list[tuple[int, dict]] = []   # self-references, second pass
         added = 0
+
         for line in src.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
@@ -2573,17 +2650,54 @@ def _import_full(conn, manifest_path: Path) -> dict[str, int]:
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if (has_uid and rec.get("uid")
-                    and conn.execute(f"SELECT 1 FROM {table} WHERE uid=? LIMIT 1",
-                                     (rec["uid"],)).fetchone()):
+            old_id = rec.get("id")
+
+            # Remap every reference to a table imported BEFORE this one. A
+            # self-reference cannot be resolved yet (the target row may not
+            # exist), so it is nulled now and fixed in the second pass.
+            self_refs = {}
+            for col, target in refs.items():
+                if col not in cols:
+                    continue
+                val = rec.get(col)
+                if val is None:
+                    continue
+                if target == table:
+                    self_refs[col] = val
+                    rec[col] = None
+                else:
+                    rec[col] = idmap.get(target, {}).get(val)
+
+            existing = _existing_row_id(conn, table, rec)
+            if existing is not None:
+                if old_id is not None:
+                    idmap[table][old_id] = existing
                 continue
             try:
-                conn.execute(sql, [rec.get(c) for c in insert_cols])
-                added += 1
+                cur = conn.execute(sql, [rec.get(c) for c in insert_cols])
             except Exception as e:
                 logger.debug("full import: %s row skipped (%s)", table, e)
+                continue
+            new_id = cur.lastrowid
+            if old_id is not None and new_id is not None:
+                idmap[table][old_id] = new_id
+            if self_refs and new_id is not None:
+                deferred.append((new_id, self_refs))
+            added += 1
+
+        # Second pass: self-references, now that every row of this table exists.
+        for new_id, self_refs in deferred:
+            for col, old_target in self_refs.items():
+                mapped = idmap[table].get(old_target)
+                if mapped is None:
+                    continue
+                try:
+                    conn.execute(f"UPDATE {table} SET {col}=? WHERE id=?",
+                                 (mapped, new_id))
+                except Exception as e:
+                    logger.debug("full import: %s.%s not remapped (%s)",
+                                 table, col, e)
         counts[table] = added
-    from .store import db
 
     db.bump_generation(conn, "mem")
     conn.commit()

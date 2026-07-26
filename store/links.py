@@ -116,7 +116,15 @@ def validate_target(conn: sqlite3.Connection, hermes_home: str | Path) -> str:
         raise ValueError(
             f"{target} is schema v{version}; this plugin understands up to "
             f"v{db.SCHEMA_VERSION}. Update the plugin before linking.")
-    return str(Path(hermes_home))
+    # Persist the ABSOLUTE path that was actually validated. A relative --home
+    # resolves against the CLI's cwd, so storing it verbatim would send a
+    # gateway (or a later CLI run from another directory) looking for a
+    # different brain.db — and a link that silently resolves to nothing
+    # degrades to local-only recall with no error (PR #9 review, P2).
+    try:
+        return str(Path(hermes_home).resolve())
+    except OSError:
+        return str(Path(hermes_home).absolute())
 
 
 def _main_db_file(conn: sqlite3.Connection) -> Path | None:
