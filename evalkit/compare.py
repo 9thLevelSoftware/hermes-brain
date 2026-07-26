@@ -80,7 +80,34 @@ def _vector_index_present(conn) -> bool:
         return False
 
 
-def _run_one(conn, queries, cfg: Config, *, embedder, reranker) -> Result:
+def score_weights(conn, queries, weights: dict[str, float] | None, *,
+                  embedder=None, reranker=None) -> Result:
+    """Score ONE candidate weight set over the query set, without applying it.
+
+    This is what makes approving a tune proposal an evidence-based decision
+    rather than a leap: `dream/tune.py` fits weights and can now say what they
+    would actually do, measured, before anyone commits them. ``weights=None``
+    scores whatever is currently active.
+    """
+    cfg = _best_available(conn, embedder=embedder, reranker=reranker)
+    return _run_one(conn, queries, cfg, embedder=embedder, reranker=reranker,
+                    weights_override=weights)
+
+
+def _best_available(conn, *, embedder, reranker) -> Config:
+    """The richest configuration this install can actually run right now.
+
+    A fixed `all` row is unreachable whenever any leg's model is missing, which
+    reproduces the exact failure evalkit exists to prevent: you cannot see your
+    real stack, so a leg that never ran is indistinguishable from a leg that
+    did not help.
+    """
+    vec = embedder is not None and _vector_index_present(conn)
+    return Config("best-available", vec, vec and reranker is not None, True, True)
+
+
+def _run_one(conn, queries, cfg: Config, *, embedder, reranker,
+             weights_override: dict[str, float] | None = None) -> Result:
     from ..recall.search import search
 
     if cfg.vec and embedder is None:
@@ -110,6 +137,7 @@ def _run_one(conn, queries, cfg: Config, *, embedder, reranker) -> Result:
                 reranker=reranker if cfg.rerank else None,
                 graph=cfg.graph,
                 facts=cfg.facts,
+                weights_override=weights_override,
             )
         except Exception as e:  # search() is a capture path; be equally safe
             logger.warning("eval: search failed for %r: %s", query[:40], e)

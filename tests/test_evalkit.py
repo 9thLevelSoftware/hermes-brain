@@ -269,3 +269,42 @@ def test_vec_is_skipped_when_the_index_is_empty(conn, tmp_home):
     report = run_comparison(conn, queries, embedder=_FakeEmbedder(), reranker=None)
     by_name = {r["name"]: r for r in report["results"]}
     assert "no vector index" in by_name["+vec"]["skipped"]
+
+
+# ---------------------------------------------------------------------------
+# score_weights + best-available (§G1, §G3)
+# ---------------------------------------------------------------------------
+
+def test_score_weights_measures_a_candidate_without_applying_it(conn, tmp_home):
+    from brain.evalkit.compare import score_weights
+    from brain.recall import weights as weights_mod
+
+    uids = _seed(conn, 6)
+    queries = [{"query": "staging database number 0", "gold": [uids[0]],
+                "source_kind": "memory", "source_uid": uids[0]}]
+
+    result = score_weights(conn, queries, {"fts": 2.0, "vec": 0.5},
+                           embedder=None, reranker=None)
+    assert result.n == 1
+    assert weights_mod.load(conn) == weights_mod.DEFAULT, "measuring must not commit"
+
+
+def test_score_weights_none_scores_the_active_set(conn, tmp_home):
+    from brain.evalkit.compare import score_weights
+
+    uids = _seed(conn, 4)
+    queries = [{"query": "staging database number 0", "gold": [uids[0]],
+                "source_kind": "memory", "source_uid": uids[0]}]
+    assert score_weights(conn, queries, None, embedder=None).n == 1
+
+
+def test_best_available_reflects_what_is_actually_present(conn):
+    """A fixed `all` row is unreachable whenever a leg's model is missing, so
+    you cannot see your real stack — the exact blind spot evalkit exists to
+    prevent."""
+    from brain.evalkit.compare import _best_available
+
+    cfg = _best_available(conn, embedder=None, reranker=None)
+    assert cfg.name == "best-available"
+    assert cfg.vec is False and cfg.rerank is False
+    assert cfg.graph is True and cfg.facts is True

@@ -541,6 +541,19 @@ def resolve_uid(conn: sqlite3.Connection, prefix: Any, *,
         params.append(ctx.principal_id or "")
     rows = conn.execute(sql + " LIMIT 5", params).fetchall()
     if not rows:
+        # Before reporting a miss, check whether this uid lives in a LINKED
+        # profile — otherwise drilling into a hit the caller was just shown
+        # fails with "not found", which is both wrong and unhelpful. Only for
+        # an owner-trust caller, matching who may traverse a link at all.
+        if ctx is not None and ctx.trust_tier == "owner":
+            origin = _find_in_links(conn, like)
+            if origin:
+                raise _ToolError(
+                    f"id '{prefix}' lives in the linked profile '{origin}', which "
+                    f"is read-only from here",
+                    f"read it there: hermes brain why {prefix} "
+                    f"(run inside the '{origin}' profile's HERMES_HOME)",
+                )
         raise _not_found(prefix)
     if len(rows) > 1:
         listing = ", ".join(r["uid"][:12] for r in rows)
@@ -550,6 +563,32 @@ def resolve_uid(conn: sqlite3.Connection, prefix: Any, *,
             f'brain_recall(id="{rows[0]["uid"][:12]}")',
         )
     return rows[0]
+
+
+def _find_in_links(conn: sqlite3.Connection, like: str) -> str | None:
+    """Name of the linked profile holding this uid prefix, or None.
+
+    Read-only and best-effort: this only improves an error message, so an
+    unreachable link must cost nothing.
+    """
+    try:
+        from .store import links as links_mod
+
+        for link in links_mod.enabled(conn):
+            remote = links_mod.open_link(link)
+            if remote is None:
+                continue
+            try:
+                hit = remote.execute(
+                    "SELECT 1 FROM memories WHERE uid LIKE ? ESCAPE '\\' LIMIT 1",
+                    (like + "%",)).fetchone()
+                if hit:
+                    return link["name"]
+            finally:
+                remote.close()
+    except Exception:
+        logger.debug("link uid lookup failed", exc_info=True)
+    return None
 
 
 def _not_found(prefix: str) -> _ToolError:
@@ -678,6 +717,20 @@ def _recall(conn: sqlite3.Connection, args: dict, ctx: ToolContext) -> dict:
         trust_tier=ctx.trust_tier,
         embedder=ctx.embedder,
     )
+    # Cross-profile recall. A no-op unless the caller is owner-trust AND links
+    # are registered — an MCP/gateway session at 'tool' or 'known_user' trust
+    # returns here unchanged (recall/linked.py enforces it, not this call site).
+    try:
+        from .recall.linked import search_linked
+
+        hits = search_linked(
+            conn, query, local_hits=hits, trust_tier=ctx.trust_tier, limit=limit,
+            link_weight=float(ctx.config.get("link_weight", 0.85)),
+            embedder=ctx.embedder,
+            kinds=[kind] if kind else None, scope_project=project,
+        )
+    except Exception:  # capture path — linked recall must never break a tool call
+        logger.debug("brain_recall: linked search skipped", exc_info=True)
 
     if depth == "deep":
         from .recall.search import _memories_by_ids

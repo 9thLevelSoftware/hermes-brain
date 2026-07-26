@@ -1063,6 +1063,23 @@ class BrainProvider(MemoryProvider):
                     facts=facts_leg_on,
                     intent_bias=intent_bias,
                 )
+            # Cross-profile lane 2 is OPT-IN (link_lane2, default off). Lane 2
+            # is the cache-safe hot path; a second database read on every turn
+            # is latency and blast radius for a feature whose value is mostly
+            # on-demand. Owner sessions only — enforced inside search_linked.
+            if self._config.get("link_lane2", False):
+                try:
+                    from .recall.linked import search_linked
+
+                    hits = search_linked(
+                        conn, query_text, local_hits=hits, trust_tier=trust_tier,
+                        limit=8,
+                        link_weight=float(self._config.get("link_weight", 0.85)),
+                        embedder=self._embedder, reranker=self._reranker,
+                        exclude_kinds=exclude_kinds,
+                    )
+                except Exception:
+                    logger.debug("brain: linked lane-2 skipped", exc_info=True)
             hits = _diversify(hits, mmr_lambda, 8)
             if use_cache:
                 self._query_cache.put(query_text, kinds=None, scope=cache_scope, hits=hits)

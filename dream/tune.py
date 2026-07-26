@@ -41,6 +41,10 @@ _MIN_SAMPLES = 5             # per-memory resolved injections to count (item 28)
 _MIN_BUCKET = 8             # memories on each side of a contrast
 _ACCEPT_DELTA = 0.05        # Wilson lower bound on the rate diff to propose
 _MIN_FIT_ROWS = 500         # labeled retrieval_log rows before a weight fit (§3.7)
+# Below this many eval queries a measured delta is noise dressed as evidence —
+# the first retrieval measurement produced a "3.7% regression" that was two
+# queries out of 71 (alignment-audit.md §F3). Say "cannot measure" instead.
+_MIN_MEASURE_QUERIES = 30
 _PROMPT_VERSION = "tune-v1"
 
 # The live weights `recall/search._modulate` uses, as the tuning baseline.
@@ -103,8 +107,71 @@ def _run(shift: Shift) -> dict:
             return {"samples": len(rows), "skipped": "insufficient_evidence"}
         return counts
 
-    _record_proposal(shift, proposals, fusion_weights, counts)
+    measured = _measure_fit(shift, fusion_weights)
+    if measured and measured.get("delta") is not None:
+        counts["measured_delta"] = round(measured["delta"], 4)
+    _record_proposal(shift, proposals, fusion_weights, counts, measured)
     return counts
+
+
+def _unmeasured(why: str) -> dict:
+    """An explicit ``delta: None`` plus the reason.
+
+    Omitting the key would make "could not measure" indistinguishable from
+    "measured, no change" for anything reading the stored payload later.
+    """
+    return {"delta": None, "why": why}
+
+
+def _measure_fit(shift: Shift, fusion_weights: dict | None) -> dict | None:
+    """Score the fitted weights against the CURRENT ones on the owner's query
+    set, so the proposal can state what it would actually do.
+
+    Without this, approving a tune proposal is a leap: the operator is asked to
+    move live retrieval on the strength of a fit they cannot see the effect of.
+    Returns ``{"before","after","delta","n"}``, or ``{"why": ...}`` when there
+    is nothing to measure with — a proposal that CANNOT demonstrate an
+    improvement must say so rather than imply one by staying silent.
+
+    Never raises: a measurement failure degrades to an unmeasured proposal,
+    which is exactly what shipped before this existed.
+    """
+    if not fusion_weights:
+        return None
+    home = shift.config.get("hermes_home")
+    if not home:
+        return _unmeasured("no hermes_home in config — cannot locate the query set")
+    try:
+        from ..evalkit import load_queryset
+        from ..evalkit.compare import score_weights
+        from ..recall import weights as weights_mod
+
+        data = load_queryset(home)
+        if not data or not data.get("queries"):
+            return _unmeasured("no query set — run 'hermes brain eval --generate'")
+        queries = data["queries"]
+        if len(queries) < _MIN_MEASURE_QUERIES:
+            return _unmeasured(f"only {len(queries)} queries; need "
+                               f"{_MIN_MEASURE_QUERIES} to measure meaningfully")
+        candidate = weights_mod.from_proposal({"fusion_weights": fusion_weights})
+        if candidate is None:
+            return _unmeasured("fitted weights are not applicable")
+
+        embedder = getattr(shift, "embedder", None)
+        before = score_weights(shift.conn, queries, None, embedder=embedder)
+        after = score_weights(shift.conn, queries, candidate, embedder=embedder)
+        if before.n == 0 or after.n == 0:
+            return _unmeasured("no scorable queries")
+        return {
+            "before": round(before.mrr, 4),
+            "after": round(after.mrr, 4),
+            "delta": round(after.mrr - before.mrr, 4),
+            "n": after.n,
+            "metric": "MRR",
+        }
+    except Exception as e:
+        logger.warning("tune: could not measure the fit: %s", e)
+        return _unmeasured(f"measurement failed ({e})")
 
 
 def _feature_contrasts(rows) -> list:
@@ -164,7 +231,7 @@ def _fit_fusion_weights(shift: Shift) -> dict | None:
 
 
 def _record_proposal(shift: Shift, proposals: list, fusion_weights: dict | None,
-                     counts: dict) -> None:
+                     counts: dict, measured: dict | None = None) -> None:
     """Record ONE tuning proposal (status=shadow) + a shadow audit, folding in
     BOTH signals. Never supersede a still-open one — accumulate across nights.
 
@@ -181,6 +248,11 @@ def _record_proposal(shift: Shift, proposals: list, fusion_weights: dict | None,
     if fusion_weights:
         payload_obj["fusion_weights"] = fusion_weights
         evidence.append("fusion_weights")
+    if measured:
+        # Carried so `review` can show what this proposal would DO, not just
+        # what it fitted. A `why` (no query set / too few queries) is recorded
+        # just as deliberately as a delta: silence would read as "no effect".
+        payload_obj["measured"] = measured
     payload = json.dumps(payload_obj)
     signals = len(proposals) + (1 if fusion_weights else 0)
     now = db.iso_now()

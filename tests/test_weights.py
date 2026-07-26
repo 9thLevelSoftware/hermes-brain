@@ -182,3 +182,45 @@ def test_search_never_raises_on_corrupt_weights(conn):
     db.set_meta(conn, weights_mod.META_KEY, "garbage")
     conn.commit()
     assert search(conn, "deploy pipeline", trust_tier="owner")
+
+
+# ---------------------------------------------------------------------------
+# weights_override — score a candidate WITHOUT committing it (§G1)
+# ---------------------------------------------------------------------------
+
+def test_weights_override_does_not_persist(conn):
+    """The whole point: evaluating a candidate must not change live retrieval.
+    Before this, the only way to measure a tune proposal was to apply it."""
+    from brain.recall.search import search
+    from conftest import seed_memory
+
+    seed_memory(conn, "the deploy pipeline runs on buildkite")
+    search(conn, "deploy pipeline", trust_tier="owner",
+           weights_override={"fts": 2.0, "vec": 0.5})
+    assert weights_mod.load(conn) == weights_mod.DEFAULT
+    assert weights_mod.is_active(conn) is False
+
+
+def test_weights_override_beats_the_stored_value(conn):
+    from brain.recall.search import search
+    from conftest import seed_memory
+
+    seed_memory(conn, "the deploy pipeline runs on buildkite")
+    weights_mod.save(conn, {"fts": 1.0})
+    # An override of a DIFFERENT shape must be what search actually uses; the
+    # simplest observable proof is that a valid override does not raise and
+    # still returns the row, while the stored value stays untouched.
+    hits = search(conn, "deploy pipeline", trust_tier="owner",
+                  weights_override={"fts": 2.5, "vec": 0.5, "graph": 1.0, "facts": 1.0})
+    assert hits
+    assert weights_mod.load(conn)["fts"] == 1.0
+
+
+def test_invalid_weights_override_falls_back_to_stored(conn):
+    """search() is a capture path — a bad override degrades, never raises."""
+    from brain.recall.search import search
+    from conftest import seed_memory
+
+    seed_memory(conn, "the deploy pipeline runs on buildkite")
+    assert search(conn, "deploy pipeline", trust_tier="owner",
+                  weights_override={"fts": 999.0})

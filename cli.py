@@ -201,6 +201,14 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     p_whynot.add_argument("query", help="the search query")
     p_whynot.add_argument("uid", help="uid prefix of the memory you expected")
 
+    p_link = cmds.add_parser("link", help="link another profile's brain (read-only)")
+    p_link.add_argument("name", help="a short name for the linked profile")
+    p_link.add_argument("--home", required=True, metavar="PATH",
+                        help="that profile's HERMES_HOME")
+    p_unlink = cmds.add_parser("unlink", help="remove a profile link")
+    p_unlink.add_argument("name", help="the link name")
+    cmds.add_parser("links", help="list linked profiles")
+
     p_w = cmds.add_parser("weights", help="active retrieval-leg weights (show | reset)")
     w_sub = p_w.add_subparsers(dest="weights_command")
     w_sub.add_parser("show", help="show the active per-leg weights and their source")
@@ -254,6 +262,7 @@ def brain_command(args: argparse.Namespace) -> int:
         "insights": cmd_insights, "review": cmd_review, "skills": cmd_skills,
         "sync": cmd_sync, "weights": cmd_weights,
         "import-provider": cmd_import_provider, "why-not": cmd_why_not,
+        "link": cmd_link, "unlink": cmd_unlink, "links": cmd_links,
         "mcp": cmd_mcp, "adopt-memory": cmd_adopt_memory,
     }.get(cmd)
     if handler is None:
@@ -508,6 +517,16 @@ def cmd_search(args: argparse.Namespace) -> int:
             include_episodes=args.episodes,
             embedder=embedder,
             reranker=reranker,
+        )
+        # The CLI is always the owner speaking, so links apply here.
+        from .recall.linked import search_linked
+
+        hits = search_linked(
+            conn, query, local_hits=hits, trust_tier="owner", limit=args.limit,
+            link_weight=float(cfg.get("link_weight", 0.85)),
+            embedder=embedder, reranker=reranker,
+            kinds=[args.kind] if args.kind else None,
+            scope_project=args.project, include_episodes=args.episodes,
         )
         if not hits:
             print("(no matches)")
@@ -976,6 +995,29 @@ def _doctor_p2_checks(conn, cfg: dict, report) -> None:
 # bootstrap
 # ---------------------------------------------------------------------------
 
+def _measured_note(payload: object) -> str:
+    """One line describing what a tuning proposal would actually DO.
+
+    A proposal that could not be measured says so explicitly. Silence would
+    read as "measured, no effect", which is the failure mode this whole
+    subsystem keeps running into (alignment-audit.md §F3/§G1).
+    """
+    try:
+        data = json.loads(payload or "{}")
+    except (ValueError, TypeError):
+        return ""
+    measured = data.get("measured")
+    if not isinstance(measured, dict):
+        return ""
+    if measured.get("delta") is None:
+        return f"NOT MEASURED: {measured.get('why') or 'unknown'}"
+    delta = measured["delta"]
+    verdict = "improves" if delta > 0 else ("no change" if delta == 0 else "REGRESSES")
+    return (f"measured: {measured.get('metric', 'MRR')} "
+            f"{measured.get('before')} -> {measured.get('after')} "
+            f"({delta:+.4f}, n={measured.get('n')}) — {verdict}")
+
+
 def _approve_tuning(conn, home: Path, row) -> int:
     """Apply an approved tune proposal's fitted weights to live retrieval.
 
@@ -1000,6 +1042,17 @@ def _approve_tuning(conn, home: Path, row) -> int:
               "dream run with enough labeled retrievals to fit weights.",
               file=sys.stderr)
         return 1
+
+    note = _measured_note(row["payload"])
+    if note:
+        print(note)
+        if "REGRESSES" in note:
+            print("  WARNING: this proposal measured WORSE than the current weights.\n"
+                  "  Applying anyway is your call — 'hermes brain weights reset' reverts.")
+        elif "NOT MEASURED" in note:
+            print("  No evidence either way. Generate a query set first if you want "
+                  "one: hermes brain eval --generate")
+        print()
 
     before = weights_mod.load(conn)
     weights_mod.save(conn, fitted)
@@ -1206,6 +1259,66 @@ def _why_not_tokens(text: str) -> list[str]:
     from .recall.search import _tokens
 
     return _tokens(text or "")
+
+
+def cmd_link(args: argparse.Namespace) -> int:
+    from .store import links as links_mod
+
+    conn = _open_db(_hermes_home())
+    if conn is None:
+        return 1
+    try:
+        entry = links_mod.add(conn, args.name, args.home)
+    except ValueError as e:
+        print(f"cannot link: {e}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+    print(f"linked            {entry['name']} -> {entry['hermes_home']}")
+    print("  Read-only, and traversed only for OWNER-trust callers: a gateway\n"
+          "  peer or an MCP session never sees linked memories.\n"
+          "  Lane-2 injection stays local unless you set link_lane2: true.")
+    return 0
+
+
+def cmd_unlink(args: argparse.Namespace) -> int:
+    from .store import links as links_mod
+
+    conn = _open_db(_hermes_home())
+    if conn is None:
+        return 1
+    try:
+        if not links_mod.remove(conn, args.name):
+            print(f"no link named {args.name!r} — 'hermes brain links' lists them",
+                  file=sys.stderr)
+            return 1
+    finally:
+        conn.close()
+    print(f"unlinked          {args.name}")
+    return 0
+
+
+def cmd_links(args: argparse.Namespace) -> int:
+    from .store import db
+    from .store import links as links_mod
+
+    conn = _open_db(_hermes_home())
+    if conn is None:
+        return 1
+    try:
+        registered = links_mod.load(conn)
+    finally:
+        conn.close()
+    if not registered:
+        print("no linked profiles.\n"
+              "  Link one:  hermes brain link coder --home /path/to/other/HERMES_HOME")
+        return 0
+    for link in registered:
+        target = db.db_path(Path(link["hermes_home"]))
+        state = "enabled" if link["enabled"] else "disabled"
+        reachable = "ok" if target.is_file() else "MISSING"
+        print(f"{link['name']:<16} {state:<9} {reachable:<8} {target}")
+    return 0
 
 
 def cmd_weights(args: argparse.Namespace) -> int:
@@ -2692,7 +2805,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         if args.approve or args.reject:
             return _review_decide(conn, args)
         props = conn.execute(
-            "SELECT uid, kind, title, status, created_at FROM proposals "
+            "SELECT uid, kind, title, status, payload, created_at FROM proposals "
             "WHERE status IN ('pending','shadow','validated','approved') "
             "ORDER BY created_at DESC LIMIT 50").fetchall()
         quar = conn.execute(
@@ -2706,6 +2819,9 @@ def cmd_review(args: argparse.Namespace) -> int:
             print(f"proposals ({len(props)}):")
             for p in props:
                 print(f"  {p['uid'][:8]}  {p['kind']:16} {p['status']:10} {p['title'][:48]}")
+                note = _measured_note(p["payload"])
+                if note:
+                    print(f"            {note}")
             print("  decide: hermes brain review --approve <uid> | --reject <uid>")
         if quar:
             print(f"\nquarantined memories ({len(quar)}):")

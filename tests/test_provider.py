@@ -157,7 +157,9 @@ def test_recall_mode_lane1_is_byte_stable(tmp_home, mode):
     """Lane 1 is byte-stable for the session under EVERY recall_mode — the mode
     is read once at initialize(), so it can never move the prompt prefix
     mid-session (invariant #1)."""
-    brain_config.save_config(tmp_home, {"recall_mode": mode})
+    # fts-only: this pins lane-1 BYTE STABILITY across modes, not retrieval
+    # quality — loading a real ONNX embedder here just adds seconds.
+    brain_config.save_config(tmp_home, {"recall_mode": mode, "mode": "fts-only"})
     provider = _make(tmp_home, f"sess-rm-{mode}")
     baseline = provider.system_prompt_block()
     for i in range(1, 26):
