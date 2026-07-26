@@ -100,6 +100,8 @@ hermes brain why-not <query> <id>                    # why a memory did NOT surf
 hermes brain eval --generate | --sample K | --compare # measure retrieval on your own corpus
 hermes brain weights show | reset                    # active retrieval-leg weights
 hermes brain import-provider <name> [--apply]        # migrate from another memory provider
+hermes brain link <name> --home <path> | unlink | links   # read another profile's brain
+hermes brain export --full | import <manifest.json>  # complete, re-importable snapshot
 hermes brain dream --if-due                          # cron entry point
 hermes brain dream --enable/--disable <strategy>     # promote a strategy
 hermes brain insights                                # longitudinal learning metrics

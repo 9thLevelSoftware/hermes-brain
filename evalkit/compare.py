@@ -80,7 +80,34 @@ def _vector_index_present(conn) -> bool:
         return False
 
 
-def _run_one(conn, queries, cfg: Config, *, embedder, reranker) -> Result:
+def score_weights(conn, queries, weights: dict[str, float] | None, *,
+                  embedder=None, reranker=None) -> Result:
+    """Score ONE candidate weight set over the query set, without applying it.
+
+    This is what makes approving a tune proposal an evidence-based decision
+    rather than a leap: `dream/tune.py` fits weights and can now say what they
+    would actually do, measured, before anyone commits them. ``weights=None``
+    scores whatever is currently active.
+    """
+    cfg = _best_available(conn, embedder=embedder, reranker=reranker)
+    return _run_one(conn, queries, cfg, embedder=embedder, reranker=reranker,
+                    weights_override=weights)
+
+
+def _best_available(conn, *, embedder, reranker) -> Config:
+    """The richest configuration this install can actually run right now.
+
+    A fixed `all` row is unreachable whenever any leg's model is missing, which
+    reproduces the exact failure evalkit exists to prevent: you cannot see your
+    real stack, so a leg that never ran is indistinguishable from a leg that
+    did not help.
+    """
+    vec = embedder is not None and _vector_index_present(conn)
+    return Config("best-available", vec, vec and reranker is not None, True, True)
+
+
+def _run_one(conn, queries, cfg: Config, *, embedder, reranker,
+             weights_override: dict[str, float] | None = None) -> Result:
     from ..recall.search import search
 
     if cfg.vec and embedder is None:
@@ -110,6 +137,7 @@ def _run_one(conn, queries, cfg: Config, *, embedder, reranker) -> Result:
                 reranker=reranker if cfg.rerank else None,
                 graph=cfg.graph,
                 facts=cfg.facts,
+                weights_override=weights_override,
             )
         except Exception as e:  # search() is a capture path; be equally safe
             logger.warning("eval: search failed for %r: %s", query[:40], e)
@@ -143,6 +171,7 @@ def run_comparison(
     *,
     embedder=None,
     reranker=None,
+    weights_override: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Score every configuration over the same queries.
 
@@ -151,8 +180,15 @@ def run_comparison(
     silently scoring as the baseline — an absent reranker producing identical
     numbers is exactly how the first run reported a stage that never executed.
     """
-    results = [_run_one(conn, queries, cfg, embedder=embedder, reranker=reranker)
-               for cfg in CONFIGURATIONS]
+    # `best-available` is computed from the legs actually present, so the real
+    # stack is always visible. The fixed `all` row below stays, and stays
+    # SKIPPED when something is missing — the gap must still be reported, not
+    # hidden behind a row that happens to run.
+    configs = [*CONFIGURATIONS, _best_available(conn, embedder=embedder,
+                                               reranker=reranker)]
+    results = [_run_one(conn, queries, cfg, embedder=embedder, reranker=reranker,
+                        weights_override=weights_override)
+               for cfg in configs]
     by_name = {r.name: r for r in results}
     base = by_name.get(BASELINE)
     paired: dict[str, dict[str, int]] = {}
@@ -171,14 +207,19 @@ def run_comparison(
     }
 
 
-def format_report(report: dict[str, Any]) -> str:
+def format_report(report: dict[str, Any], baseline: dict[str, Any] | None = None) -> str:
     """Human-readable table. Paired counts sit next to the means on purpose:
     reading a mean without them is how noise gets mistaken for a finding."""
     k = report.get("k", K)
+    prior = {}
+    if baseline:
+        prior = {r["name"]: r for r in baseline.get("results", [])
+                 if not r.get("skipped")}
+    delta_head = "   ΔMRR vs saved" if prior else ""
     lines = [
         f"{'configuration':<16} {'P@' + str(k):>7} {'MRR':>7} {'n':>5}   "
-        f"vs {BASELINE} (win/loss/tie)",
-        "-" * 74,
+        f"vs {BASELINE} (win/loss/tie){delta_head}",
+        "-" * (74 + len(delta_head)),
     ]
     for row in report.get("results", []):
         if row.get("skipped"):
@@ -189,8 +230,12 @@ def format_report(report: dict[str, Any]) -> str:
         cell = ""
         if pair:
             cell = f"{pair['win']} / {pair['loss']} / {pair['tie']}"
+        delta = ""
+        was = prior.get(row["name"])
+        if was:
+            delta = f"   {row['mrr'] - was['mrr']:+.4f}"
         lines.append(f"{row['name']:<16} {row['p_at_k']:>7.3f} {row['mrr']:>7.3f} "
-                     f"{row['n']:>5}   {cell}")
+                     f"{row['n']:>5}   {cell:<26}{delta}")
     n = next((r["n"] for r in report.get("results", []) if not r.get("skipped")), 0)
     if 0 < n < 100:
         lines.append("")

@@ -61,6 +61,30 @@ c.save_config("/hermes-home", {"recall_mode": "hybrid"})
 print("[ok] dashboard config.json mirror round-trips")
 PY
 
+# 1b2. Tool ROUTING (alignment-audit §G6). `add_provider` builds
+#      `_tool_to_provider` BEFORE initialize(); when get_tool_schemas() gated on
+#      _initialized that map came out empty and every brain tool the model
+#      called returned "Unknown tool", while the schemas still appeared in the
+#      agent's advertised list. Assert the map is actually populated.
+RUN python - <<'PY'
+import importlib.util, pathlib, sys
+
+root = pathlib.Path("/hermes-home/plugins/brain")
+spec = importlib.util.spec_from_file_location(
+    "brain", root / "__init__.py", submodule_search_locations=[str(root)])
+mod = importlib.util.module_from_spec(spec); sys.modules["brain"] = mod
+spec.loader.exec_module(mod)
+from agent.memory_manager import MemoryManager
+from brain.provider import BrainProvider
+
+mm = MemoryManager()
+mm.add_provider(BrainProvider())        # the host does this BEFORE initialize()
+routed = sorted(mm._tool_to_provider)
+assert "brain_recall" in routed, f"routing map is empty/incomplete: {routed}"
+assert "memories" in routed, f"memories not routable: {routed}"
+print(f"[ok] tool routing populated pre-initialize: {routed}")
+PY
+
 # 1c. The `memories` tool (alignment-audit C4) must be advertised on the MCP
 #     surface and must refuse a path outside /memories.
 RUN printf '%s\n%s\n' \

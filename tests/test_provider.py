@@ -157,7 +157,9 @@ def test_recall_mode_lane1_is_byte_stable(tmp_home, mode):
     """Lane 1 is byte-stable for the session under EVERY recall_mode — the mode
     is read once at initialize(), so it can never move the prompt prefix
     mid-session (invariant #1)."""
-    brain_config.save_config(tmp_home, {"recall_mode": mode})
+    # fts-only: this pins lane-1 BYTE STABILITY across modes, not retrieval
+    # quality — loading a real ONNX embedder here just adds seconds.
+    brain_config.save_config(tmp_home, {"recall_mode": mode, "mode": "fts-only"})
     provider = _make(tmp_home, f"sess-rm-{mode}")
     baseline = provider.system_prompt_block()
     for i in range(1, 26):
@@ -265,5 +267,44 @@ def test_get_status_config_prefers_the_injected_profile(tmp_home, tmp_path, monk
     provider = _make(tmp_home, "sess-profile")
     try:
         assert provider.get_status_config({})["db"] == str(db.db_path(tmp_home))
+    finally:
+        provider.shutdown()
+
+
+def test_linked_lane2_results_are_not_query_cached(tmp_home, tmp_path):
+    """query_cache keys on the LOCAL mem_generation, which a write in another
+    profile cannot bump and which linking/unlinking does not touch. Caching a
+    merged result would make a long-running gateway serve memories from an
+    unlinked profile indefinitely (PR #9 review, P2)."""
+    other = tmp_path / "other_home"
+    other.mkdir()
+    oconn = db.connect(other)
+    try:
+        seed_memory(oconn, "the other profile knows about flux_capacitor venting")
+    finally:
+        oconn.close()
+
+    conn = db.connect(tmp_home)
+    try:
+        from brain.store import links as links_mod
+
+        links_mod.add(conn, "other", str(other))
+    finally:
+        conn.close()
+
+    brain_config.save_config(tmp_home, {"mode": "fts-only", "link_lane2": True,
+                                        "bootstrap_import": False})
+    provider = _make(tmp_home, "sess-linkcache")
+    query = "how do I vent the flux_capacitor"
+    provider.queue_prefetch(query, session_id="sess-linkcache")
+    result = poll_until(
+        lambda: provider.prefetch(query, session_id="sess-linkcache") or None,
+        timeout=5.0)
+    try:
+        assert result and "flux" in result.lower(), "sanity: linked lane 2 served"
+        assert provider._query_cache.get(
+            db.connect(tmp_home), query, kinds=None,
+            scope=("sess-linkcache", "owner", "", "owner"), embedder=None) is None, \
+            "a result containing linked rows must not be cached"
     finally:
         provider.shutdown()

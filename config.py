@@ -27,6 +27,15 @@ DEFAULTS: dict[str, Any] = {
     #   tools   = tools only; lane 1 static, lane 2 empty
     # Operator surfaces (CLI, MCP) are deliberately unaffected.
     "recall_mode": "hybrid",     # hybrid | context | tools
+    # -- cross-profile links (store/links.py, recall/linked.py) --
+    # Linked profiles are searched only for an OWNER-trust caller, always
+    # read-only, and fused at a slight discount: another profile is relevant
+    # context but it is not THIS conversation's.
+    "link_weight": 0.85,
+    # Include linked profiles in the per-turn lane-2 injection. OFF: lane 2 is
+    # the cache-safe hot path, and a second database read per turn is latency
+    # and blast radius for a feature whose value is mostly on-demand.
+    "link_lane2": False,
     "dream_schedule": "auto",    # cron | on-idle | manual | auto
     "dream_time": "03:30",
     "dream_min_interval_hours": 6,  # dream --if-due no-ops within this window

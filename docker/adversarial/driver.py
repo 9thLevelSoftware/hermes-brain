@@ -103,15 +103,24 @@ def _wait(pred, timeout=8.0, interval=0.1):
 # Strategy A: real AIAgent turns
 # ---------------------------------------------------------------------------
 
-def _make_agent(session_id: str | None = None):
+def _make_agent(session_id: str | None = None, scenario: str | None = None):
+    """`scenario` rides the MODEL string (``mock-main@<scenario>``).
+
+    That is the only channel that works from here: MOCK_SCENARIO is read by the
+    mock SERVER process, which was started separately with its own environment,
+    so setting it in this process does nothing. Hermes forwards the configured
+    model string verbatim, which is why the mock documents this as the reliable
+    per-call channel.
+    """
     os.environ.setdefault("HERMES_YOLO_MODE", "1")
     os.environ.setdefault("HERMES_ACCEPT_HOOKS", "1")
     from run_agent import AIAgent
 
     kwargs = dict(
         base_url=MOCK_BASE_URL, api_key=MOCK_API_KEY, provider="custom",
-        api_mode="chat_completions", model="mock-main", platform="cli",
-        max_iterations=4, quiet_mode=True,
+        api_mode="chat_completions",
+        model=f"mock-main@{scenario}" if scenario else "mock-main",
+        platform="cli", max_iterations=4, quiet_mode=True,
     )
     if session_id:
         kwargs["session_id"] = session_id
@@ -291,6 +300,53 @@ def cmd_hook(name: str) -> int:
     return 0 if ok else 1
 
 
+def cmd_memories_tool() -> int:
+    """Drive the brain's `memories` tool through a REAL agent turn.
+
+    Until this existed no model had ever issued a `memories` call — the tool
+    was thoroughly unit-tested and never exercised through Hermes's own tool
+    dispatch (alignment-audit.md §F5/§G4). Two scenarios:
+
+      write      the model creates a topic file; the memory must actually land
+      traversal  the model aims outside /memories; it must be REFUSED, and the
+                 turn must survive (a refused tool call is not a crashed agent)
+    """
+    home = os.environ["HERMES_HOME"]
+    before = _counts(home)[2]
+
+    agent = _make_agent("adv-memories-1", scenario="tool_call_memories_write")
+    _run_turn(agent, "Please record how staging deploys work.")
+
+    ok = _wait(lambda: _counts(home)[2] > before, timeout=10.0)
+    if not ok:
+        print("[A] FAIL: the memories tool wrote nothing")
+        return 1
+    conn = sqlite3.connect(_brain_db_path(home))
+    try:
+        row = conn.execute(
+            "SELECT content, tags FROM memories WHERE content LIKE '%VPN%'"
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        print("[A] FAIL: the created memory is not in the store")
+        return 1
+    if "deployment" not in (row[1] or ""):
+        print(f"[A] FAIL: topic tag missing (tags={row[1]!r})")
+        return 1
+    print(f"[A] OK: memories create round-tripped -> {row[0][:60]!r} tags={row[1]}")
+
+    # ...and the traversal attempt must be refused without killing the turn.
+    after_write = _counts(home)[2]
+    agent = _make_agent("adv-memories-2", scenario="tool_call_memories_traversal")
+    _run_turn(agent, "Show me the system password file.")
+    if _counts(home)[2] < after_write:
+        print("[A] FAIL: a refused traversal call lost data")
+        return 1
+    print("[A] OK: /memories traversal refused; the turn survived")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if not os.environ.get("HERMES_HOME"):
         print("HERMES_HOME not set", file=sys.stderr)
@@ -316,6 +372,8 @@ def main(argv: list[str]) -> int:
         return cmd_compress()
     if cmd == "hook":
         return cmd_hook(rest[0]) if rest else 2
+    if cmd == "memories-tool":
+        return cmd_memories_tool()
     print(f"unknown command {cmd!r}", file=sys.stderr)
     return 2
 

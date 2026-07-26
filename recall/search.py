@@ -72,6 +72,11 @@ class Hit:
     platform: str | None
     score: float
     source: str                     # 'fts' | 'vec' | 'fts+vec' | 'like'
+    # Which profile this row came from. None = the local brain. A non-None
+    # value means the row lives in ANOTHER database, so `id` (a rowid) is
+    # meaningless here and any write keyed on it would hit the wrong row —
+    # see recall/linked.py and search.log_retrieval.
+    profile: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +192,7 @@ def search(
     graph: bool = True,
     facts: bool = True,
     intent_bias: bool = False,
+    weights_override: dict[str, float] | None = None,
     diversify: bool = False,
     mmr_lambda: float = 0.7,
 ) -> list[Hit]:
@@ -320,7 +326,13 @@ def search(
         try:
             from . import weights as weights_mod
 
-            active = weights_mod.load(conn)
+            # weights_override lets a CANDIDATE weight set be scored without
+            # committing it. Without this the only way to evaluate a tune
+            # proposal was to apply it first and measure afterwards, which is
+            # exactly backwards — see evalkit.compare.score_weights and
+            # dream/tune.py's measured delta.
+            active = (weights_mod.validate(weights_override) or weights_mod.load(conn)
+                      if weights_override is not None else weights_mod.load(conn))
             if intent_bias:
                 # Per-query intent multipliers ON TOP of the approved base
                 # weights. Opt-in only (`intent_weighting: active`); the
@@ -728,7 +740,15 @@ def log_retrieval(
     `messages`, so only the raw text works.
     """
     try:
-        mem_hits = [h for h in hits if h.kind == "memory"]
+        # `h.profile is None` is load-bearing, not defensive: retrieval_log
+        # and the recall-count bump key on `h.id`, which is a ROWID. A hit from
+        # a linked profile carries that profile's rowid, so writing it here
+        # would credit — and eventually reweight and forget — a completely
+        # unrelated local memory that happens to share the number. Linked rows
+        # are read-only by construction (recall/linked.py); this is where that
+        # guarantee is enforced on the write side.
+        mem_hits = [h for h in hits
+                    if h.kind == "memory" and getattr(h, "profile", None) is None]
         # Guidance items (strategy/guardrail/case) are injected via the
         # learned-guidance subsection, not the fact search, but they are
         # memories rows too — logging them is what lets dream/mine credit a

@@ -40,6 +40,37 @@ def save_queryset(hermes_home: str | Path, queries: list[dict[str, Any]],
     return path
 
 
+def baseline_path(hermes_home: str | Path) -> Path:
+    return Path(hermes_home) / "brain" / "eval" / "baseline.json"
+
+
+def save_baseline(hermes_home: str | Path, report: dict[str, Any]) -> Path:
+    """Record a comparison run so a later one can show the DIFFERENCE.
+
+    Approving a tune proposal changes retrieval; without a stored before-run
+    there is nothing to compare the after-run against, which made
+    `_approve_tuning`'s "measure the effect" advice unactionable.
+    """
+    path = baseline_path(hermes_home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
+def load_baseline(hermes_home: str | Path) -> dict[str, Any] | None:
+    path = baseline_path(hermes_home)
+    try:
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        logger.warning("eval: baseline unreadable (%s)", e)
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def load_queryset(hermes_home: str | Path) -> dict[str, Any] | None:
     """Parsed query set, or None when absent/unreadable (never raises — the
     caller prints a remedy, it does not crash a CLI verb)."""

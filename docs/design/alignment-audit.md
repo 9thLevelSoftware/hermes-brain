@@ -383,3 +383,259 @@ Side effect worth noting: with `[full]` installable, ~50 previously-skipped
 tests now run, and three provider tests had to pin `mode: fts-only` — they were
 implicitly relying on no embedder being present, and a real ONNX load blew their
 poll deadlines.
+
+---
+
+# Cross-profile linking + my own outstanding gaps — 2026-07-26
+
+§F closed what running against real data found. This section closes the item §F
+deferred, plus three gaps that are **my own promises or my own false claims**
+rather than pre-existing debt. Recorded because the failure mode they share —
+shipping the mechanism and skipping the part that makes it trustworthy — is
+worth being able to point at later.
+
+## G1. The tune measured delta was promised and not built — **fixed**
+
+PR #8's plan (W5) said a tuning proposal would carry the measured quality delta
+against current weights, so approving it is evidence-based. I shipped the apply
+path and skipped the measurement, leaving `review --approve` telling the
+operator to go and measure it themselves.
+
+The missing primitive was a way to score a CANDIDATE weight set **without
+committing it** — until now the only way to evaluate a proposal was to apply it
+first, which is exactly backwards.
+
+* `search(..., weights_override=)` — score candidates, persist nothing.
+* `evalkit.compare.score_weights()` over the best-available leg configuration.
+* `dream/tune.py:_measure_fit` scores current vs fitted on the owner's query
+  set and embeds `{"before","after","delta","n","metric"}` in the proposal.
+* `review` and `--approve` print it; approving something that measured WORSE
+  prints a warning (still allowed — the operator decides).
+
+A proposal that cannot be measured records an explicit `delta: null` **plus the
+reason**. Omitting the key would make "could not measure" indistinguishable
+from "measured, no change" — the same confusion §F3 is about. Below 30 queries
+it declines to measure at all: the first real measurement's "3.7% regression"
+was two queries out of 71.
+
+## G2. Cross-profile linking — **built**
+
+`hermes profile create coder` gives you a second, empty brain and nothing
+follows. `hermes brain link <name> --home <path>` registers a sibling profile
+this one may READ.
+
+**Merged at the fusion layer, not in SQL.** Each linked profile is searched
+through its own `search()` on its own read-only connection; ranked lists go
+through `fusion.rrf()`. ATTACH+UNION would mean rewriting every statement to be
+attach-aware including FTS5 external-content and sqlite-vec virtual tables.
+Rank fusion is also the *correct* merge: scores are min-max normalized WITHIN a
+corpus, so 0.9 from a 50-row profile and 0.9 from a 5000-row one are not the
+same number. Merge keys on `(profile, uid)`, never uid alone — two profiles can
+hold the same memory (an import, a sync), and collapsing would let one row vote
+for itself twice.
+
+**The trust decision was the operator's, against my recommendation.** I
+proposed non-owner scoping for linked profiles (reusing the existing, already
+adversarially-tested guarantee); the operator chose full owner access, so a
+linked profile IS searched as its owner, `peer_card` rows included. The
+trade-off is real: a work profile can surface private characterizations of
+people from a personal profile.
+
+The guard that keeps that from becoming worse than it is:
+
+> **Links are traversed ONLY for an owner-trust caller.**
+
+A gateway peer, or an MCP session at `tool` trust, searches local only. Full
+owner access, scoped to owners — a link widens what the owner sees and can
+never be a privilege-escalation path. One comparison in `recall/linked.py`,
+pinned by parametrized tests over every non-owner tier plus an MCP-surface test.
+
+**Read-only in fact, not intent.** Connections are opened `mode=ro`, and
+`log_retrieval` filters linked hits explicitly. `Hit.id` is a ROWID, so a linked
+hit's id addresses a *different database* — logging it would credit, and
+eventually reweight and forget, whatever local memory shares that number.
+Drilling into a linked uid reports which profile owns it; mutations refuse and
+name it.
+
+Lane 2 stays local unless `link_lane2: true`. It is the cache-safe hot path and
+a second DB read per turn is latency and blast radius for a feature whose value
+is mostly on-demand.
+
+Registration refuses a self-link, a missing brain.db, a future-schema DB,
+duplicate names, and more than 8 links. A deleted, corrupt or unreachable link
+degrades to local-only; one broken link does not cost the others.
+
+## G3. `export` was documented "lossless" and was not — **fixed**
+
+`integration.md` §5.3 called the export "lossless, re-importable". It wrote
+**only current-truth memories**: no episodes, no fact triples, no entities, no
+edges, and no version history — which is to say it dropped exactly what
+`hermes brain why` reads back.
+
+`export --full` now writes a `manifest.json` plus per-table JSONL, with
+`memories` exported **without** the `valid_to`/`status` filter so superseded and
+tombstoned rows survive. `import` detects the manifest and restores every table
+with uids preserved, skipping uids that already exist so re-import is
+idempotent. The default remains memories-only (fast, human-facing) and now says
+so in its own output. The design doc carries a dated correction rather than a
+quiet edit.
+
+## G4. Eval blind spots and never-exercised paths — **fixed**
+
+* **`best-available`** is a configuration computed at runtime from the legs
+  actually present. The fixed `all` row was unreachable whenever any model was
+  missing, so you could not see your real stack — a reproduction of the very
+  failure `evalkit` exists to prevent. `all` remains, and remains SKIPPED when
+  something is absent, so the gap is still reported rather than hidden.
+* **A stored baseline.** `--compare --save-baseline` records a run; later runs
+  print a `ΔMRR vs saved` column. Without it, `_approve_tuning`'s "measure the
+  effect" advice had nothing to measure against.
+* **Cron job creation** is now exercised against an injected fake `cron.jobs`:
+  the call shape (`no_agent=True`, the schedule, a script that exists),
+  idempotency, decline, and a scheduler that raises. This does **not** make it
+  production-verified — cron is gateway-resident and no test environment has
+  one — but it moves from *unknown* to *known against a fake*.
+* **The `memories` tool** is now driven by the mock LLM through Hermes's real
+  tool dispatch in the live adversarial image: a `create` that must round-trip
+  into the store, and a traversal attempt that must be refused without killing
+  the turn. Same caveat: a mock is not a model.
+
+## G5. A test of mine was the slowest thing in the suite — **fixed**
+
+The dead-config-key guard added in §F6 walked the repo with `rglob("*.py")` and
+filtered afterwards. With a developer venv inside the repo that meant reading
+tens of thousands of site-packages files: **117 seconds**, the single slowest
+test in the suite. It also existed twice, in two near-copies with different
+strictness.
+
+Now one test, pruning with `os.walk` (2.3s), keeping the stricter rule —
+`config.py` declares keys and `brain_setup.py` only prompts for them, so
+neither counts as a reader, which is what makes it catch a wizard question
+nothing acts on.
+
+## Not built, deliberately
+
+**Bidirectional / writable links.** A link is a read. Writing through one would
+record a session and platform that never touched the target database, making
+provenance a lie. If cross-profile *writes* are ever wanted, the honest
+mechanism is the existing sync engine, not the link.
+
+## G6. The agent-facing tool surface had never worked — **fixed**
+
+The most serious finding in this pass, and the reason §G4's "exercise the
+never-exercised paths" was worth doing: adding a model-driven `memories` call
+to the live adversarial image produced
+
+    ⚡ memories  create  0.0s [Unknown tool: memories]
+
+Probing the running image showed `MemoryManager._tool_to_provider` — the map
+that ROUTES a tool call back to the provider — was **completely empty**. Not
+just for `memories`: `brain_recall`, `brain_remember`, `brain_outcome` and
+`brain_manage` were all unroutable. Every brain tool the model tried to call
+came back "Unknown tool".
+
+Root cause: `BrainProvider.get_tool_schemas()` opened with
+
+```python
+if not self._initialized:
+    return []
+```
+
+The host calls `get_tool_schemas()` **twice, at two different times**:
+
+* `MemoryManager.add_provider()` calls it to build the routing map — and that
+  runs BEFORE `initialize()`, so it got `[]`;
+* `inject_memory_provider_tools()` calls it AFTER init to build the agent's
+  advertised tool list — which is why the schemas were visibly present in
+  `agent.tools` while nothing could actually be dispatched.
+
+Advertised but unroutable is the worst shape this failure could take: every
+surface that inspects the provider directly (the phase-1 image's schema
+assertion, the MCP `tools/list`, `get_tool_schemas()` in a unit test) reported
+five healthy tools, because none of them exercised host dispatch.
+
+The guard is now `if self._initialized and self._recall_mode == "context"`, so
+pre-init the config is `DEFAULTS` (permissive) and routing learns every name we
+could ever answer to, while post-init the advertised list still reflects
+brain.yaml. `tools.dispatch` re-checks the real gates at call time, so a
+disabled tool is refused rather than silently served — the offered set is always
+a subset of the routable set, which is now a test.
+
+Pinned three ways: `tests/test_hermes_loader.py` (pre-init schemas, the
+offered ⊆ routable invariant, and that `recall_mode: context` still does not
+empty the routing map), an assertion inside `docker/Dockerfile.hermes` that
+builds a real `MemoryManager` and checks the map, and the live adversarial
+phase that drives an actual model-issued tool call.
+
+**How long this was broken:** since the tool surface was introduced. No test
+exercised host dispatch, and every direct inspection looked correct.
+
+## G7. CRLF crept into the build context — **fixed**
+
+Scripted edits during this pass rewrote several files with Windows line
+endings, and `docker/adversarial/Dockerfile.live` failed with
+`env: 'bash\r': No such file or directory`. This is precisely what CLAUDE.md's
+`.gitattributes` note warns about: CRLF breaks Docker shebangs and BuildKit
+heredocs. Eight files were normalized back to LF. Worth remembering that
+`.gitattributes` normalizes on commit but the **working tree** is what Docker
+builds from.
+
+## G8. Codex review on PR #9 — six findings, all legitimate
+
+Automated review found six real issues, three P1. Two were corruption bugs in
+code written in this same pass. Recorded because the pattern is instructive:
+every one of them was in a path my own tests exercised only in the *easy*
+configuration.
+
+**P1 — linked hits could never survive the fusion limit.** With RRF `k=60` and
+the default `link_weight=0.85`, the best linked hit scores `0.85/61 = 0.01393`
+while the EIGHTH local hit scores `1/68 = 0.01471`. On any query where the local
+profile fills the default limit, every linked hit was truncated away regardless
+of relevance — cross-profile recall was effectively local-only on a populated
+profile. My tests missed it because they used tiny local corpora.
+
+Raising the weight is not a fix: linked rank 1 clears local rank N only when
+`w > (k+1)/(k+N)`, so any fixed weight is a coincidence that breaks when the
+caller changes `limit`. `_reserve_linked_slots` guarantees linked profiles a
+quarter of the slots when they have anything to offer — a policy survives
+parameter changes; arithmetic does not.
+
+**P1 — the full import did not remap row-ID references.** Excluding `id` on
+insert generates new rowids, but `memories.supersedes_id`/`superseded_by`,
+`facts.memory_id`/`entity_id`/`superseded_by`, `entity_mentions.*` and
+`edges.src_id`/`dst_id` were carried over verbatim, pointing at unrelated rows
+or at nothing. Silent corruption of exactly the version history, facts and
+graph that `--full` exists to preserve — and invisible when restoring into an
+EMPTY database, which is all my round-trip test did. Now imports in dependency
+order, builds an old→new map per table, and resolves self-references in a
+second pass.
+
+**P1 — UID-less tables duplicated on re-import.** The idempotency check keyed on
+`uid`, which `facts`, `entity_mentions` and `edges` do not have, so a second
+import duplicated every one while the CLI reported a clean idempotent restore.
+Each table now declares its identity: `canonical` for entities, the PK for
+mentions, the UNIQUE tuple for edges, and `(subject, predicate, object,
+valid_from, recorded_at)` for facts.
+
+**P2 — lane-2 cache could serve unlinked memories forever.** `query_cache` keys
+on the LOCAL `mem_generation`, which a write in another profile cannot bump and
+which linking/unlinking does not touch. Merged results are no longer cached at
+all: correctness beats one cache hit per turn, and a fingerprint over remote
+databases would still not see their writes.
+
+**P2 — deep recall seeded the local graph with linked rowids.** The same class
+as the `log_retrieval` guard, missed one call site over: `brain_recall(depth=
+"deep")` passed every memory hit id to `entities.co_mentioned()` on the LOCAL
+connection, so a linked rowid colliding with a local memory id would present
+unrelated local neighbours as related to the linked hit.
+
+**P2 — a relative `--home` was persisted verbatim.** It validated against the
+CLI's cwd, then a gateway started elsewhere would resolve a different path and
+degrade to local-only recall with no error. The resolved absolute path is
+stored.
+
+The through-line: the rowid-collision hazard has now surfaced in **three**
+places (`log_retrieval`, deep traversal, full import). Any code that takes an
+id from one database and uses it against another is wrong by default;
+`Hit.profile is None` and the import id-maps are the two guards, and new call
+sites need to be checked against them.

@@ -34,10 +34,20 @@ from __future__ import annotations
 
 from .compare import CONFIGURATIONS, format_report, run_comparison
 from .generate import generate_queryset
-from .store import load_queryset, queryset_path, save_queryset
+from .store import (
+    baseline_path,
+    load_baseline,
+    load_queryset,
+    queryset_path,
+    save_baseline,
+    save_queryset,
+)
 
 __all__ = [
     "CONFIGURATIONS",
+    "baseline_path",
+    "load_baseline",
+    "save_baseline",
     "format_report",
     "format_report_or_none",
     "generate_queryset",
@@ -48,7 +58,7 @@ __all__ = [
 ]
 
 
-def format_report_or_none(report) -> str:
+def format_report_or_none(report, baseline=None) -> str:
     """format_report, but explicit when every configuration was skipped —
     an empty table reads as "no difference" when it means "nothing ran"."""
     if not report or not any(
@@ -57,4 +67,4 @@ def format_report_or_none(report) -> str:
         return ("No configuration could be scored.\n"
                 "  Every leg was unavailable — run 'hermes brain doctor' and look at "
                 "the 'legs' line.")
-    return format_report(report)
+    return format_report(report, baseline)

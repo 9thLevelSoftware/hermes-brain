@@ -28,6 +28,9 @@ Scenarios:
   vague_lesson     consolidate returns a non-actionable, non-concrete lesson
   tool_call_delegate  the streaming turn emits a delegate_task tool call
   tool_call_memory    the streaming turn emits a builtin `memory` add tool call
+  tool_call_memories_write      the turn emits a brain `memories` create call
+  tool_call_memories_traversal  the turn emits a `memories` call aimed OUTSIDE
+                                /memories (must be refused, never honoured)
   budget_bomb      every response reports millions of tokens in `usage`
   slow             a short server-side delay before replying (timeout probe)
 
@@ -53,7 +56,8 @@ _DIGEST_UID_RE = re.compile(r"\[([0-9A-Za-z]{6,26})\|")
 
 _ALL_SCENARIOS = frozenset({
     "valid", "empty", "malformed_json", "huge", "prompt_echo", "spam_items",
-    "vague_lesson", "tool_call_delegate", "tool_call_memory", "budget_bomb",
+    "vague_lesson", "tool_call_delegate", "tool_call_memory",
+    "tool_call_memories_write", "tool_call_memories_traversal", "budget_bomb",
     "slow",
 })
 
@@ -268,6 +272,29 @@ def _tool_call_stream_delta(scenario: str) -> dict | None:
             "function": {"name": "memory", "arguments": json.dumps({
                 "command": "add",
                 "content": "The user prefers concise answers.",
+            })},
+        }]}
+    if scenario == "tool_call_memories_write":
+        # The brain's OWN Anthropic-shaped file tool, driven through Hermes's
+        # real tool dispatch. Until this existed no model had ever issued a
+        # `memories` call — the tool was unit-tested and never exercised end
+        # to end (alignment-audit.md §F5/§G4).
+        return {"tool_calls": [{
+            "index": 0, "id": "call_memories_0", "type": "function",
+            "function": {"name": "memories", "arguments": json.dumps({
+                "command": "create",
+                "path": "/memories/topics/deployment.md",
+                "file_text": "- staging deploys require the VPN to be up first",
+            })},
+        }]}
+    if scenario == "tool_call_memories_traversal":
+        # The same surface, aimed outside /memories. Must be REFUSED with an
+        # errors-that-teach payload, not honoured and not crashed on.
+        return {"tool_calls": [{
+            "index": 0, "id": "call_memories_1", "type": "function",
+            "function": {"name": "memories", "arguments": json.dumps({
+                "command": "view",
+                "path": "/memories/../../etc/passwd",
             })},
         }]}
     return None

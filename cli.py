@@ -130,6 +130,9 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     p_eval.add_argument("--sample", type=int, default=0, metavar="K",
                         help="print K query/gold pairs from the stored set for "
                              "manual spot-checking")
+    p_eval.add_argument("--save-baseline", dest="save_baseline", action="store_true",
+                        help="with --compare: record this run as the baseline for "
+                             "future comparisons")
     p_eval.add_argument("--compare", action="store_true",
                         help="score the stored query set across every leg "
                              "configuration (no LLM calls)")
@@ -160,6 +163,10 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
 
     p_exp = cmds.add_parser("export", help="JSONL + markdown snapshot of current memories")
     p_exp.add_argument("--out", default=None, help="output directory (default brain/exports/<date>)")
+    p_exp.add_argument("--full", action="store_true",
+                       help="complete, re-importable snapshot: every table plus "
+                            "superseded/tombstoned rows (the default is "
+                            "current-truth memories only)")
 
     p_imp = cmds.add_parser("import", help="re-import a memories.jsonl (content-hash dedup)")
     p_imp.add_argument("file", help="path to a memories.jsonl produced by export")
@@ -200,6 +207,14 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
                                help="why a memory did NOT surface for a query")
     p_whynot.add_argument("query", help="the search query")
     p_whynot.add_argument("uid", help="uid prefix of the memory you expected")
+
+    p_link = cmds.add_parser("link", help="link another profile's brain (read-only)")
+    p_link.add_argument("name", help="a short name for the linked profile")
+    p_link.add_argument("--home", required=True, metavar="PATH",
+                        help="that profile's HERMES_HOME")
+    p_unlink = cmds.add_parser("unlink", help="remove a profile link")
+    p_unlink.add_argument("name", help="the link name")
+    cmds.add_parser("links", help="list linked profiles")
 
     p_w = cmds.add_parser("weights", help="active retrieval-leg weights (show | reset)")
     w_sub = p_w.add_subparsers(dest="weights_command")
@@ -254,6 +269,7 @@ def brain_command(args: argparse.Namespace) -> int:
         "insights": cmd_insights, "review": cmd_review, "skills": cmd_skills,
         "sync": cmd_sync, "weights": cmd_weights,
         "import-provider": cmd_import_provider, "why-not": cmd_why_not,
+        "link": cmd_link, "unlink": cmd_unlink, "links": cmd_links,
         "mcp": cmd_mcp, "adopt-memory": cmd_adopt_memory,
     }.get(cmd)
     if handler is None:
@@ -508,6 +524,16 @@ def cmd_search(args: argparse.Namespace) -> int:
             include_episodes=args.episodes,
             embedder=embedder,
             reranker=reranker,
+        )
+        # The CLI is always the owner speaking, so links apply here.
+        from .recall.linked import search_linked
+
+        hits = search_linked(
+            conn, query, local_hits=hits, trust_tier="owner", limit=args.limit,
+            link_weight=float(cfg.get("link_weight", 0.85)),
+            embedder=embedder, reranker=reranker,
+            kinds=[args.kind] if args.kind else None,
+            scope_project=args.project, include_episodes=args.episodes,
         )
         if not hits:
             print("(no matches)")
@@ -976,6 +1002,29 @@ def _doctor_p2_checks(conn, cfg: dict, report) -> None:
 # bootstrap
 # ---------------------------------------------------------------------------
 
+def _measured_note(payload: object) -> str:
+    """One line describing what a tuning proposal would actually DO.
+
+    A proposal that could not be measured says so explicitly. Silence would
+    read as "measured, no effect", which is the failure mode this whole
+    subsystem keeps running into (alignment-audit.md §F3/§G1).
+    """
+    try:
+        data = json.loads(payload or "{}")
+    except (ValueError, TypeError):
+        return ""
+    measured = data.get("measured")
+    if not isinstance(measured, dict):
+        return ""
+    if measured.get("delta") is None:
+        return f"NOT MEASURED: {measured.get('why') or 'unknown'}"
+    delta = measured["delta"]
+    verdict = "improves" if delta > 0 else ("no change" if delta == 0 else "REGRESSES")
+    return (f"measured: {measured.get('metric', 'MRR')} "
+            f"{measured.get('before')} -> {measured.get('after')} "
+            f"({delta:+.4f}, n={measured.get('n')}) — {verdict}")
+
+
 def _approve_tuning(conn, home: Path, row) -> int:
     """Apply an approved tune proposal's fitted weights to live retrieval.
 
@@ -1000,6 +1049,17 @@ def _approve_tuning(conn, home: Path, row) -> int:
               "dream run with enough labeled retrievals to fit weights.",
               file=sys.stderr)
         return 1
+
+    note = _measured_note(row["payload"])
+    if note:
+        print(note)
+        if "REGRESSES" in note:
+            print("  WARNING: this proposal measured WORSE than the current weights.\n"
+                  "  Applying anyway is your call — 'hermes brain weights reset' reverts.")
+        elif "NOT MEASURED" in note:
+            print("  No evidence either way. Generate a query set first if you want "
+                  "one: hermes brain eval --generate")
+        print()
 
     before = weights_mod.load(conn)
     weights_mod.save(conn, fitted)
@@ -1206,6 +1266,66 @@ def _why_not_tokens(text: str) -> list[str]:
     from .recall.search import _tokens
 
     return _tokens(text or "")
+
+
+def cmd_link(args: argparse.Namespace) -> int:
+    from .store import links as links_mod
+
+    conn = _open_db(_hermes_home())
+    if conn is None:
+        return 1
+    try:
+        entry = links_mod.add(conn, args.name, args.home)
+    except ValueError as e:
+        print(f"cannot link: {e}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+    print(f"linked            {entry['name']} -> {entry['hermes_home']}")
+    print("  Read-only, and traversed only for OWNER-trust callers: a gateway\n"
+          "  peer or an MCP session never sees linked memories.\n"
+          "  Lane-2 injection stays local unless you set link_lane2: true.")
+    return 0
+
+
+def cmd_unlink(args: argparse.Namespace) -> int:
+    from .store import links as links_mod
+
+    conn = _open_db(_hermes_home())
+    if conn is None:
+        return 1
+    try:
+        if not links_mod.remove(conn, args.name):
+            print(f"no link named {args.name!r} — 'hermes brain links' lists them",
+                  file=sys.stderr)
+            return 1
+    finally:
+        conn.close()
+    print(f"unlinked          {args.name}")
+    return 0
+
+
+def cmd_links(args: argparse.Namespace) -> int:
+    from .store import db
+    from .store import links as links_mod
+
+    conn = _open_db(_hermes_home())
+    if conn is None:
+        return 1
+    try:
+        registered = links_mod.load(conn)
+    finally:
+        conn.close()
+    if not registered:
+        print("no linked profiles.\n"
+              "  Link one:  hermes brain link coder --home /path/to/other/HERMES_HOME")
+        return 0
+    for link in registered:
+        target = db.db_path(Path(link["hermes_home"]))
+        state = "enabled" if link["enabled"] else "disabled"
+        reachable = "ok" if target.is_file() else "MISSING"
+        print(f"{link['name']:<16} {state:<9} {reachable:<8} {target}")
+    return 0
 
 
 def cmd_weights(args: argparse.Namespace) -> int:
@@ -1906,7 +2026,14 @@ def cmd_eval_sample(args: argparse.Namespace) -> int:
 def cmd_eval_compare(args: argparse.Namespace) -> int:
     """Score the stored query set across leg configurations. No LLM calls."""
     from . import config
-    from .evalkit import format_report_or_none, load_queryset, queryset_path, run_comparison
+    from .evalkit import (
+        format_report_or_none,
+        load_baseline,
+        load_queryset,
+        queryset_path,
+        run_comparison,
+        save_baseline,
+    )
 
     home = _hermes_home()
     data = load_queryset(home)
@@ -1924,7 +2051,13 @@ def cmd_eval_compare(args: argparse.Namespace) -> int:
                                 embedder=embedder, reranker=reranker)
     finally:
         conn.close()
-    print(format_report_or_none(report))
+    print(format_report_or_none(report, load_baseline(home)))
+    if getattr(args, "save_baseline", False):
+        path = save_baseline(home, report)
+        print(f"\nbaseline saved to {path} — a later --compare shows the delta.")
+    elif load_baseline(home) is None:
+        print("\nTip: 'hermes brain eval --compare --save-baseline' records this "
+              "run so a later one can show what changed.")
     return 0
 
 
@@ -2273,6 +2406,111 @@ def _topic_filename(tag: str) -> str:
     return (_re.sub(r"[^A-Za-z0-9_-]+", "-", tag).strip("-") or "untagged") + ".md"
 
 
+# Tables a --full export carries, in dependency order. `memories` FIRST so an
+# importer can map old->new ids before anything references them.
+_FULL_EXPORT_TABLES = ("memories", "episodes", "facts", "entities",
+                       "entity_mentions", "edges")
+FULL_EXPORT_VERSION = 1
+
+# Import order matters: a table must land AFTER everything it references, so
+# the old->new id map is populated before anything needs it.
+_FULL_IMPORT_ORDER = ("memories", "episodes", "entities", "entity_mentions",
+                      "edges", "facts")
+
+# column -> table it references. Self-references (a table pointing at itself)
+# are resolved in a second pass, because the target row may be exported after
+# the row that points at it.
+_FULL_IMPORT_REFS: dict[str, dict[str, str]] = {
+    "memories": {"supersedes_id": "memories", "superseded_by": "memories"},
+    "entity_mentions": {"entity_id": "entities", "memory_id": "memories"},
+    "edges": {"src_id": "memories", "dst_id": "memories"},
+    "facts": {"memory_id": "memories", "entity_id": "entities",
+              "superseded_by": "facts"},
+}
+
+# How a row is RECOGNIZED as already present, per table. `uid` where there is
+# one; a natural key otherwise. Without this, re-importing a snapshot silently
+# duplicated every fact, mention and edge while reporting an idempotent
+# restore (PR #9 review, P1). Columns here are read AFTER reference remapping,
+# so the comparison is against ids that exist in THIS database.
+_FULL_IMPORT_IDENTITY: dict[str, tuple[str, ...]] = {
+    "memories": ("uid",),
+    "episodes": ("uid",),
+    "entities": ("canonical",),                       # UNIQUE in schema.sql
+    "entity_mentions": ("entity_id", "memory_id"),    # PK
+    "edges": ("src_id", "dst_id", "edge_type", "valid_from"),   # UNIQUE
+    # facts has no uid and no uniqueness constraint; the triple plus its
+    # validity window is the stable identity of an exported row.
+    "facts": ("subject", "predicate", "object", "valid_from", "recorded_at"),
+}
+
+
+def _existing_row_id(conn, table: str, rec: dict):
+    """rowid of an already-present row matching this record's identity, else None.
+
+    Returns the id so the caller can map old->new even for a SKIPPED row: a
+    later table referencing it must still resolve to the row that is really
+    there.
+    """
+    keys = _FULL_IMPORT_IDENTITY.get(table)
+    if not keys:
+        return None
+    values = [rec.get(k) for k in keys]
+    if all(v is None for v in values):
+        return None
+    where = " AND ".join(f"{k} IS ?" for k in keys)
+    # entity_mentions is WITHOUT ROWID and has no `id` column at all, so there
+    # is no id to return — 1 just means "present". Nothing references it, and
+    # its exported rows carry no `id`, so no idmap entry is created either.
+    try:
+        has_id = any(r["name"] == "id" for r in
+                     conn.execute(f"PRAGMA table_info({table})").fetchall())
+        select = "id" if has_id else "1"
+        row = conn.execute(
+            f"SELECT {select} FROM {table} WHERE {where} LIMIT 1", values).fetchone()
+    except Exception:
+        return None
+    return row[0] if row else None
+
+
+def _export_full(conn, out_dir: Path) -> dict[str, int]:
+    """Write every table a brain's knowledge lives in, plus a manifest.
+
+    The default export is current-truth memories only, which `integration.md`
+    §5.3 nonetheless described as "lossless, re-importable" — it was neither
+    (alignment-audit.md §G3). This mode makes the claim true.
+
+    `memories` is exported WITHOUT the valid_to/status filter: versions-are-rows
+    is the storage model, so dropping superseded and tombstoned rows discards
+    exactly the history `hermes brain why` reads back.
+    """
+    from .store import db
+
+    counts: dict[str, int] = {}
+    for table in _FULL_EXPORT_TABLES:
+        try:
+            rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+        except Exception as e:      # a table this schema version lacks
+            logger.debug("full export: skipping %s (%s)", table, e)
+            continue
+        path = out_dir / f"{table}.jsonl"
+        with open(path, "w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(dict(row), ensure_ascii=False, default=str) + "\n")
+        counts[table] = len(rows)
+
+    manifest = {
+        "format": "hermes-brain-full-export",
+        "version": FULL_EXPORT_VERSION,
+        "schema_version": db.get_meta(conn, "schema_version"),
+        "exported_at": db.iso_now(),
+        "tables": counts,
+    }
+    (out_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    return counts
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     from .store import db
 
@@ -2321,6 +2559,14 @@ def cmd_export(args: argparse.Namespace) -> int:
                     f"# {tag}\n\n" + "\n".join(lines) + "\n", encoding="utf-8")
 
         print(f"exported {len(rows)} memories to {out_dir}")
+        if getattr(args, "full", False):
+            counts = _export_full(conn, out_dir)
+            print("full export (identity-preserving):")
+            for table, n in counts.items():
+                print(f"  {table:<16} {n}")
+        else:
+            print("  (current-truth memories only — use --full for a complete, "
+                  "re-importable snapshot)")
         return 0
     except Exception as e:
         print(f"Export failed: {e}\n"
@@ -2349,6 +2595,115 @@ _INSTRUCTION_SHAPED_RE = re.compile(
 )
 
 
+def _import_full(conn, manifest_path: Path) -> dict[str, int]:
+    """Restore a `--full` export.
+
+    Row IDs are NOT preserved — they are rowids, and reusing them would collide
+    with rows already in the target. But every id-REFERENCING column has to be
+    rewritten to match, or the restore silently corrupts what it claims to have
+    restored: `memories.supersedes_id`/`superseded_by`, `facts.memory_id`/
+    `entity_id`/`superseded_by`, `entity_mentions.*` and `edges.src_id`/`dst_id`
+    would otherwise point at unrelated rows or at nothing (PR #9 review, P1).
+    So we build an old->new map per table and remap as we go.
+
+    Idempotency needs a per-table identity, not just `uid`: `facts`,
+    `entity_mentions` and `edges` have no uid, so a second import of the same
+    snapshot would duplicate every one of them while the CLI reported a clean
+    idempotent restore (PR #9 review, P1). Each table below declares how it is
+    recognized.
+    """
+    from .store import db
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("format") != "hermes-brain-full-export":
+        raise ValueError(f"{manifest_path} is not a full-export manifest")
+    out_dir = manifest_path.parent
+    counts: dict[str, int] = {}
+    # old id -> new id, per table. Populated for SKIPPED rows too, so a
+    # reference to an already-present row still resolves.
+    idmap: dict[str, dict[int, int]] = {t: {} for t in _FULL_EXPORT_TABLES}
+
+    for table in _FULL_IMPORT_ORDER:
+        src = out_dir / f"{table}.jsonl"
+        if not src.exists():
+            continue
+        try:
+            cols = [r["name"] for r in
+                    conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        except Exception:
+            continue
+        if not cols:
+            continue
+
+        refs = _FULL_IMPORT_REFS.get(table, {})
+        insert_cols = [c for c in cols if c != "id"]
+        placeholders = ",".join("?" * len(insert_cols))
+        sql = (f"INSERT INTO {table} ({','.join(insert_cols)}) "
+               f"VALUES ({placeholders})")
+        deferred: list[tuple[int, dict]] = []   # self-references, second pass
+        added = 0
+
+        for line in src.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            old_id = rec.get("id")
+
+            # Remap every reference to a table imported BEFORE this one. A
+            # self-reference cannot be resolved yet (the target row may not
+            # exist), so it is nulled now and fixed in the second pass.
+            self_refs = {}
+            for col, target in refs.items():
+                if col not in cols:
+                    continue
+                val = rec.get(col)
+                if val is None:
+                    continue
+                if target == table:
+                    self_refs[col] = val
+                    rec[col] = None
+                else:
+                    rec[col] = idmap.get(target, {}).get(val)
+
+            existing = _existing_row_id(conn, table, rec)
+            if existing is not None:
+                if old_id is not None:
+                    idmap[table][old_id] = existing
+                continue
+            try:
+                cur = conn.execute(sql, [rec.get(c) for c in insert_cols])
+            except Exception as e:
+                logger.debug("full import: %s row skipped (%s)", table, e)
+                continue
+            new_id = cur.lastrowid
+            if old_id is not None and new_id is not None:
+                idmap[table][old_id] = new_id
+            if self_refs and new_id is not None:
+                deferred.append((new_id, self_refs))
+            added += 1
+
+        # Second pass: self-references, now that every row of this table exists.
+        for new_id, self_refs in deferred:
+            for col, old_target in self_refs.items():
+                mapped = idmap[table].get(old_target)
+                if mapped is None:
+                    continue
+                try:
+                    conn.execute(f"UPDATE {table} SET {col}=? WHERE id=?",
+                                 (mapped, new_id))
+                except Exception as e:
+                    logger.debug("full import: %s.%s not remapped (%s)",
+                                 table, col, e)
+        counts[table] = added
+
+    db.bump_generation(conn, "mem")
+    conn.commit()
+    return counts
+
+
 def cmd_import(args: argparse.Namespace) -> int:
     from .store import db
 
@@ -2361,6 +2716,25 @@ def cmd_import(args: argparse.Namespace) -> int:
     conn = _open_db(_hermes_home())
     if conn is None:
         return 1
+    # A manifest next to the file (or handed in directly) means this is a full
+    # export — restore every table rather than memories alone.
+    manifest = path if path.name == "manifest.json" else path.parent / "manifest.json"
+    if manifest.exists():
+        try:
+            counts = _import_full(conn, manifest)
+            print("restored full export:")
+            for table, n in counts.items():
+                print(f"  {table:<16} {n}")
+            print("\nuids preserved; existing rows were left alone (re-import is "
+                  "idempotent).")
+            return 0
+        except Exception as e:
+            print(f"Full import failed: {e}\n"
+                  f"  Remedy: check {manifest} came from 'hermes brain export --full'.",
+                  file=sys.stderr)
+            return 1
+        finally:
+            conn.close()
     try:
         columns = [r["name"] for r in conn.execute("PRAGMA table_info(memories)").fetchall()
                    if r["name"] not in _IMPORT_SKIP_COLS]
@@ -2692,7 +3066,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         if args.approve or args.reject:
             return _review_decide(conn, args)
         props = conn.execute(
-            "SELECT uid, kind, title, status, created_at FROM proposals "
+            "SELECT uid, kind, title, status, payload, created_at FROM proposals "
             "WHERE status IN ('pending','shadow','validated','approved') "
             "ORDER BY created_at DESC LIMIT 50").fetchall()
         quar = conn.execute(
@@ -2706,6 +3080,9 @@ def cmd_review(args: argparse.Namespace) -> int:
             print(f"proposals ({len(props)}):")
             for p in props:
                 print(f"  {p['uid'][:8]}  {p['kind']:16} {p['status']:10} {p['title'][:48]}")
+                note = _measured_note(p["payload"])
+                if note:
+                    print(f"            {note}")
             print("  decide: hermes brain review --approve <uid> | --reject <uid>")
         if quar:
             print(f"\nquarantined memories ({len(quar)}):")

@@ -459,9 +459,26 @@ class BrainProvider(MemoryProvider):
     # -- tools -------------------------------------------------------------------
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        if not self._initialized:
-            return []
-        if self._recall_mode == "context":
+        """Tool schemas. Called at TWO different times, for two purposes.
+
+        This must NOT gate on ``self._initialized``, and that was a real bug
+        (docs/design/alignment-audit.md §G6): the host calls this once from
+        ``MemoryManager.add_provider`` to build ``_tool_to_provider`` — the
+        map that ROUTES a tool call back to us — and that happens BEFORE
+        ``initialize()``. Returning ``[]`` there left the routing map empty, so
+        every brain tool the model called came back "Unknown tool: brain_recall"
+        while the schemas still appeared in the agent's advertised list (those
+        are injected later, post-init, by ``inject_memory_provider_tools``).
+        The whole agent-facing tool surface was dead and nothing said so.
+
+        The two call sites want slightly different things and both are served:
+        pre-init the config is ``DEFAULTS`` (permissive), so routing learns every
+        name we could ever answer to; post-init it reflects brain.yaml, so the
+        model is only OFFERED what is enabled. ``tools.dispatch`` re-checks the
+        real gates at call time, so a disabled tool is refused, never silently
+        served.
+        """
+        if self._initialized and self._recall_mode == "context":
             return []  # injection-only: the agent gets memory via the lanes
         from . import tools
 
@@ -1063,8 +1080,34 @@ class BrainProvider(MemoryProvider):
                     facts=facts_leg_on,
                     intent_bias=intent_bias,
                 )
+            # Cross-profile lane 2 is OPT-IN (link_lane2, default off). Lane 2
+            # is the cache-safe hot path; a second database read on every turn
+            # is latency and blast radius for a feature whose value is mostly
+            # on-demand. Owner sessions only — enforced inside search_linked.
+            linked_used = False
+            if self._config.get("link_lane2", False):
+                try:
+                    from .recall.linked import search_linked
+
+                    merged = search_linked(
+                        conn, query_text, local_hits=hits, trust_tier=trust_tier,
+                        limit=8,
+                        link_weight=float(self._config.get("link_weight", 0.85)),
+                        embedder=self._embedder, reranker=self._reranker,
+                        exclude_kinds=exclude_kinds,
+                    )
+                    linked_used = any(getattr(h, "profile", None) for h in merged)
+                    hits = merged
+                except Exception:
+                    logger.debug("brain: linked lane-2 skipped", exc_info=True)
             hits = _diversify(hits, mmr_lambda, 8)
-            if use_cache:
+            # Results containing linked rows are NOT cached. query_cache is
+            # keyed on the LOCAL mem_generation, which a write in another
+            # profile cannot bump and which adding/removing a link does not
+            # touch — so a long-running gateway would keep serving memories
+            # from an unlinked profile, or miss newly linked ones, indefinitely
+            # (PR #9 review, P2). Correctness beats one cache hit per turn.
+            if use_cache and not linked_used:
                 self._query_cache.put(query_text, kinds=None, scope=cache_scope, hits=hits)
         facts_block = lane2_block(hits, remaining)
         block = "\n".join(p for p in (gblock, facts_block) if p)

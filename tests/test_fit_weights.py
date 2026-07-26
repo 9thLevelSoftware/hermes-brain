@@ -183,3 +183,86 @@ def test_tune_without_fit_still_proposes_feature_contrast(conn, tmp_home):
     assert "fusion_weights" not in json.loads(prop["payload"])
 
 
+
+
+# ---------------------------------------------------------------------------
+# the measured delta (alignment-audit.md §G1) — a proposal must say what it
+# would DO, or say that it cannot tell
+# ---------------------------------------------------------------------------
+
+def _queryset(tmp_home, uids, n):
+    """A query set big enough to clear _MIN_MEASURE_QUERIES."""
+    from brain.evalkit import save_queryset
+
+    save_queryset(tmp_home, [
+        {"query": f"question about topic {i}", "gold": [uids[i % len(uids)]],
+         "source_kind": "memory", "source_uid": uids[i % len(uids)]}
+        for i in range(n)
+    ])
+
+
+def test_tune_proposal_says_it_cannot_measure_without_a_queryset(conn, tmp_home):
+    """Silence would read as 'measured, no effect'. It must state WHY."""
+    mem = seed_memory(conn, "always cap the JVM heap at 2GB")
+    _seed_rlog(conn, mem, [("fts", "t-help", 300), ("vec", "t-harm", 300)])
+    make_state_db(tmp_home, outcomes=_OUTCOMES)
+
+    tune_mod.run(_tune_shift(conn, tmp_home, "shadow"))
+    payload = json.loads(conn.execute(
+        "SELECT payload FROM proposals WHERE kind='tuning'").fetchone()["payload"])
+    assert payload["measured"]["delta"] is None
+    assert "query set" in payload["measured"]["why"]
+
+
+def test_tune_proposal_declines_to_measure_on_too_few_queries(conn, tmp_home):
+    """Below the floor a delta is noise dressed as evidence — the first real
+    measurement's '3.7% regression' was two queries out of 71."""
+    mem = seed_memory(conn, "always cap the JVM heap at 2GB")
+    _seed_rlog(conn, mem, [("fts", "t-help", 300), ("vec", "t-harm", 300)])
+    make_state_db(tmp_home, outcomes=_OUTCOMES)
+    _queryset(tmp_home, [conn.execute("SELECT uid FROM memories").fetchone()["uid"]], 5)
+
+    tune_mod.run(_tune_shift(conn, tmp_home, "shadow"))
+    payload = json.loads(conn.execute(
+        "SELECT payload FROM proposals WHERE kind='tuning'").fetchone()["payload"])
+    assert payload["measured"]["delta"] is None
+    assert "need" in payload["measured"]["why"]
+
+
+def test_tune_proposal_carries_a_measured_delta_when_it_can(conn, tmp_home):
+    mem = seed_memory(conn, "always cap the JVM heap at 2GB")
+    _seed_rlog(conn, mem, [("fts", "t-help", 300), ("vec", "t-harm", 300)])
+    make_state_db(tmp_home, outcomes=_OUTCOMES)
+    uid = conn.execute("SELECT uid FROM memories").fetchone()["uid"]
+    _queryset(tmp_home, [uid], 40)
+
+    result = tune_mod.run(_tune_shift(conn, tmp_home, "shadow"))
+    payload = json.loads(conn.execute(
+        "SELECT payload FROM proposals WHERE kind='tuning'").fetchone()["payload"])
+    measured = payload["measured"]
+    assert measured["delta"] is not None
+    assert measured["metric"] == "MRR"
+    assert measured["n"] == 40
+    assert "measured_delta" in result
+    # Measuring must not have applied anything.
+    assert db.get_meta(conn, "retrieval_weights") is None
+
+
+def test_measurement_failure_degrades_to_an_unmeasured_proposal(conn, tmp_home,
+                                                                monkeypatch):
+    """A scoring bug must not cost you the proposal — that is what shipped
+    before the measurement existed."""
+    mem = seed_memory(conn, "always cap the JVM heap at 2GB")
+    _seed_rlog(conn, mem, [("fts", "t-help", 300), ("vec", "t-harm", 300)])
+    make_state_db(tmp_home, outcomes=_OUTCOMES)
+    _queryset(tmp_home, [conn.execute("SELECT uid FROM memories").fetchone()["uid"]], 40)
+
+    import brain.evalkit.compare as compare_mod
+
+    monkeypatch.setattr(compare_mod, "score_weights",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    tune_mod.run(_tune_shift(conn, tmp_home, "shadow"))
+    payload = json.loads(conn.execute(
+        "SELECT payload FROM proposals WHERE kind='tuning'").fetchone()["payload"])
+    assert "fusion_weights" in payload, "the proposal itself must survive"
+    assert payload["measured"]["delta"] is None

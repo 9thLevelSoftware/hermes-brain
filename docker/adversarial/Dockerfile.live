@@ -113,6 +113,11 @@ python /opt/driver.py hook memory_write     && note OK "memory_write mirrored"  
 python /opt/driver.py hook session_reset    && note OK "session reset (lane-1 swap)" || note FAIL "session_reset"
 python /opt/driver.py compress              && note OK "forced compression pre_compress" || echo "[compress] non-fatal (real compaction path may differ)"
 
+echo "===== [5b] the brain memories tool, model-driven ====="
+# Until this existed no model had ever issued a `memories` call — the tool was
+# unit-tested and never exercised through Hermes's real tool dispatch.
+python /opt/driver.py memories-tool && note OK "memories tool round-trip + traversal refused" || note FAIL "memories tool"
+
 echo "===== [6] MCP money-shot + malformed-frame survival ====="
 python /opt/mcp_client.py --self-check --home /hermes-home && note OK "MCP serve survived malformed frames + owner read" || note FAIL "MCP self-check"
 

@@ -43,11 +43,20 @@ def lane1_static() -> str:
 
 
 def index_line(hit) -> str:
-    """One-line index entry: [uid8 · kind · date · platform] snippet."""
+    """One-line index entry: [uid8 · kind · date · platform] snippet.
+
+    A hit from a linked profile carries `@<profile>` so it is never mistaken
+    for local memory — its uid does not resolve here, and it cannot be written
+    to (see recall/linked.py).
+    """
     snippet = _WS.sub(" ", (hit.summary or hit.text or "")).strip()[:_SNIPPET_CHARS]
     label = hit.mkind or hit.kind
     date = (hit.ts or "")[:10]
-    return f"[{hit.uid[:8]} · {label} · {date} · {hit.platform or '-'}] {snippet}"
+    origin = getattr(hit, "profile", None)
+    where = f"{hit.platform or '-'}"
+    if origin:
+        where += f" @{origin}"
+    return f"[{hit.uid[:8]} · {label} · {date} · {where}] {snippet}"
 
 
 def lane2_block(hits: list, budget_tokens: int) -> str:
