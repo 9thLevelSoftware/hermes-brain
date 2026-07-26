@@ -59,7 +59,10 @@ DEFAULTS: dict[str, Any] = {
     "lane2_blend_recent_days": 14,  # recency window for the "most-recent" blend leg
     "query_cache": True,         # in-process recall cache, invalidated on mem_generation
     "mmr_lambda": 0.7,           # MMR diversity/relevance tradeoff (1.0 = pure relevance)
-    "intent_weighting": "shadow",  # off | shadow (log proposed deltas) — never applied in v1
+    # off | shadow (log proposed deltas, nothing reads them) | active (apply
+    # per-query intent multipliers on top of the approved base weights, see
+    # recall/weights.py). Never auto-promoted past shadow.
+    "intent_weighting": "shadow",
     # Rewrite the raw user turn into a retrieval query via the host's shared
     # plugins/memory/query_rewrite.py helper (the same one honcho uses). OFF by
     # default: it is one auxiliary LLM call per turn against day_budget_usd.

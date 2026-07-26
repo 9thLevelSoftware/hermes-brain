@@ -116,11 +116,23 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     p_ctx.add_argument("--tokens", type=int, default=None,
                        help="token budget (default: precompress_tokens config)")
 
-    p_eval = cmds.add_parser("eval", help="run the retrieval/answer eval harness on a fixture")
+    p_eval = cmds.add_parser("eval", help="retrieval quality: fixture harness, or a "
+                                          "real query set over your own brain")
     p_eval.add_argument("--fixture", default=None,
                         help="eval fixture JSON (default: bundled eval_basic.json)")
     p_eval.add_argument("--real", action="store_true",
                         help="use the real aux LLM instead of the scripted fake")
+    p_eval.add_argument("--generate", action="store_true",
+                        help="build a paraphrase query set from YOUR memories (uses "
+                             "the aux LLM; costs budget)")
+    p_eval.add_argument("--limit", type=int, default=150,
+                        help="how many source items to sample when generating")
+    p_eval.add_argument("--sample", type=int, default=0, metavar="K",
+                        help="print K query/gold pairs from the stored set for "
+                             "manual spot-checking")
+    p_eval.add_argument("--compare", action="store_true",
+                        help="score the stored query set across every leg "
+                             "configuration (no LLM calls)")
 
     p_id = cmds.add_parser("identity", help="manage platform identities (trust roots)")
     id_sub = p_id.add_subparsers(dest="identity_command")
@@ -176,6 +188,11 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
                          help="set a strategy's mode to off")
 
     # -- P5: learning surface --------------------------------------------------
+    p_w = cmds.add_parser("weights", help="active retrieval-leg weights (show | reset)")
+    w_sub = p_w.add_subparsers(dest="weights_command")
+    w_sub.add_parser("show", help="show the active per-leg weights and their source")
+    w_sub.add_parser("reset", help="revert to uniform weights")
+
     p_ins = cmds.add_parser("insights", help="longitudinal learning metrics from turn_outcomes")
     p_ins.add_argument("--days", type=int, default=30, help="window in days (default 30)")
 
@@ -222,13 +239,13 @@ def brain_command(args: argparse.Namespace) -> int:
         "models": cmd_models, "export": cmd_export, "import": cmd_import,
         "incognito": cmd_incognito, "dream-now": cmd_dream_now, "dream": cmd_dream,
         "insights": cmd_insights, "review": cmd_review, "skills": cmd_skills,
-        "sync": cmd_sync,
+        "sync": cmd_sync, "weights": cmd_weights,
         "mcp": cmd_mcp, "adopt-memory": cmd_adopt_memory,
     }.get(cmd)
     if handler is None:
         print(f"Unknown brain command: {cmd}. Try: hermes brain status|search|doctor|"
               f"remember|forget|why|fact|ask|identity|reindex|models|export|import|incognito|"
-              f"dream-now|dream|insights|review|skills|context|sync|mcp|adopt-memory",
+              f"dream-now|dream|insights|review|skills|weights|context|sync|mcp|adopt-memory",
               file=sys.stderr)
         return 1
     return handler(args)
@@ -945,6 +962,73 @@ def _doctor_p2_checks(conn, cfg: dict, report) -> None:
 # bootstrap
 # ---------------------------------------------------------------------------
 
+def _approve_tuning(conn, home: Path, row) -> int:
+    """Apply an approved tune proposal's fitted weights to live retrieval.
+
+    Before this existed, approving a tuning proposal set status='approved' and
+    did nothing at all — `fusion.rrf()` had no weight parameter, so the fitted
+    weights had no consumer anywhere (alignment-audit.md §F4). This is the only
+    path from a fitted weight to live retrieval, and it requires an explicit
+    human approve: `tune` remains a shadow strategy and is never auto-applied.
+    """
+    from .recall import weights as weights_mod
+    from .store import db
+
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (ValueError, TypeError):
+        payload = {}
+    fitted = weights_mod.from_proposal(payload)
+    if fitted is None:
+        print("This tuning proposal carries no applicable leg weights — it "
+              "recorded feature contrasts only.\n"
+              "  Nothing to apply; mark it read with --reject, or wait for a "
+              "dream run with enough labeled retrievals to fit weights.",
+              file=sys.stderr)
+        return 1
+
+    before = weights_mod.load(conn)
+    weights_mod.save(conn, fitted)
+    conn.execute("UPDATE proposals SET status='applied', decided_at=?, "
+                 "decided_by='cli' WHERE uid=?", (db.iso_now(), row["uid"]))
+    conn.commit()
+    print(f"approved: retrieval weights applied ({row['uid'][:8]})")
+    for leg in weights_mod.LEGS:
+        print(f"  {leg:<8} {before.get(leg, 1.0):>5.2f} -> {fitted[leg]:>5.2f}")
+    print("\nMeasure the effect, do not assume it:\n"
+          "  hermes brain eval --compare        (before/after on your query set)\n"
+          "  hermes brain weights reset         (revert to uniform)")
+    return 0
+
+
+def cmd_weights(args: argparse.Namespace) -> int:
+    """Inspect or revert the active retrieval-leg weights."""
+    from .recall import weights as weights_mod
+
+    home = _hermes_home()
+    conn = _open_db(home)
+    if conn is None:
+        return 1
+    try:
+        sub = getattr(args, "weights_command", None) or "show"
+        if sub == "reset":
+            weights_mod.reset(conn)
+            print("retrieval weights reset to uniform (every leg 1.00)")
+            return 0
+        active = weights_mod.load(conn)
+        custom = weights_mod.is_active(conn)
+        print(f"source            {'approved tune proposal' if custom else 'default (uniform)'}")
+        for leg in weights_mod.LEGS:
+            print(f"  {leg:<8} {active[leg]:.2f}")
+        if not custom:
+            print("\nWeights change only when you approve a tune proposal:\n"
+                  "  hermes brain review                  (see open proposals)\n"
+                  "  hermes brain review --approve <uid>")
+        return 0
+    finally:
+        conn.close()
+
+
 def _print_bootstrap_coverage(home: Path, counts: dict) -> None:
     """Report what fraction of state.db actually landed, and what did not.
 
@@ -1539,10 +1623,115 @@ def cmd_sync(args: argparse.Namespace) -> int:
         conn.close()
 
 
+def _eval_embedder_and_reranker(cfg: dict):
+    from .recall.embed import get_embedder
+    from .recall.rerank import get_reranker
+    from .store import sysinfo
+
+    mode = sysinfo.resolve_mode(str(cfg.get("mode", "auto")))
+    embedder = reranker = None
+    try:
+        embedder = get_embedder(cfg, mode, allow_download=False)
+    except Exception as e:
+        print(f"  (no embedder: {e})")
+    try:
+        reranker = get_reranker(cfg, mode, allow_download=False)
+    except Exception as e:
+        print(f"  (no reranker: {e})")
+    return embedder, reranker
+
+
+def cmd_eval_generate(args: argparse.Namespace) -> int:
+    """Build a paraphrase query set from the live brain (costs LLM budget)."""
+    from . import config
+    from .evalkit import generate_queryset, save_queryset
+
+    home = _hermes_home()
+    cfg = {**config.load_config(home), "hermes_home": str(home)}
+    conn = _open_db(home)
+    if conn is None:
+        return 1
+    try:
+        print(f"sampling up to {args.limit} source item(s) from the brain...")
+        queries, meta = generate_queryset(conn, cfg, limit=args.limit)
+    finally:
+        conn.close()
+
+    if not queries:
+        print("No queries generated.\n"
+              f"  {meta.get('note') or meta.get('stopped_early') or ''}\n"
+              "  Remedy: the brain needs content first (run 'hermes brain bootstrap'), "
+              "and an auxiliary LLM must be configured.", file=sys.stderr)
+        return 1
+
+    path = save_queryset(home, queries, meta=meta)
+    print(f"generated         {len(queries)} query/gold pair(s)")
+    for key in ("sampled", "batches", "declined", "rejected_verbatim"):
+        print(f"  {key:<18} {meta.get(key, 0)}")
+    if meta.get("stopped_early"):
+        print(f"  stopped early     {meta['stopped_early']}")
+    print(f"saved             {path}")
+    print("\nSpot-check before trusting any number derived from these:\n"
+          "  hermes brain eval --sample 10")
+    return 0
+
+
+def cmd_eval_sample(args: argparse.Namespace) -> int:
+    from .evalkit import load_queryset, queryset_path
+
+    home = _hermes_home()
+    data = load_queryset(home)
+    if not data:
+        print(f"No query set at {queryset_path(home)}.\n"
+              "  Remedy: hermes brain eval --generate", file=sys.stderr)
+        return 1
+    queries = data["queries"]
+    import random
+
+    for item in random.sample(queries, min(args.sample, len(queries))):
+        print(f"\nQ: {item['query']}")
+        print(f"   gold: {', '.join(u[:8] for u in item.get('gold') or [])} "
+              f"({item.get('source_kind')})")
+    print(f"\n{len(queries)} query/gold pair(s) total.")
+    return 0
+
+
+def cmd_eval_compare(args: argparse.Namespace) -> int:
+    """Score the stored query set across leg configurations. No LLM calls."""
+    from . import config
+    from .evalkit import format_report_or_none, load_queryset, queryset_path, run_comparison
+
+    home = _hermes_home()
+    data = load_queryset(home)
+    if not data:
+        print(f"No query set at {queryset_path(home)}.\n"
+              "  Remedy: hermes brain eval --generate", file=sys.stderr)
+        return 1
+    cfg = {**config.load_config(home), "hermes_home": str(home)}
+    embedder, reranker = _eval_embedder_and_reranker(cfg)
+    conn = _open_db(home)
+    if conn is None:
+        return 1
+    try:
+        report = run_comparison(conn, data["queries"],
+                                embedder=embedder, reranker=reranker)
+    finally:
+        conn.close()
+    print(format_report_or_none(report))
+    return 0
+
+
 def cmd_eval(args: argparse.Namespace) -> int:
     """Run the eval harness (retrieval P@k/MRR + answer/abstain rubric) on a
     fixture. Loads the harness by file path so it works under any package name.
     Use --real to hit the real aux LLM instead of the scripted fake."""
+    if getattr(args, "generate", False):
+        return cmd_eval_generate(args)
+    if getattr(args, "sample", 0):
+        return cmd_eval_sample(args)
+    if getattr(args, "compare", False):
+        return cmd_eval_compare(args)
+
     import importlib.util
     from pathlib import Path
 
@@ -2395,6 +2584,8 @@ def _review_decide(conn, args) -> int:
             conn.commit()
             print(f"approved: {msg}")
             return 0
+        if row["kind"] == "tuning":
+            return _approve_tuning(conn, home, row)
         conn.execute("UPDATE proposals SET status='approved', decided_at=?, "
                      "decided_by='cli' WHERE uid=?", (db.iso_now(), row["uid"]))
         conn.commit()

@@ -50,22 +50,91 @@ def test_review_lists_proposals_and_quarantine(home_env, capsys):
     assert "quarantined memories" in out
 
 
-def test_review_approve_and_reject_a_proposal(home_env, capsys):
-    conn = db.connect(home_env)
+def _insert_tuning(conn, payload=None):
     uid = db.new_ulid()
     conn.execute(
-        "INSERT INTO proposals (uid, kind, target, title, status, created_at)"
-        " VALUES (?,?,?,?,?,?)",
-        (uid, "tuning", "retrieval_weights", "tune", "shadow", db.iso_now()))
+        "INSERT INTO proposals (uid, kind, target, title, status, payload, created_at)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (uid, "tuning", "retrieval_weights", "tune", "shadow",
+         json.dumps(payload) if payload is not None else None, db.iso_now()))
     conn.commit()
+    return uid
+
+
+def test_review_approving_a_tuning_proposal_applies_the_weights(home_env, capsys):
+    """The whole point of §F4: approving a tune proposal used to set
+    status='approved' and change nothing, because fusion.rrf() had no weight
+    parameter. Approval must now actually move retrieval."""
+    from brain.recall import weights as weights_mod
+
+    conn = db.connect(home_env)
+    uid = _insert_tuning(conn, {"fusion_weights": {
+        "weights": {"fts": 0.6, "vec": 0.3, "ppr": 0.1}}})
+    assert weights_mod.load(conn) == weights_mod.DEFAULT
     conn.close()
 
     rc, out = _run(cli.cmd_review, capsys, approve=uid[:8], reject=None)
-    assert rc == 0 and "approved" in out
+    assert rc == 0 and "weights applied" in out
+
     conn = db.connect(home_env)
-    assert conn.execute("SELECT status FROM proposals WHERE uid=?", (uid,)
-                        ).fetchone()["status"] == "approved"
+    try:
+        assert conn.execute("SELECT status FROM proposals WHERE uid=?", (uid,)
+                            ).fetchone()["status"] == "applied"
+        active = weights_mod.load(conn)
+        assert active != weights_mod.DEFAULT
+        # 'ppr' is fit_weights' name for the graph leg, and convex weights are
+        # rescaled to mean 1.0 (a uniform scale would not change RRF at all).
+        assert active["fts"] > active["vec"] > active["graph"]
+        assert abs(sum(active[k] for k in ("fts", "vec", "graph")) / 3 - 1.0) < 0.35
+    finally:
+        conn.close()
+
+
+def test_review_refuses_a_tuning_proposal_with_no_fitted_weights(home_env, capsys):
+    """A proposal carrying only feature contrasts has nothing to apply. Saying
+    'approved' would be the same silent lie this replaced."""
+    from brain.recall import weights as weights_mod
+
+    conn = db.connect(home_env)
+    uid = _insert_tuning(conn, {"features": [{"feature": "recency"}]})
     conn.close()
+
+    # _run() drains capsys, so read both streams from one call here: the
+    # refusal is on stderr (it is an error, not a result).
+    rc = cli.cmd_review(argparse.Namespace(approve=uid[:8], reject=None))
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "no applicable leg weights" in (captured.out + captured.err)
+
+    conn = db.connect(home_env)
+    try:
+        assert conn.execute("SELECT status FROM proposals WHERE uid=?", (uid,)
+                            ).fetchone()["status"] == "shadow"
+        assert weights_mod.load(conn) == weights_mod.DEFAULT
+    finally:
+        conn.close()
+
+
+def test_weights_show_and_reset(home_env, capsys):
+    from brain.recall import weights as weights_mod
+
+    rc, out = _run(cli.cmd_weights, capsys, weights_command="show")
+    assert rc == 0 and "default (uniform)" in out
+
+    conn = db.connect(home_env)
+    weights_mod.save(conn, {"fts": 1.5, "vec": 0.5, "graph": 1.0, "facts": 1.0})
+    conn.close()
+
+    rc, out = _run(cli.cmd_weights, capsys, weights_command="show")
+    assert rc == 0 and "approved tune proposal" in out and "1.50" in out
+
+    rc, out = _run(cli.cmd_weights, capsys, weights_command="reset")
+    assert rc == 0 and "uniform" in out
+    conn = db.connect(home_env)
+    try:
+        assert weights_mod.load(conn) == weights_mod.DEFAULT
+    finally:
+        conn.close()
 
 
 def test_review_release_quarantined_memory(home_env, capsys):
