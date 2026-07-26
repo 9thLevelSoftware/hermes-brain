@@ -390,6 +390,12 @@ def cmd_status(args: argparse.Namespace) -> int:
               f"fts5={'yes' if caps.get('fts5') else 'NO'} "
               f"vec={'yes' if caps.get('vec') else 'no'}")
         print(f"tier              {_tier_label(cfg, sysinfo.resolve_mode(str(mode)))}")
+        # What retrieval will actually do — every leg degrades silently and
+        # independently, so the configured stack and the live one can differ.
+        try:
+            print(f"legs              {_format_legs(_active_legs(conn, cfg))}")
+        except Exception as e:
+            print(f"legs              (undetermined: {e})")
         vstats = vec_store.stats(conn)
         if vstats:
             print(f"vectors           mem_vec={vstats.get('mem_vec')} "
@@ -632,6 +638,77 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 1 if n_fail else 0
 
 
+def _active_legs(conn, cfg: dict) -> dict[str, bool]:
+    """Which retrieval legs would actually run right now.
+
+    Every leg degrades silently and independently by design (a missing model,
+    an absent extension, an empty table), which is correct behavior and
+    terrible observability: the operator sees a configured six-leg stack and
+    gets one leg, with nothing anywhere saying so. This is the one-line answer.
+    """
+    from .recall import embed
+    from .store import db, sysinfo
+
+    resolved = sysinfo.resolve_mode(str(cfg.get("mode", "auto")))
+    caps = {}
+    try:
+        caps = db.capabilities(conn)
+    except Exception:
+        pass
+
+    legs = {"fts": bool(caps.get("fts5"))}
+
+    # vector: needs the extension, an embedder for the tier, AND a live index.
+    vec_ready = bool(caps.get("vec"))
+    if vec_ready:
+        try:
+            vec_ready = db.get_meta(conn, "vec_dim") is not None
+        except Exception:
+            vec_ready = False
+    legs["vec"] = vec_ready and resolved in ("full", "lite", "stub")
+
+    # rerank: config on, full tier, model files present.
+    rr = str(cfg.get("rerank", "auto")).strip().lower()
+    rerank_on = rr not in ("off", "false", "no", "0", "none") and resolved == "full"
+    if rerank_on:
+        try:
+            from .recall.rerank import RERANK_REGISTRY
+
+            key = str(cfg.get("rerank_model") or "").strip().lower()
+            if key not in RERANK_REGISTRY:
+                key = next(iter(RERANK_REGISTRY))
+            spec = RERANK_REGISTRY[key]
+            rr_dir = embed.models_cache_dir() / spec.key
+            rerank_on = all((rr_dir / n).exists() and (rr_dir / n).stat().st_size > 0
+                            for n in spec.files)
+        except Exception:
+            rerank_on = False
+    legs["rerank"] = rerank_on
+
+    # graph: PPR needs entity mentions, which only `consolidate` populates.
+    try:
+        legs["graph"] = conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM entity_mentions)").fetchone()[0] == 1
+    except Exception:
+        legs["graph"] = False
+
+    # facts: config on AND at least one current triple.
+    facts_on = bool(cfg.get("facts_leg", True))
+    if facts_on:
+        try:
+            facts_on = conn.execute(
+                "SELECT EXISTS(SELECT 1 FROM facts WHERE valid_to IS NULL)"
+            ).fetchone()[0] == 1
+        except Exception:
+            facts_on = False
+    legs["facts"] = facts_on
+    return legs
+
+
+def _format_legs(legs: dict[str, bool]) -> str:
+    return "  ".join(f"{k}={'yes' if v else 'no'}" for k, v in legs.items())
+
+
 def _doctor_host_config_checks(home: Path, report) -> None:
     """Drift between Hermes's config.yaml and what the brain expects (§4.6).
 
@@ -756,12 +833,54 @@ def _doctor_p2_checks(conn, cfg: dict, report) -> None:
             expected_dim = embed.TARGET_DIM
         report("PASS", "model-files", f"tier '{resolved}' needs no ONNX model files")
 
+    # 8b. rerank model files. Check 8 only covers the EMBEDDING model, so a
+    #     configured reranker with no files on disk made the whole stage a
+    #     silent no-op — get_reranker returns None and nothing says why
+    #     (alignment-audit.md §F2).
+    rr_setting = str(cfg.get("rerank", "auto")).strip().lower()
+    if rr_setting in ("off", "false", "no", "0", "none"):
+        report("PASS", "rerank-model", "rerank disabled by config")
+    elif resolved != "full":
+        report("PASS", "rerank-model", f"tier '{resolved}' has no rerank stage")
+    else:
+        try:
+            from .recall.rerank import RERANK_REGISTRY
+
+            rr_key = str(cfg.get("rerank_model") or "").strip().lower()
+            if rr_key not in RERANK_REGISTRY:
+                rr_key = next(iter(RERANK_REGISTRY))
+            rr_spec = RERANK_REGISTRY[rr_key]
+            rr_dir = embed.models_cache_dir() / rr_spec.key
+            if all((rr_dir / n).exists() and (rr_dir / n).stat().st_size > 0
+                   for n in rr_spec.files):
+                report("PASS", "rerank-model", f"{rr_spec.key} present")
+            else:
+                report("WARN", "rerank-model",
+                       f"{rr_spec.key} missing from {rr_dir} — the rerank stage is "
+                       f"silently skipped; run 'hermes brain models --download'")
+        except Exception as e:
+            report("WARN", "rerank-model", f"could not check: {e}")
+
     # 9. sqlite-vec importable
     if sysinfo.importable("sqlite_vec"):
         report("PASS", "sqlite-vec", "importable")
     else:
         report("WARN", "sqlite-vec", "not importable — vector recall disabled; "
                "pip install sqlite-vec")
+
+    # 9b. the whole full-tier dependency set. Individually each import failure
+    #     degrades quietly and correctly; together they mean the operator asked
+    #     for 'full' and is silently running fts-only.
+    if resolved == "full":
+        missing = [m for m in ("onnxruntime", "tokenizers", "numpy", "sqlite_vec")
+                   if not sysinfo.importable(m)]
+        if missing:
+            report("WARN", "tier-deps",
+                   f"tier resolved to 'full' but {', '.join(missing)} not importable — "
+                   f"retrieval is degraded; pip install 'hermes-brain[full]' "
+                   f"(or pip install {' '.join(missing).replace('sqlite_vec', 'sqlite-vec')})")
+        else:
+            report("PASS", "tier-deps", "onnxruntime, tokenizers, numpy, sqlite-vec present")
 
     # 10. vec table dim vs the tier's embedder dim
     try:
@@ -792,6 +911,21 @@ def _doctor_p2_checks(conn, cfg: dict, report) -> None:
     except Exception as e:
         report("WARN", "lane1-snapshot", f"query failed: {e}")
 
+    # 11b. the summary line: what retrieval will ACTUALLY do on the next query.
+    try:
+        legs = _active_legs(conn, cfg)
+        detail = _format_legs(legs)
+        if not legs.get("fts"):
+            report("FAIL", "legs", detail + " — no keyword leg; search is "
+                   "LIKE-only. Install a Python whose sqlite3 has FTS5.")
+        elif sum(1 for v in legs.values() if v) == 1:
+            report("WARN", "legs", detail + " — only one leg is live; the rest "
+                   "degraded silently (see the checks above for which and why)")
+        else:
+            report("PASS", "legs", detail)
+    except Exception as e:
+        report("WARN", "legs", f"could not determine: {e}")
+
     # 12. owner identity enrolled
     try:
         n = conn.execute(
@@ -810,6 +944,51 @@ def _doctor_p2_checks(conn, cfg: dict, report) -> None:
 # ---------------------------------------------------------------------------
 # bootstrap
 # ---------------------------------------------------------------------------
+
+def _print_bootstrap_coverage(home: Path, counts: dict) -> None:
+    """Report what fraction of state.db actually landed, and what did not.
+
+    A silent import is how a 9%-coverage bootstrap looked like a success: the
+    counts alone ("26 turns") carry no denominator. Reading it back from the
+    source is cheap and read-only, and it makes an incomplete import obvious
+    at the moment it happens rather than months later when recall is thin.
+    """
+    import sqlite3
+
+    from .bootstrap.state_db import _open_state_ro
+
+    path = Path(home) / "state.db"
+    if not path.exists():
+        return
+    try:
+        state = _open_state_ro(path)
+    except sqlite3.Error:
+        return
+    try:
+        users = state.execute(
+            "SELECT count(*) FROM messages WHERE role='user'").fetchone()[0]
+        sessions = state.execute("SELECT count(*) FROM sessions").fetchone()[0]
+    except sqlite3.Error:
+        return
+    finally:
+        state.close()
+
+    turns = int(counts.get("turns") or 0)
+    pct = (turns / users * 100.0) if users else 0.0
+    print(f"\ncoverage                 {turns} turn(s) from {users} user message(s) "
+          f"across {sessions} session(s) — {pct:.0f}%")
+    live = int(counts.get("sessions_live_skipped") or 0)
+    if live:
+        print(f"  {live} session(s) still live — they import once idle for "
+              f"bootstrap_stale_days, or re-run this command later")
+    done = int(counts.get("sessions_skipped") or 0)
+    if done:
+        print(f"  {done} session(s) already imported by an earlier run")
+    if turns and pct < 50:
+        print("  NOTE: coverage is low. Most turns in an agentic session are "
+              "tool calls with no assistant text, which cannot be paired — but "
+              "if this looks wrong, run 'hermes brain doctor'.")
+
 
 def cmd_bootstrap(args: argparse.Namespace) -> int:
     from . import config
@@ -839,6 +1018,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         )
         for key, value in (counts or {}).items():
             print(f"{key:<24} {value}")
+        _print_bootstrap_coverage(home, counts or {})
         return 0
     except Exception as e:
         print(f"Bootstrap failed: {e}\n"

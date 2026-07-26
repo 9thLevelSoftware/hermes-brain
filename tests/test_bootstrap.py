@@ -9,6 +9,7 @@ by re-running every stage and expecting zero new rows.
 from __future__ import annotations
 
 import sqlite3
+import time
 
 import pytest
 from brain.bootstrap import run_bootstrap
@@ -385,7 +386,11 @@ def test_backfill_session_started_at_fallback_ts(conn, tmp_home):
     assert row["ts"].startswith("2001-09-09T")
 
 
-def test_backfill_skips_inactive_messages(conn, tmp_home):
+def test_backfill_imports_compacted_messages_by_default(conn, tmp_home):
+    """active=0 means "compressed out of the live context" — which is exactly
+    the history an external memory system exists to preserve. Skipping it is
+    right for live capture and backwards for bootstrap
+    (docs/design/alignment-audit.md §F1)."""
     build_state_db(tmp_home, [
         ("sess-act", "cli", 100.0, [
             ("user", "compacted away", 101.0, 0),
@@ -395,31 +400,128 @@ def test_backfill_skips_inactive_messages(conn, tmp_home):
         ]),
     ])
     counts = backfill_sessions(conn, tmp_home)
-    assert counts["turns"] == 1
+    assert counts["turns"] == 2
     assert _count(conn, "episodes", "user_content='live question'") == 1
+    assert _count(conn, "episodes", "user_content='compacted away'") == 1
+
+
+def test_backfill_can_still_exclude_compacted_messages(conn, tmp_home):
+    build_state_db(tmp_home, [
+        ("sess-act", "cli", 100.0, [
+            ("user", "compacted away", 101.0, 0),
+            ("assistant", "compacted reply", 102.0, 0),
+            ("user", "live question", 103.0, 1),
+            ("assistant", "live answer", 104.0),
+        ]),
+    ])
+    counts = backfill_sessions(conn, tmp_home, include_compacted=False)
+    assert counts["turns"] == 1
     assert _count(conn, "episodes", "user_content='compacted away'") == 0
 
 
-def test_backfill_skips_live_session_without_watermark(conn, tmp_home):
-    """ended_at IS NULL means still running: no import AND no watermark —
-    a watermark now would freeze the partial transcript forever."""
+def test_backfill_skips_a_genuinely_live_session_without_watermark(conn, tmp_home):
+    """ended_at IS NULL AND recently active means still running: no import AND
+    no watermark — a watermark now would freeze the partial transcript."""
+    now = time.time()
     build_state_db(tmp_home, [
-        ("sess-live", "cli", 100.0, _session_messages(2, "live"),
-         {"ended_at": None}),
+        ("sess-live", "cli", now - 60, [
+            ("user", "live q1", now - 50), ("assistant", "live a1", now - 49),
+            ("user", "live q2", now - 20), ("assistant", "live a2", now - 19),
+        ], {"ended_at": None}),
     ])
     counts = backfill_sessions(conn, tmp_home)
     assert counts["sessions"] == 0 and counts["turns"] == 0
+    assert counts["skipped_live"] == 1
     assert _count(conn, "episodes") == 0
     assert _count(conn, "sweep_state", "key='bootstrap:sess-live'") == 0
 
     # The session ends later — the next run picks it up in full.
     con = sqlite3.connect(str(tmp_home / "state.db"))
-    con.execute("UPDATE sessions SET ended_at=200.0 WHERE id='sess-live'")
+    con.execute("UPDATE sessions SET ended_at=? WHERE id='sess-live'", (now,))
     con.commit()
     con.close()
     counts = backfill_sessions(conn, tmp_home)
     assert counts["sessions"] == 1 and counts["turns"] == 2
     assert _count(conn, "sweep_state", "key='bootstrap:sess-live'") == 1
+
+
+def test_backfill_reaps_an_abandoned_open_session(conn, tmp_home):
+    """Hermes stamps ended_at on a clean close only, so on a real install most
+    sessions never get one. Without a reaper "still running" also meant
+    "abandoned months ago" — 72% of all history, skipped permanently."""
+    old = time.time() - 30 * 86400
+    build_state_db(tmp_home, [
+        ("sess-abandoned", "cli", old, [
+            ("user", "old q1", old + 1), ("assistant", "old a1", old + 2),
+            ("user", "old q2", old + 3), ("assistant", "old a2", old + 4),
+        ], {"ended_at": None}),
+    ])
+    counts = backfill_sessions(conn, tmp_home)
+    assert counts["sessions"] == 1 and counts["turns"] == 2
+    assert counts["reaped"] == 1 and counts["skipped_live"] == 0
+    assert _count(conn, "sweep_state", "key='bootstrap:sess-abandoned'") == 1
+
+
+def test_stale_days_threshold_is_configurable(conn, tmp_home):
+    ts = time.time() - 3 * 86400  # 3 days old
+    build_state_db(tmp_home, [
+        ("sess-3d", "cli", ts, [("user", "q", ts), ("assistant", "a", ts + 1)],
+         {"ended_at": None}),
+    ])
+    # Default (7d): still considered live.
+    assert backfill_sessions(conn, tmp_home)["skipped_live"] == 1
+    # Lower the bar: now it reaps.
+    counts = backfill_sessions(conn, tmp_home, stale_days=1)
+    assert counts["reaped"] == 1 and counts["turns"] == 1
+
+
+def test_open_session_with_no_messages_is_safe_to_reap(conn, tmp_home):
+    """Nothing to freeze, so no reason to withhold it forever."""
+    build_state_db(tmp_home, [("sess-empty", "cli", time.time(), [], {"ended_at": None})])
+    counts = backfill_sessions(conn, tmp_home)
+    assert counts["skipped_live"] == 0
+    assert _count(conn, "sweep_state", "key='bootstrap:sess-empty'") == 1
+
+
+def test_consecutive_user_messages_are_joined_not_dropped(conn, tmp_home):
+    """A second user message used to OVERWRITE the pending one, silently
+    discarding the first. Real transcripts are full of follow-ups sent before
+    the assistant replies."""
+    ts = time.time() - 30 * 86400
+    build_state_db(tmp_home, [
+        ("sess-multi", "cli", ts, [
+            ("user", "first question", ts + 1),
+            ("user", "actually also this", ts + 2),
+            ("user", "and one more thing", ts + 3),
+            ("assistant", "answering all three", ts + 4),
+        ]),
+    ])
+    counts = backfill_sessions(conn, tmp_home)
+    assert counts["turns"] == 1
+    row = conn.execute("SELECT user_content FROM episodes").fetchone()
+    for fragment in ("first question", "actually also this", "and one more thing"):
+        assert fragment in row["user_content"]
+
+
+def test_user_turn_survives_a_tool_call_loop(conn, tmp_home):
+    """Blank assistant rows are the tool-call scaffolding of an agentic loop —
+    on a real install they are the MAJORITY. They must not close a turn, so the
+    user message still pairs with the reply that eventually arrives."""
+    ts = time.time() - 30 * 86400
+    build_state_db(tmp_home, [
+        ("sess-tools", "cli", ts, [
+            ("user", "run the deploy", ts + 1),
+            ("assistant", "", ts + 2),        # tool call, no text
+            ("tool", "tool output", ts + 3),
+            ("assistant", "", ts + 4),        # another tool call
+            ("tool", "more output", ts + 5),
+            ("assistant", "deploy finished", ts + 6),
+        ]),
+    ])
+    assert backfill_sessions(conn, tmp_home)["turns"] == 1
+    row = conn.execute("SELECT user_content, assistant_content FROM episodes").fetchone()
+    assert row["user_content"] == "run the deploy"
+    assert row["assistant_content"] == "deploy finished"
 
 
 def test_backfill_ancient_schema_without_projected_columns(conn, tmp_home):
@@ -607,3 +709,38 @@ def test_cmd_bootstrap_via_cli_returns_zero(tmp_home, monkeypatch, capsys):
         assert _count(conn, "memories", "content='cli fact'") == 1
     finally:
         conn.close()
+
+
+def test_trailing_user_messages_are_captured_not_discarded(conn, tmp_home):
+    """A user message with no reply — session ended, crashed, or only tool
+    calls followed. 156 of 290 user messages were in this state on the install
+    that motivated this, and all of them were discarded."""
+    ts = time.time() - 30 * 86400
+    build_state_db(tmp_home, [
+        ("sess-trail", "cli", ts, [
+            ("user", "answered question", ts + 1),
+            ("assistant", "the answer", ts + 2),
+            ("user", "please deploy to prod", ts + 3),
+            ("user", "and update the changelog", ts + 4),
+        ]),
+    ])
+    assert backfill_sessions(conn, tmp_home)["turns"] == 2
+    row = conn.execute(
+        "SELECT user_content, assistant_content FROM episodes"
+        " WHERE trim(assistant_content)=''").fetchone()
+    assert row is not None, "the trailing turn must be captured"
+    assert "please deploy to prod" in row["user_content"]
+    assert "and update the changelog" in row["user_content"]
+
+
+def test_a_session_of_only_tool_noise_yields_nothing(conn, tmp_home):
+    """No user text at all -> no episodes, and no crash."""
+    ts = time.time() - 30 * 86400
+    build_state_db(tmp_home, [
+        ("sess-noise", "cli", ts, [
+            ("assistant", "", ts + 1), ("tool", "output", ts + 2),
+            ("assistant", "", ts + 3),
+        ]),
+    ])
+    assert backfill_sessions(conn, tmp_home)["turns"] == 0
+    assert _count(conn, "episodes") == 0

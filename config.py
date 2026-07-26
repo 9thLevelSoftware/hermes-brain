@@ -36,6 +36,16 @@ DEFAULTS: dict[str, Any] = {
     "extract_search_aids": True, # D2: fold LLM paraphrase aids into tags + embed text
     "extract_max_aids": 4,       # per-item cap on search aids
     "bootstrap_import": True,
+    # An `ended_at IS NULL` session is only withheld from bootstrap while it is
+    # plausibly LIVE. Hermes stamps ended_at on a clean close only, so without a
+    # staleness reaper "still running" also meant "abandoned months ago" — and
+    # on the install that motivated this, that was 72% of all history, skipped
+    # permanently (docs/design/alignment-audit.md §F1).
+    "bootstrap_stale_days": 7,
+    # Import messages compacted out of the live context (active=0). Right for
+    # bootstrap and wrong for live capture: compacted history is exactly what an
+    # external memory system exists to preserve.
+    "bootstrap_include_compacted": True,
     "night_budget_usd": 0.50,
     "day_budget_usd": 1.50,
     "forget_grace_days": 30,

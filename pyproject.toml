@@ -34,6 +34,26 @@ dev = [
     "ruff>=0.9.0",
 ]
 
+[tool.setuptools]
+# The repo root IS the Hermes plugin directory: the host loads it BY PATH
+# (spec_from_file_location, registered under a synthetic package name), never
+# through `import hermes_brain`. There are no console scripts and no entry
+# points, so there is deliberately NOTHING to install into site-packages —
+# this project's pip install exists only to resolve the optional-dependency
+# extras ([dev], [full], [rerank], [sync]).
+#
+# These empty lists are load-bearing, not decoration. Without them setuptools
+# runs flat-layout auto-discovery, finds a dozen top-level packages
+# (bootstrap, capture, dream, memfs, recall, skillforge, store, sync, replay,
+# observer, tests) plus nine root modules, cannot choose, and aborts — BEFORE
+# it ever reads [project.optional-dependencies]. That is why the documented
+# `pip install -e .[dev]` and `.[full]` both failed with a package-discovery
+# error. Declaring "install nothing" is the honest fix; inventing a package
+# name here would put a second, importable copy of the plugin on sys.path and
+# invite exactly the dual-identity bugs _compat.py exists to avoid.
+packages = []
+py-modules = []
+
 [tool.ruff]
 target-version = "py311"
 line-length = 100
