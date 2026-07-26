@@ -52,6 +52,12 @@ def _episode_count(tmp_home, session_id=None):
 
 
 def test_fifty_turns_lane1_stable_capture_complete_and_fast(tmp_home):
+    # fts-only: what this pins is lane-1 byte stability, queue-only sync_turn
+    # latency, and that shutdown DRAINS rather than abandoning work. Firing 50
+    # turns with no gaps is already an artificial worst case (real turns arrive
+    # minutes apart, so the queue is empty at shutdown); adding real ONNX
+    # embedding of all 50 on top would measure model load time, not the drain.
+    brain_config.save_config(tmp_home, {"mode": "fts-only"})
     provider = _make(tmp_home, "sess-50")
     baseline = provider.system_prompt_block()
     assert isinstance(baseline, str)
@@ -94,6 +100,7 @@ def test_prefetch_empty_query_never_raises(tmp_home):
 
 
 def test_queue_prefetch_serves_seeded_memory(tmp_home):
+    brain_config.save_config(tmp_home, {"mode": "fts-only"})
     conn = db.connect(tmp_home)
     seed_memory(conn, "Warning: flux_capacitor drains the plasma coil unless vented first.",
                 kind="warning", outcome="failed")
@@ -167,7 +174,10 @@ def test_recall_mode_context_hides_tools_but_keeps_lanes(tmp_home):
                 kind="warning", outcome="failed")
     conn.close()
 
-    brain_config.save_config(tmp_home, {"recall_mode": "context"})
+    # fts-only on purpose: this test is about lane/tool GATING, not retrieval
+    # quality, and loading a real ONNX embedder here costs seconds and makes
+    # the poll below flaky on machines where the [full] extra is installed.
+    brain_config.save_config(tmp_home, {"recall_mode": "context", "mode": "fts-only"})
     provider = _make(tmp_home, "sess-ctx")
     assert provider.get_tool_schemas() == []
 
@@ -185,7 +195,7 @@ def test_recall_mode_tools_hides_lanes_but_keeps_tools(tmp_home):
                 kind="warning", outcome="failed")
     conn.close()
 
-    brain_config.save_config(tmp_home, {"recall_mode": "tools"})
+    brain_config.save_config(tmp_home, {"recall_mode": "tools", "mode": "fts-only"})
     provider = _make(tmp_home, "sess-tools")
     assert [s["function"]["name"] for s in provider.get_tool_schemas()], \
         "tools mode must still advertise the tool surface"

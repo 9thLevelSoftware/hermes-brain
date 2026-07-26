@@ -108,7 +108,11 @@ hermes brain review [--approve/--reject <uid>]       # proposals + quarantine qu
 hermes brain skills list|forge|approve|reject        # forged-skill lifecycle
 hermes brain mcp                                      # stdio MCP server for external agents
 hermes brain adopt-memory [--apply]                  # hand memory ownership to the brain
-hermes brain context | ask <q> | fact <s> | eval     # context block, cited answers, s-p-o facts
+hermes brain context | ask <q> | fact <s>            # context block, cited answers, s-p-o facts
+hermes brain why-not <query> <id>                    # why a memory did NOT surface
+hermes brain eval --generate|--sample K|--compare    # real-corpus retrieval measurement
+hermes brain weights show|reset                      # active retrieval-leg weights
+hermes brain import-provider <name> [--apply]        # migrate from another provider
 hermes brain export | import | sync init|push|pull|status
 ```
 
@@ -121,7 +125,14 @@ Beyond the `MemoryProvider` ABC, the host duck-types a few optional provider met
 - **`recall_mode`** (`hybrid | context | tools`) mirrors Honcho's `recallMode` / Hindsight's `memory_mode`. Read ONCE at `initialize()` — it decides what lane 1 renders, so re-reading it mid-session would break byte-stability.
 - **`plugins/memory/query_rewrite.py`** is a host-shared, provider-agnostic query rewriter (config `query_rewrite`, off by default). It calls `agent.auxiliary_client` directly, which would route spend around the budget gate — so it is wrapped by `llm.call_query_rewrite` (gate before, meter after), never called directly.
 
-`docs/design/alignment-audit.md` is the numbered record of what was checked and why each call was made.
+`docs/design/alignment-audit.md` is the numbered record of what was checked and why each call was made. Its **§F series** covers what running against real data (rather than fixtures) found — read it before touching `bootstrap/state_db.py`, `recall/weights.py`, or `evalkit/`.
+
+## Retrieval weights and measurement
+
+- **`recall/weights.py`** holds the active per-leg fusion weights in a `meta` row. `fusion.rrf()` takes an optional positional `weights` list; `recall/search.py` maintains `leg_names` parallel to `rankings` to map them. Uniform weights are byte-identical to no weights — every other caller (`blend.py`) depends on that.
+- **`tune` is still shadow and still never auto-applies.** The ONLY path from a fitted weight to live retrieval is `hermes brain review --approve` on a `kind='tuning'` proposal. A proposal with no fitted weights is refused, not silently "approved". `weights.from_proposal` rescales `fit_weights`' CONVEX output to mean 1.0 (a uniform scale would leave RRF ranking unchanged) and renames its `ppr` leg to `graph`.
+- **`evalkit/`** measures retrieval on the owner's real corpus: LLM-generated *paraphrase* queries (verbatim ones just measure BM25 finding itself), stored under `$HERMES_HOME/brain/eval/` (user data, never the repo), scored per leg-configuration with **paired win/loss/tie** alongside means. A config whose leg is unavailable is reported skipped, never scored.
+- **`bootstrap/state_db.py`** has a staleness reaper: an `ended_at IS NULL` session is withheld only while genuinely live (newest message within `bootstrap_stale_days`). Without it, 72% of a real install's history was skipped forever.
 
 ## "Best-of-three" subsystems (Mnemosyne + Honcho ports)
 

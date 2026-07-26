@@ -116,11 +116,23 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     p_ctx.add_argument("--tokens", type=int, default=None,
                        help="token budget (default: precompress_tokens config)")
 
-    p_eval = cmds.add_parser("eval", help="run the retrieval/answer eval harness on a fixture")
+    p_eval = cmds.add_parser("eval", help="retrieval quality: fixture harness, or a "
+                                          "real query set over your own brain")
     p_eval.add_argument("--fixture", default=None,
                         help="eval fixture JSON (default: bundled eval_basic.json)")
     p_eval.add_argument("--real", action="store_true",
                         help="use the real aux LLM instead of the scripted fake")
+    p_eval.add_argument("--generate", action="store_true",
+                        help="build a paraphrase query set from YOUR memories (uses "
+                             "the aux LLM; costs budget)")
+    p_eval.add_argument("--limit", type=int, default=150,
+                        help="how many source items to sample when generating")
+    p_eval.add_argument("--sample", type=int, default=0, metavar="K",
+                        help="print K query/gold pairs from the stored set for "
+                             "manual spot-checking")
+    p_eval.add_argument("--compare", action="store_true",
+                        help="score the stored query set across every leg "
+                             "configuration (no LLM calls)")
 
     p_id = cmds.add_parser("identity", help="manage platform identities (trust roots)")
     id_sub = p_id.add_subparsers(dest="identity_command")
@@ -176,6 +188,24 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
                          help="set a strategy's mode to off")
 
     # -- P5: learning surface --------------------------------------------------
+    p_imp_p = cmds.add_parser("import-provider",
+                              help="import memory from another Hermes memory provider")
+    p_imp_p.add_argument("provider", help="holographic | jsonl (others: see --help output)")
+    p_imp_p.add_argument("--path", default=None,
+                         help="source file (default: the provider's usual location)")
+    p_imp_p.add_argument("--apply", action="store_true",
+                         help="write the import (default: dry-run)")
+
+    p_whynot = cmds.add_parser("why-not",
+                               help="why a memory did NOT surface for a query")
+    p_whynot.add_argument("query", help="the search query")
+    p_whynot.add_argument("uid", help="uid prefix of the memory you expected")
+
+    p_w = cmds.add_parser("weights", help="active retrieval-leg weights (show | reset)")
+    w_sub = p_w.add_subparsers(dest="weights_command")
+    w_sub.add_parser("show", help="show the active per-leg weights and their source")
+    w_sub.add_parser("reset", help="revert to uniform weights")
+
     p_ins = cmds.add_parser("insights", help="longitudinal learning metrics from turn_outcomes")
     p_ins.add_argument("--days", type=int, default=30, help="window in days (default 30)")
 
@@ -222,13 +252,14 @@ def brain_command(args: argparse.Namespace) -> int:
         "models": cmd_models, "export": cmd_export, "import": cmd_import,
         "incognito": cmd_incognito, "dream-now": cmd_dream_now, "dream": cmd_dream,
         "insights": cmd_insights, "review": cmd_review, "skills": cmd_skills,
-        "sync": cmd_sync,
+        "sync": cmd_sync, "weights": cmd_weights,
+        "import-provider": cmd_import_provider, "why-not": cmd_why_not,
         "mcp": cmd_mcp, "adopt-memory": cmd_adopt_memory,
     }.get(cmd)
     if handler is None:
         print(f"Unknown brain command: {cmd}. Try: hermes brain status|search|doctor|"
               f"remember|forget|why|fact|ask|identity|reindex|models|export|import|incognito|"
-              f"dream-now|dream|insights|review|skills|context|sync|mcp|adopt-memory",
+              f"dream-now|dream|insights|review|skills|weights|context|sync|mcp|adopt-memory",
               file=sys.stderr)
         return 1
     return handler(args)
@@ -390,6 +421,12 @@ def cmd_status(args: argparse.Namespace) -> int:
               f"fts5={'yes' if caps.get('fts5') else 'NO'} "
               f"vec={'yes' if caps.get('vec') else 'no'}")
         print(f"tier              {_tier_label(cfg, sysinfo.resolve_mode(str(mode)))}")
+        # What retrieval will actually do — every leg degrades silently and
+        # independently, so the configured stack and the live one can differ.
+        try:
+            print(f"legs              {_format_legs(_active_legs(conn, cfg))}")
+        except Exception as e:
+            print(f"legs              (undetermined: {e})")
         vstats = vec_store.stats(conn)
         if vstats:
             print(f"vectors           mem_vec={vstats.get('mem_vec')} "
@@ -632,6 +669,77 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 1 if n_fail else 0
 
 
+def _active_legs(conn, cfg: dict) -> dict[str, bool]:
+    """Which retrieval legs would actually run right now.
+
+    Every leg degrades silently and independently by design (a missing model,
+    an absent extension, an empty table), which is correct behavior and
+    terrible observability: the operator sees a configured six-leg stack and
+    gets one leg, with nothing anywhere saying so. This is the one-line answer.
+    """
+    from .recall import embed
+    from .store import db, sysinfo
+
+    resolved = sysinfo.resolve_mode(str(cfg.get("mode", "auto")))
+    caps = {}
+    try:
+        caps = db.capabilities(conn)
+    except Exception:
+        pass
+
+    legs = {"fts": bool(caps.get("fts5"))}
+
+    # vector: needs the extension, an embedder for the tier, AND a live index.
+    vec_ready = bool(caps.get("vec"))
+    if vec_ready:
+        try:
+            vec_ready = db.get_meta(conn, "vec_dim") is not None
+        except Exception:
+            vec_ready = False
+    legs["vec"] = vec_ready and resolved in ("full", "lite", "stub")
+
+    # rerank: config on, full tier, model files present.
+    rr = str(cfg.get("rerank", "auto")).strip().lower()
+    rerank_on = rr not in ("off", "false", "no", "0", "none") and resolved == "full"
+    if rerank_on:
+        try:
+            from .recall.rerank import RERANK_REGISTRY
+
+            key = str(cfg.get("rerank_model") or "").strip().lower()
+            if key not in RERANK_REGISTRY:
+                key = next(iter(RERANK_REGISTRY))
+            spec = RERANK_REGISTRY[key]
+            rr_dir = embed.models_cache_dir() / spec.key
+            rerank_on = all((rr_dir / n).exists() and (rr_dir / n).stat().st_size > 0
+                            for n in spec.files)
+        except Exception:
+            rerank_on = False
+    legs["rerank"] = rerank_on
+
+    # graph: PPR needs entity mentions, which only `consolidate` populates.
+    try:
+        legs["graph"] = conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM entity_mentions)").fetchone()[0] == 1
+    except Exception:
+        legs["graph"] = False
+
+    # facts: config on AND at least one current triple.
+    facts_on = bool(cfg.get("facts_leg", True))
+    if facts_on:
+        try:
+            facts_on = conn.execute(
+                "SELECT EXISTS(SELECT 1 FROM facts WHERE valid_to IS NULL)"
+            ).fetchone()[0] == 1
+        except Exception:
+            facts_on = False
+    legs["facts"] = facts_on
+    return legs
+
+
+def _format_legs(legs: dict[str, bool]) -> str:
+    return "  ".join(f"{k}={'yes' if v else 'no'}" for k, v in legs.items())
+
+
 def _doctor_host_config_checks(home: Path, report) -> None:
     """Drift between Hermes's config.yaml and what the brain expects (§4.6).
 
@@ -756,12 +864,54 @@ def _doctor_p2_checks(conn, cfg: dict, report) -> None:
             expected_dim = embed.TARGET_DIM
         report("PASS", "model-files", f"tier '{resolved}' needs no ONNX model files")
 
+    # 8b. rerank model files. Check 8 only covers the EMBEDDING model, so a
+    #     configured reranker with no files on disk made the whole stage a
+    #     silent no-op — get_reranker returns None and nothing says why
+    #     (alignment-audit.md §F2).
+    rr_setting = str(cfg.get("rerank", "auto")).strip().lower()
+    if rr_setting in ("off", "false", "no", "0", "none"):
+        report("PASS", "rerank-model", "rerank disabled by config")
+    elif resolved != "full":
+        report("PASS", "rerank-model", f"tier '{resolved}' has no rerank stage")
+    else:
+        try:
+            from .recall.rerank import RERANK_REGISTRY
+
+            rr_key = str(cfg.get("rerank_model") or "").strip().lower()
+            if rr_key not in RERANK_REGISTRY:
+                rr_key = next(iter(RERANK_REGISTRY))
+            rr_spec = RERANK_REGISTRY[rr_key]
+            rr_dir = embed.models_cache_dir() / rr_spec.key
+            if all((rr_dir / n).exists() and (rr_dir / n).stat().st_size > 0
+                   for n in rr_spec.files):
+                report("PASS", "rerank-model", f"{rr_spec.key} present")
+            else:
+                report("WARN", "rerank-model",
+                       f"{rr_spec.key} missing from {rr_dir} — the rerank stage is "
+                       f"silently skipped; run 'hermes brain models --download'")
+        except Exception as e:
+            report("WARN", "rerank-model", f"could not check: {e}")
+
     # 9. sqlite-vec importable
     if sysinfo.importable("sqlite_vec"):
         report("PASS", "sqlite-vec", "importable")
     else:
         report("WARN", "sqlite-vec", "not importable — vector recall disabled; "
                "pip install sqlite-vec")
+
+    # 9b. the whole full-tier dependency set. Individually each import failure
+    #     degrades quietly and correctly; together they mean the operator asked
+    #     for 'full' and is silently running fts-only.
+    if resolved == "full":
+        missing = [m for m in ("onnxruntime", "tokenizers", "numpy", "sqlite_vec")
+                   if not sysinfo.importable(m)]
+        if missing:
+            report("WARN", "tier-deps",
+                   f"tier resolved to 'full' but {', '.join(missing)} not importable — "
+                   f"retrieval is degraded; pip install 'hermes-brain[full]' "
+                   f"(or pip install {' '.join(missing).replace('sqlite_vec', 'sqlite-vec')})")
+        else:
+            report("PASS", "tier-deps", "onnxruntime, tokenizers, numpy, sqlite-vec present")
 
     # 10. vec table dim vs the tier's embedder dim
     try:
@@ -792,6 +942,21 @@ def _doctor_p2_checks(conn, cfg: dict, report) -> None:
     except Exception as e:
         report("WARN", "lane1-snapshot", f"query failed: {e}")
 
+    # 11b. the summary line: what retrieval will ACTUALLY do on the next query.
+    try:
+        legs = _active_legs(conn, cfg)
+        detail = _format_legs(legs)
+        if not legs.get("fts"):
+            report("FAIL", "legs", detail + " — no keyword leg; search is "
+                   "LIKE-only. Install a Python whose sqlite3 has FTS5.")
+        elif sum(1 for v in legs.values() if v) == 1:
+            report("WARN", "legs", detail + " — only one leg is live; the rest "
+                   "degraded silently (see the checks above for which and why)")
+        else:
+            report("PASS", "legs", detail)
+    except Exception as e:
+        report("WARN", "legs", f"could not determine: {e}")
+
     # 12. owner identity enrolled
     try:
         n = conn.execute(
@@ -810,6 +975,311 @@ def _doctor_p2_checks(conn, cfg: dict, report) -> None:
 # ---------------------------------------------------------------------------
 # bootstrap
 # ---------------------------------------------------------------------------
+
+def _approve_tuning(conn, home: Path, row) -> int:
+    """Apply an approved tune proposal's fitted weights to live retrieval.
+
+    Before this existed, approving a tuning proposal set status='approved' and
+    did nothing at all — `fusion.rrf()` had no weight parameter, so the fitted
+    weights had no consumer anywhere (alignment-audit.md §F4). This is the only
+    path from a fitted weight to live retrieval, and it requires an explicit
+    human approve: `tune` remains a shadow strategy and is never auto-applied.
+    """
+    from .recall import weights as weights_mod
+    from .store import db
+
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (ValueError, TypeError):
+        payload = {}
+    fitted = weights_mod.from_proposal(payload)
+    if fitted is None:
+        print("This tuning proposal carries no applicable leg weights — it "
+              "recorded feature contrasts only.\n"
+              "  Nothing to apply; mark it read with --reject, or wait for a "
+              "dream run with enough labeled retrievals to fit weights.",
+              file=sys.stderr)
+        return 1
+
+    before = weights_mod.load(conn)
+    weights_mod.save(conn, fitted)
+    conn.execute("UPDATE proposals SET status='applied', decided_at=?, "
+                 "decided_by='cli' WHERE uid=?", (db.iso_now(), row["uid"]))
+    conn.commit()
+    print(f"approved: retrieval weights applied ({row['uid'][:8]})")
+    for leg in weights_mod.LEGS:
+        print(f"  {leg:<8} {before.get(leg, 1.0):>5.2f} -> {fitted[leg]:>5.2f}")
+    print("\nMeasure the effect, do not assume it:\n"
+          "  hermes brain eval --compare        (before/after on your query set)\n"
+          "  hermes brain weights reset         (revert to uniform)")
+    return 0
+
+
+def cmd_import_provider(args: argparse.Namespace) -> int:
+    """Import memory from another Hermes memory provider (dry-run by default)."""
+    from .bootstrap.providers import PROVIDERS, UNSUPPORTED, import_provider
+
+    home = _hermes_home()
+    conn = _open_db(home)
+    if conn is None:
+        return 1
+    try:
+        counts = import_provider(conn, args.provider, hermes_home=home,
+                                 path=args.path, apply=args.apply)
+    finally:
+        conn.close()
+
+    if "error" in counts:
+        print(counts["error"], file=sys.stderr)
+        name = (args.provider or "").strip().lower()
+        if name not in UNSUPPORTED and name not in PROVIDERS:
+            print(f"  supported directly: {', '.join(PROVIDERS)}\n"
+                  f"  others (export first, then --provider jsonl): "
+                  f"{', '.join(sorted(UNSUPPORTED))}", file=sys.stderr)
+        return 1
+
+    for key in ("provider", "source", "imported", "skipped", "malformed"):
+        if key in counts:
+            print(f"{key:<12} {counts[key]}")
+    if not args.apply:
+        print("\nDry run — nothing was written. Re-run with --apply to keep it.")
+    else:
+        print(f"\nImported at 'agent' trust with provenance import:{counts['provider']}.\n"
+              "  Review anything surprising: hermes brain search <term>")
+    return 0
+
+
+def cmd_why_not(args: argparse.Namespace) -> int:
+    """Explain why a memory did NOT surface for a query.
+
+    `why <id>` answers "what is this memory and where did it come from", which
+    is the easy direction. When recall disappoints the question is about the
+    row that DIDN'T appear, and nothing answered that (alignment-audit.md §F5).
+    """
+    from .recall import weights as weights_mod
+    from .recall.search import search
+    from .store import db
+
+    home = _hermes_home()
+    conn = _open_db(home)
+    if conn is None:
+        return 1
+    try:
+        prefix = str(args.uid).strip().upper()
+        row = conn.execute(
+            "SELECT * FROM memories WHERE uid LIKE ? ORDER BY id DESC LIMIT 1",
+            (prefix + "%",)).fetchone()
+        # Episodes are half of what recall returns, so "why didn't this turn
+        # come back?" is as common a question as the memory version.
+        episode = None
+        if row is None:
+            episode = conn.execute(
+                "SELECT * FROM episodes WHERE uid LIKE ? ORDER BY id DESC LIMIT 1",
+                (prefix + "%",)).fetchone()
+        if row is None and episode is None:
+            print(f"No memory or episode with uid prefix {prefix!r}.\n"
+                  "  Remedy: ids come from 'hermes brain search' results.",
+                  file=sys.stderr)
+            return 1
+
+        if episode is not None:
+            return _why_not_episode(conn, args, episode, home)
+
+        print(f"memory        {row['uid'][:8]}  kind={row['kind']}  status={row['status']}")
+        print(f"content       {' '.join((row['content'] or '')[:160].split())}")
+        print()
+
+        # 1. Structural exclusions — these beat every ranking consideration.
+        blockers = []
+        if row["status"] != "active":
+            blockers.append(f"status is {row['status']!r}, not 'active' — "
+                            f"tombstoned and quarantined rows never reach the lanes")
+        if row["valid_to"] is not None:
+            blockers.append("superseded (valid_to set) — a newer version replaced it")
+        if not row["live"]:
+            blockers.append("live=0 — demoted by the forget pass")
+        if row["kind"] in ("peer_card", "strategy", "guardrail", "case"):
+            blockers.append(f"kind={row['kind']!r} is excluded from generic recall "
+                            f"(internal/dream-owned)")
+        if row["scope_user"]:
+            blockers.append(f"scoped to principal {row['scope_user']!r} — only that "
+                            f"caller (and the owner) can retrieve it")
+        if blockers:
+            print("EXCLUDED before ranking:")
+            for b in blockers:
+                print(f"  - {b}")
+            print()
+
+        # 2. Ranking: run the real search and locate it.
+        from . import config as config_mod
+
+        embedder, reranker = _eval_embedder_and_reranker(config_mod.load_config(home))
+        hits = search(conn, args.query, limit=50, include_episodes=True,
+                      episode_limit=50, trust_tier="owner",
+                      embedder=embedder, reranker=reranker)
+        rank = next((i for i, h in enumerate(hits, 1) if h.uid == row["uid"]), None)
+        if rank:
+            print(f"RANKING       found at position {rank} of {len(hits)} "
+                  f"(score {hits[rank - 1].score:.3f}, via {hits[rank - 1].source})")
+            print("  It IS retrievable — but lane 2 injects only the top few, so "
+                  "anything past that is crowded out by higher-scoring rows.")
+        else:
+            print(f"RANKING       not in the top {len(hits)} for this query")
+            toks = set(_why_not_tokens(args.query))
+            overlap = toks & set(_why_not_tokens(row["content"] or ""))
+            print(f"  shared query terms: {', '.join(sorted(overlap)) or '(none)'}")
+            if not overlap:
+                print("  No lexical overlap — the keyword leg cannot match it. It "
+                      "needs the vector leg (check 'legs' in 'hermes brain doctor').")
+
+        # 3. Lifecycle modulation that could have demoted it.
+        print()
+        print("MODULATION")
+        print(f"  pinned={bool(row['pinned'])}  outcome={row['outcome']}  "
+              f"helpful={row['helpful_count']}  harmful={row['harmful_count']}")
+        if row["harmful_count"] and row["harmful_count"] > row["helpful_count"]:
+            print("  - marked harmful more often than helpful; its score is damped")
+        if row["half_life_days"]:
+            age = (db.iso_now()[:10], row["valid_from"][:10])
+            print(f"  - decays with a {row['half_life_days']}d half-life "
+                  f"(recorded {age[1]}, today {age[0]})")
+        active = weights_mod.load(conn)
+        if weights_mod.is_active(conn):
+            print(f"  - approved leg weights are active: "
+                  f"{', '.join(f'{k}={v:g}' for k, v in active.items())}")
+        return 0
+    finally:
+        conn.close()
+
+
+def _why_not_episode(conn, args: argparse.Namespace, row, home: Path) -> int:
+    """why-not for a raw conversation turn.
+
+    Episodes have their own exclusion rules — attribution scoping rather than
+    scope_user, and a flat 0.6x score factor so distilled memories outrank raw
+    turns — so they need their own explanation, not the memory one reworded.
+    """
+    from . import config as config_mod
+    from .recall.search import search
+
+    print(f"episode       {row['uid'][:8]}  session={row['session_id'][:20]}  "
+          f"turn={row['turn_no']}")
+    print(f"user          {' '.join((row['user_content'] or '')[:140].split())}")
+    print()
+
+    blockers = []
+    if (row["trust_tier"] or "") == "untrusted":
+        blockers.append("trust_tier='untrusted' — excluded from the episode leg "
+                        "for every caller")
+    if blockers:
+        print("EXCLUDED before ranking:")
+        for b in blockers:
+            print(f"  - {b}")
+        print()
+
+    embedder, reranker = _eval_embedder_and_reranker(config_mod.load_config(home))
+    hits = search(conn, args.query, limit=50, include_episodes=True,
+                  episode_limit=50, trust_tier="owner",
+                  embedder=embedder, reranker=reranker)
+    rank = next((i for i, h in enumerate(hits, 1) if h.uid == row["uid"]), None)
+    if rank:
+        print(f"RANKING       found at position {rank} of {len(hits)} "
+              f"(score {hits[rank - 1].score:.3f}, via {hits[rank - 1].source})")
+    else:
+        print(f"RANKING       not in the top {len(hits)} for this query")
+        toks = set(_why_not_tokens(args.query))
+        body = f"{row['user_content'] or ''} {row['assistant_content'] or ''}"
+        overlap = toks & set(_why_not_tokens(body))
+        print(f"  shared query terms: {', '.join(sorted(overlap)) or '(none)'}")
+        if not overlap:
+            print("  No lexical overlap — the keyword leg cannot match it; it needs "
+                  "the vector leg (check 'legs' in 'hermes brain doctor').")
+    print()
+    print("MODULATION")
+    print(f"  salience={row['salience']:.2f}")
+    print("  - episodes are scored at 0.6x so distilled memories outrank raw turns")
+    print("  - a caller's OWN current session is excluded from the episode leg")
+    return 0
+
+
+def _why_not_tokens(text: str) -> list[str]:
+    from .recall.search import _tokens
+
+    return _tokens(text or "")
+
+
+def cmd_weights(args: argparse.Namespace) -> int:
+    """Inspect or revert the active retrieval-leg weights."""
+    from .recall import weights as weights_mod
+
+    home = _hermes_home()
+    conn = _open_db(home)
+    if conn is None:
+        return 1
+    try:
+        sub = getattr(args, "weights_command", None) or "show"
+        if sub == "reset":
+            weights_mod.reset(conn)
+            print("retrieval weights reset to uniform (every leg 1.00)")
+            return 0
+        active = weights_mod.load(conn)
+        custom = weights_mod.is_active(conn)
+        print(f"source            {'approved tune proposal' if custom else 'default (uniform)'}")
+        for leg in weights_mod.LEGS:
+            print(f"  {leg:<8} {active[leg]:.2f}")
+        if not custom:
+            print("\nWeights change only when you approve a tune proposal:\n"
+                  "  hermes brain review                  (see open proposals)\n"
+                  "  hermes brain review --approve <uid>")
+        return 0
+    finally:
+        conn.close()
+
+
+def _print_bootstrap_coverage(home: Path, counts: dict) -> None:
+    """Report what fraction of state.db actually landed, and what did not.
+
+    A silent import is how a 9%-coverage bootstrap looked like a success: the
+    counts alone ("26 turns") carry no denominator. Reading it back from the
+    source is cheap and read-only, and it makes an incomplete import obvious
+    at the moment it happens rather than months later when recall is thin.
+    """
+    import sqlite3
+
+    from .bootstrap.state_db import _open_state_ro
+
+    path = Path(home) / "state.db"
+    if not path.exists():
+        return
+    try:
+        state = _open_state_ro(path)
+    except sqlite3.Error:
+        return
+    try:
+        users = state.execute(
+            "SELECT count(*) FROM messages WHERE role='user'").fetchone()[0]
+        sessions = state.execute("SELECT count(*) FROM sessions").fetchone()[0]
+    except sqlite3.Error:
+        return
+    finally:
+        state.close()
+
+    turns = int(counts.get("turns") or 0)
+    pct = (turns / users * 100.0) if users else 0.0
+    print(f"\ncoverage                 {turns} turn(s) from {users} user message(s) "
+          f"across {sessions} session(s) — {pct:.0f}%")
+    live = int(counts.get("sessions_live_skipped") or 0)
+    if live:
+        print(f"  {live} session(s) still live — they import once idle for "
+              f"bootstrap_stale_days, or re-run this command later")
+    done = int(counts.get("sessions_skipped") or 0)
+    if done:
+        print(f"  {done} session(s) already imported by an earlier run")
+    if turns and pct < 50:
+        print("  NOTE: coverage is low. Most turns in an agentic session are "
+              "tool calls with no assistant text, which cannot be paired — but "
+              "if this looks wrong, run 'hermes brain doctor'.")
+
 
 def cmd_bootstrap(args: argparse.Namespace) -> int:
     from . import config
@@ -839,6 +1309,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         )
         for key, value in (counts or {}).items():
             print(f"{key:<24} {value}")
+        _print_bootstrap_coverage(home, counts or {})
         return 0
     except Exception as e:
         print(f"Bootstrap failed: {e}\n"
@@ -1359,10 +1830,115 @@ def cmd_sync(args: argparse.Namespace) -> int:
         conn.close()
 
 
+def _eval_embedder_and_reranker(cfg: dict):
+    from .recall.embed import get_embedder
+    from .recall.rerank import get_reranker
+    from .store import sysinfo
+
+    mode = sysinfo.resolve_mode(str(cfg.get("mode", "auto")))
+    embedder = reranker = None
+    try:
+        embedder = get_embedder(cfg, mode, allow_download=False)
+    except Exception as e:
+        print(f"  (no embedder: {e})")
+    try:
+        reranker = get_reranker(cfg, mode, allow_download=False)
+    except Exception as e:
+        print(f"  (no reranker: {e})")
+    return embedder, reranker
+
+
+def cmd_eval_generate(args: argparse.Namespace) -> int:
+    """Build a paraphrase query set from the live brain (costs LLM budget)."""
+    from . import config
+    from .evalkit import generate_queryset, save_queryset
+
+    home = _hermes_home()
+    cfg = {**config.load_config(home), "hermes_home": str(home)}
+    conn = _open_db(home)
+    if conn is None:
+        return 1
+    try:
+        print(f"sampling up to {args.limit} source item(s) from the brain...")
+        queries, meta = generate_queryset(conn, cfg, limit=args.limit)
+    finally:
+        conn.close()
+
+    if not queries:
+        print("No queries generated.\n"
+              f"  {meta.get('note') or meta.get('stopped_early') or ''}\n"
+              "  Remedy: the brain needs content first (run 'hermes brain bootstrap'), "
+              "and an auxiliary LLM must be configured.", file=sys.stderr)
+        return 1
+
+    path = save_queryset(home, queries, meta=meta)
+    print(f"generated         {len(queries)} query/gold pair(s)")
+    for key in ("sampled", "batches", "declined", "rejected_verbatim"):
+        print(f"  {key:<18} {meta.get(key, 0)}")
+    if meta.get("stopped_early"):
+        print(f"  stopped early     {meta['stopped_early']}")
+    print(f"saved             {path}")
+    print("\nSpot-check before trusting any number derived from these:\n"
+          "  hermes brain eval --sample 10")
+    return 0
+
+
+def cmd_eval_sample(args: argparse.Namespace) -> int:
+    from .evalkit import load_queryset, queryset_path
+
+    home = _hermes_home()
+    data = load_queryset(home)
+    if not data:
+        print(f"No query set at {queryset_path(home)}.\n"
+              "  Remedy: hermes brain eval --generate", file=sys.stderr)
+        return 1
+    queries = data["queries"]
+    import random
+
+    for item in random.sample(queries, min(args.sample, len(queries))):
+        print(f"\nQ: {item['query']}")
+        print(f"   gold: {', '.join(u[:8] for u in item.get('gold') or [])} "
+              f"({item.get('source_kind')})")
+    print(f"\n{len(queries)} query/gold pair(s) total.")
+    return 0
+
+
+def cmd_eval_compare(args: argparse.Namespace) -> int:
+    """Score the stored query set across leg configurations. No LLM calls."""
+    from . import config
+    from .evalkit import format_report_or_none, load_queryset, queryset_path, run_comparison
+
+    home = _hermes_home()
+    data = load_queryset(home)
+    if not data:
+        print(f"No query set at {queryset_path(home)}.\n"
+              "  Remedy: hermes brain eval --generate", file=sys.stderr)
+        return 1
+    cfg = {**config.load_config(home), "hermes_home": str(home)}
+    embedder, reranker = _eval_embedder_and_reranker(cfg)
+    conn = _open_db(home)
+    if conn is None:
+        return 1
+    try:
+        report = run_comparison(conn, data["queries"],
+                                embedder=embedder, reranker=reranker)
+    finally:
+        conn.close()
+    print(format_report_or_none(report))
+    return 0
+
+
 def cmd_eval(args: argparse.Namespace) -> int:
     """Run the eval harness (retrieval P@k/MRR + answer/abstain rubric) on a
     fixture. Loads the harness by file path so it works under any package name.
     Use --real to hit the real aux LLM instead of the scripted fake."""
+    if getattr(args, "generate", False):
+        return cmd_eval_generate(args)
+    if getattr(args, "sample", 0):
+        return cmd_eval_sample(args)
+    if getattr(args, "compare", False):
+        return cmd_eval_compare(args)
+
     import importlib.util
     from pathlib import Path
 
@@ -2215,6 +2791,8 @@ def _review_decide(conn, args) -> int:
             conn.commit()
             print(f"approved: {msg}")
             return 0
+        if row["kind"] == "tuning":
+            return _approve_tuning(conn, home, row)
         conn.execute("UPDATE proposals SET status='approved', decided_at=?, "
                      "decided_by='cli' WHERE uid=?", (db.iso_now(), row["uid"]))
         conn.commit()

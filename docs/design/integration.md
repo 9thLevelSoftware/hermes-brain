@@ -304,6 +304,25 @@ First `initialize()` with an empty DB (or `hermes brain bootstrap`):
 
 1. **MEMORY.md / USER.md import** — parse the §-delimited entries (`~/.hermes/memories/` per built-in layout; re-verify exact paths in `agent/` at build time), each becomes a memory (`kind` inferred, `source=builtin-import`, trust `operator`). USER.md entries seed the lane-1 profile section.
 2. **state.db backfill** — read-only walk of `sessions`/`messages`/`turn_outcomes` (F14; open with `mode=ro` URI + its own busy_timeout), oldest→newest, writing episodic rows + salience tags and setting `sweep_state` watermarks; extraction of old sessions is then just normal sweep work the next dreams chew through (rate-limited: `dream.backfill_sessions_per_run`, default 20, so a 2-year history doesn't produce a 4-hour first dream).
+
+   > **AMENDED 2026-07-26 (alignment-audit.md §F1).** Measured against a real
+   > `state.db`, this sketch imported **9% of history** (26 of 290 user
+   > messages). Three corrections, all now shipped:
+   > * A session is withheld only while **genuinely live** — `ended_at IS NULL`
+   >   *and* a message newer than `bootstrap_stale_days` (default 7). Hermes
+   >   stamps `ended_at` on a clean close only, so without a reaper "still
+   >   running" meant "abandoned months ago", permanently: 22 of 49 sessions
+   >   holding 210 of 290 user messages.
+   > * **Consecutive user messages are joined**, not overwritten, and a
+   >   **trailing** user message with no reply still becomes a turn.
+   > * **Compacted (`active=0`) messages are imported.** Skipping them is right
+   >   for live capture and backwards here — compacted history is precisely
+   >   what an external memory system exists to preserve.
+   >
+   > Note the realistic ceiling: on an agentic install most assistant rows are
+   > blank tool-call scaffolding (1006 of 1383 in the sample), so pairable
+   > turns are far fewer than user messages. `hermes brain bootstrap` now
+   > prints coverage so a thin import is visible rather than silent.
 3. **Optional Daem0n-MCP import** (`--daemon C:\path\to\project\.daem0nmcp\memory.db`, repeatable per project). Schema mapping sketch (verify against Daem0n v6.6.6 at build time): `memories(id, category, content, tags, importance, created_at)` → brain memories with `kind` mapped (`warning→warning`, `decision→decision`, `pattern/insight→insight`, else `fact`), `project=<dirname>` scope, `source=daemon-import:<project>`, importance → initial salience; `rules`/covenant `must_not` → `warning` kind, pinned; `outcomes` → outcome links on the imported decisions; Daem0n's federation links → inter-project `related` edges. Auto-captured Daem0n spam (`Auto-captured from conversation`) imported at floor confidence, first in line for the forgetting pipeline.
 
 Bootstrap is idempotent (content-hash dedup) and always re-runnable.

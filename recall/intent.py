@@ -200,6 +200,30 @@ def adjust_weights(
     return (vw, fw, iw)
 
 
+def leg_multipliers(intent: Intent | None) -> dict[str, float]:
+    """Per-leg multipliers for `recall/weights.LEGS`, from a classified intent.
+
+    This is the bridge that turned this module from telemetry into a feature
+    (docs/design/alignment-audit.md §F4). It is applied ON TOP of the approved
+    base weights and ONLY when the operator sets ``intent_weighting: active``
+    — the default stays ``shadow``, where nothing downstream reads the result.
+
+    The donor's third axis, ``importance_bias``, has no corresponding fusion
+    leg (importance is applied later, in lifecycle modulation), so it is
+    deliberately NOT mapped here rather than being aimed at an approximately
+    similar leg. graph/facts get 1.0 for the same reason: the donor never
+    modelled them, and inventing a bias would be fabrication, not a port.
+    """
+    if intent is None:
+        return {"fts": 1.0, "vec": 1.0, "graph": 1.0, "facts": 1.0}
+    return {
+        "fts": float(intent.fts_bias),
+        "vec": float(intent.vec_bias),
+        "graph": 1.0,
+        "facts": 1.0,
+    }
+
+
 def record_proposal(conn, query: str, intent: Intent | None = None,
                     *, actor: str = "shadow") -> dict:
     """Log a shadow intent proposal to ``audit_log`` and return the proposal.

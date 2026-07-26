@@ -186,6 +186,7 @@ def search(
     rerank_budget_s: float = rerank.DEFAULT_BUDGET_S,
     graph: bool = True,
     facts: bool = True,
+    intent_bias: bool = False,
     diversify: bool = False,
     mmr_lambda: float = 0.7,
 ) -> list[Hit]:
@@ -229,6 +230,10 @@ def search(
             [f"m:{r['id']}" for r in mem_rows],
             [f"e:{r['id']}" for r in epi_rows],
         ]
+        # Parallel to `rankings` — names the leg each ranking came from so
+        # approved per-leg weights can be applied at fusion time. Memory and
+        # episode variants share a leg name on purpose (see recall/weights.py).
+        leg_names: list[str] = ["fts", "fts"]
         vec_keys: set = set()
 
         # -- vector legs (optional; same filters applied at row fetch) --
@@ -240,6 +245,7 @@ def search(
                                           principal_id, trust_tier, exclude_kinds,
                                           epistemic, date_from, date_to)
                 rankings.append([f"m:{i}" for i in mem_knn if i in mvrows])
+                leg_names.append("vec")
                 rows_by_key.update({f"m:{i}": r for i, r in mvrows.items()})
                 vec_keys.update(f"m:{i}" for i in mvrows)
                 if want_episodes:
@@ -258,6 +264,7 @@ def search(
                                               principal_id, source_author, trust_tier)
                     surviving = [i for i in epi_knn if i in evrows][: episode_limit * 3]
                     rankings.append([f"e:{i}" for i in surviving])
+                    leg_names.append("vec")
                     rows_by_key.update({f"e:{i}": evrows[i] for i in surviving})
                     vec_keys.update(f"e:{i}" for i in surviving)
             except Exception as e:
@@ -277,6 +284,7 @@ def search(
                                               principal_id, trust_tier, exclude_kinds,
                                               epistemic, date_from, date_to)
                     rankings.append([f"m:{i}" for i in ppr_ids if i in gvrows])
+                    leg_names.append("graph")
                     rows_by_key.update({f"m:{i}": r for i, r in gvrows.items()})
                     graph_keys.update(f"m:{i}" for i in gvrows)
             except Exception as e:
@@ -299,13 +307,35 @@ def search(
                                               principal_id, trust_tier, exclude_kinds,
                                               epistemic, date_from, date_to)
                     rankings.append([f"m:{i}" for i in fact_ids if i in fvrows])
+                    leg_names.append("facts")
                     rows_by_key.update({f"m:{i}": r for i, r in fvrows.items()})
                     fact_keys.update(f"m:{i}" for i in fvrows)
             except Exception as e:
                 logger.warning("facts leg failed (%s); continuing", e)
 
         fts_keys = {f"m:{r['id']}" for r in mem_rows} | {f"e:{r['id']}" for r in epi_rows}
-        bases = fusion.normalized(fusion.rrf(rankings), floor=_NORM_FLOOR)
+        # Approved per-leg weights, if a human ever approved a tune proposal.
+        # Absent (the default) this is uniform and rrf() behaves exactly as it
+        # did before weights existed. Never raises — capture path.
+        try:
+            from . import weights as weights_mod
+
+            active = weights_mod.load(conn)
+            if intent_bias:
+                # Per-query intent multipliers ON TOP of the approved base
+                # weights. Opt-in only (`intent_weighting: active`); the
+                # default 'shadow' never reaches here.
+                from . import intent as intent_mod
+
+                mult = intent_mod.leg_multipliers(intent_mod.classify(query))
+                active = {leg: active.get(leg, 1.0) * mult.get(leg, 1.0)
+                          for leg in active}
+            leg_weights = weights_mod.for_legs(active, leg_names)
+        except Exception:
+            logger.debug("retrieval weights unavailable; using uniform", exc_info=True)
+            leg_weights = None
+        bases = fusion.normalized(
+            fusion.rrf(rankings, weights=leg_weights), floor=_NORM_FLOOR)
         # Late-interaction rerank of the fused relevance (memory-engine §3.4),
         # BEFORE lifecycle modulation / the 0.6x episode factor. No-op unless a
         # reranker was supplied (full tier + models present); degrades to the

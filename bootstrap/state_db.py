@@ -177,31 +177,60 @@ def _iter_messages(state: sqlite3.Connection, session_id: str) -> Iterator[dict[
 
 def _pair_turns(
     messages: Iterable[dict[str, Any]],
+    *,
+    include_compacted: bool = True,
 ) -> Iterator[tuple[str, str, str | None]]:
     """Pair user/assistant messages into (user, assistant, iso_ts) turns.
 
-    tool/system/anything-else rows are skipped, as are rows compacted out of
-    the live context (active=0 — missing/None counts as active); an assistant
-    reply closes the pending user message (later assistant chunks in the same
-    tool loop are dropped — backfill wants the conversational skeleton, not
-    the tool trace). The turn timestamp is the user message's, falling back
-    to the assistant's.
+    tool/system/anything-else rows are skipped. An assistant reply with text
+    closes the pending user message; blank assistant rows (the tool-call
+    scaffolding of an agentic loop — on a real install those are the MAJORITY,
+    1006 of 1383 in the sample that motivated this) correctly do NOT close it,
+    so a user turn still pairs with the reply that eventually arrives after the
+    tool trace. The turn timestamp is the user message's, falling back to the
+    assistant's.
+
+    Two corrections over the original (see docs/design/alignment-audit.md §F1),
+    both found by running this against a real state.db rather than a fixture:
+
+    * **Consecutive user messages are JOINED, not dropped.** A second user
+      message used to overwrite ``pending_user``, silently discarding the
+      first. Real transcripts are full of follow-ups sent before the assistant
+      replies, and every one of them took its predecessor with it. The eventual
+      assistant reply answers all of them, so joining is the faithful reading.
+    * **Compacted rows are included by default.** ``active=0`` means "compressed
+      out of the live context", and skipping those is right for live capture but
+      backwards for bootstrap: compacted history is precisely what an external
+      memory system exists to preserve. ``include_compacted=False`` restores the
+      old behavior.
     """
-    pending_user: str | None = None
+    pending: list[str] = []
     pending_ts: str | None = None
     for msg in messages:
-        if msg.get("active") == 0:
+        if not include_compacted and msg.get("active") == 0:
             continue
         role = str(msg.get("role") or "")
         if role == "user":
-            pending_user = _decode_content(msg.get("content"))
-            pending_ts = _epoch_to_iso(msg.get("timestamp"))
-        elif role == "assistant" and pending_user is not None:
+            text = _decode_content(msg.get("content"))
+            if text.strip():
+                pending.append(text)
+                if pending_ts is None:
+                    pending_ts = _epoch_to_iso(msg.get("timestamp"))
+        elif role == "assistant" and pending:
             content = _decode_content(msg.get("content"))
             if content.strip():
-                yield pending_user, content, pending_ts or _epoch_to_iso(msg.get("timestamp"))
-                pending_user = None
+                yield ("\n\n".join(pending), content,
+                       pending_ts or _epoch_to_iso(msg.get("timestamp")))
+                pending = []
                 pending_ts = None
+    if pending:
+        # Trailing user messages with no reply — the session ended, crashed, or
+        # never produced assistant text after them. On the install that
+        # motivated this, 156 of 290 user messages were in this state and were
+        # discarded wholesale. They are often the most useful rows in the file
+        # (the last thing the user asked for), so emit them with an empty
+        # assistant side rather than losing them.
+        yield "\n\n".join(pending), "", pending_ts
 
 
 def _flush_embeddings(
@@ -220,26 +249,67 @@ def _flush_embeddings(
         logger.warning("bootstrap: embedding session %s failed: %s", session_id, e)
 
 
+def _last_message_epoch(state: sqlite3.Connection, session_id: str) -> float | None:
+    """Newest message timestamp in a session, or None when it has none."""
+    try:
+        row = state.execute(
+            "SELECT MAX(timestamp) AS t FROM messages WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    try:
+        return float(row["t"]) if row and row["t"] is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _session_is_abandoned(state: sqlite3.Connection, session_id: str,
+                          stale_days: float, now: float) -> bool:
+    """True when an ``ended_at IS NULL`` session is stale enough to import.
+
+    Hermes only stamps ``ended_at`` on a clean close, so on a real install most
+    sessions never get one — 22 of 49 in the sample that motivated this, holding
+    210 of 290 user messages. The original skip is right for a session that is
+    genuinely live (watermarking it would freeze a partial transcript forever)
+    but there was no reaper, so "still running" also meant "abandoned three
+    months ago", permanently.
+
+    A session whose NEWEST message is older than ``stale_days`` is not running.
+    A session with no messages at all has nothing to freeze, so it is safe too.
+    """
+    last = _last_message_epoch(state, session_id)
+    if last is None:
+        return True
+    return (now - last) > stale_days * 86400.0
+
+
 def backfill_sessions(
     conn: sqlite3.Connection,
     hermes_home: str | Path,
     *,
     max_sessions: int = 20,
     embedder=None,
+    stale_days: float = 7.0,
+    include_compacted: bool = True,
 ) -> dict[str, Any]:
     """Import up to ``max_sessions`` un-watermarked sessions, oldest first.
 
-    Returns {'sessions': imported, 'turns': written, 'skipped': already
-    watermarked or still running} (+ 'note' when state.db is absent or not
-    actually a state.db). Sessions and messages are streamed via SQL-ordered
-    cursors — a multi-year history must not be materialized in memory.
+    Returns counts: ``sessions``/``turns`` imported, ``skipped`` (already
+    watermarked), ``skipped_live`` (open AND recently active — the only
+    sessions still deliberately withheld), and ``reaped`` (open but stale, so
+    imported anyway). ``note`` is set when state.db is absent or unreadable.
+    Sessions and messages are streamed via SQL-ordered cursors — a multi-year
+    history must not be materialized in memory.
     """
-    counts: dict[str, Any] = {"sessions": 0, "turns": 0, "skipped": 0}
+    counts: dict[str, Any] = {"sessions": 0, "turns": 0, "skipped": 0,
+                              "skipped_live": 0, "reaped": 0}
     path = Path(hermes_home) / "state.db"
     if not path.exists():
         counts["note"] = f"no state.db at {path}"
         return counts
 
+    now_epoch = time.time()
     state = _open_state_ro(path)
     try:
         try:
@@ -272,11 +342,14 @@ def backfill_sessions(
             session_id = str(session.get("id") or "")
             if not session_id:
                 continue
+            reaped = False
             if "ended_at" in session and session["ended_at"] is None:
-                # Still running: a watermark now would freeze the partial
-                # transcript forever. No watermark — next run retries.
-                counts["skipped"] += 1
-                continue
+                if not _session_is_abandoned(state, session_id, stale_days, now_epoch):
+                    # Genuinely live: a watermark now would freeze the partial
+                    # transcript forever. No watermark — next run retries.
+                    counts["skipped_live"] += 1
+                    continue
+                reaped = True
             if _watermark_exists(conn, session_id):
                 counts["skipped"] += 1
                 continue
@@ -295,7 +368,8 @@ def backfill_sessions(
             embed_batch: list[tuple[int, str]] = []
             written = 0
             for turn_no, (user, assistant, turn_ts) in enumerate(
-                _pair_turns(_iter_messages(state, session_id)), start=1
+                _pair_turns(_iter_messages(state, session_id),
+                            include_compacted=include_compacted), start=1
             ):
                 ctx.turn_no = turn_no
                 episode_id = capture_turn(
@@ -318,11 +392,15 @@ def backfill_sessions(
             _set_watermark(conn, session_id, written)
             counts["sessions"] += 1
             counts["turns"] += written
+            if reaped:
+                counts["reaped"] += 1
     finally:
         state.close()
 
     logger.info(
-        "bootstrap: backfilled %d session(s), %d turn(s) (%d already done or live)",
-        counts["sessions"], counts["turns"], counts["skipped"],
+        "bootstrap: backfilled %d session(s), %d turn(s) "
+        "(%d reaped-stale, %d already done, %d still live)",
+        counts["sessions"], counts["turns"], counts["reaped"],
+        counts["skipped"], counts["skipped_live"],
     )
     return counts

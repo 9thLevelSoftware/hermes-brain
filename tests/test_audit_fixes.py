@@ -463,3 +463,37 @@ def test_plugin_manifest_lists_every_implemented_hook():
                  "on_turn_start", "on_session_switch", "on_session_end",
                  "on_pre_compress", "on_memory_write", "on_delegation", "shutdown"):
         assert hook in declared, f"plugin.yaml omits implemented hook {hook}"
+
+
+def test_pyproject_declares_explicit_setuptools_packages():
+    """Regression: `pip install -e .[dev]` and `.[full]` both failed.
+
+    The repo root IS the plugin directory — a flat layout with a dozen
+    top-level packages and nine root modules. Without an explicit
+    [tool.setuptools] section setuptools runs auto-discovery, cannot choose a
+    single package, and aborts BEFORE reading [project.optional-dependencies],
+    so the extras were unreachable and the documented dev workflow was broken.
+
+    Nothing should ever be installed into site-packages: the host loads the
+    plugin by path, and a second importable copy would create exactly the
+    dual-identity problem _compat.py exists to avoid.
+    """
+    import tomllib
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    with open(root / "pyproject.toml", "rb") as fh:
+        cfg = tomllib.load(fh)
+
+    setuptools_cfg = cfg.get("tool", {}).get("setuptools")
+    assert setuptools_cfg is not None, (
+        "pyproject.toml needs an explicit [tool.setuptools] section or flat-layout "
+        "auto-discovery aborts and every extra becomes uninstallable")
+    assert setuptools_cfg.get("packages") == [], \
+        "packages must be explicitly empty — the plugin is loaded by path, never imported"
+    assert setuptools_cfg.get("py-modules") == [], \
+        "py-modules must be explicitly empty for the same reason"
+
+    extras = cfg["project"]["optional-dependencies"]
+    for name in ("dev", "full", "rerank", "sync"):
+        assert name in extras, f"documented extra [{name}] is missing"

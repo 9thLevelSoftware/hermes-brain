@@ -40,6 +40,7 @@ def run_bootstrap(
     counts: dict[str, Any] = {
         "memory_md": 0, "user_md": 0, "memory_skipped": 0,
         "sessions": 0, "turns": 0, "sessions_skipped": 0,
+        "sessions_live_skipped": 0, "sessions_reaped": 0,
     }
     if not config.get("bootstrap_import", True):
         counts["disabled"] = True
@@ -58,13 +59,19 @@ def run_bootstrap(
     try:
         # Forward max_sessions only when the caller set one — state_db's
         # default (20/run) stays the single source of truth for the cap.
-        backfill_kwargs: dict[str, Any] = {"embedder": embedder}
+        backfill_kwargs: dict[str, Any] = {
+            "embedder": embedder,
+            "stale_days": float(config.get("bootstrap_stale_days", 7)),
+            "include_compacted": bool(config.get("bootstrap_include_compacted", True)),
+        }
         if max_sessions is not None:
             backfill_kwargs["max_sessions"] = max_sessions
         sessions = backfill_sessions(conn, hermes_home, **backfill_kwargs)
         counts["sessions"] = sessions["sessions"]
         counts["turns"] = sessions["turns"]
         counts["sessions_skipped"] = sessions["skipped"]
+        counts["sessions_live_skipped"] = sessions.get("skipped_live", 0)
+        counts["sessions_reaped"] = sessions.get("reaped", 0)
     except Exception as e:
         logger.warning("bootstrap: state.db backfill failed: %s", e, exc_info=True)
         counts["error"] = f"state.db backfill: {e}"

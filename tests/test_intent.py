@@ -118,3 +118,50 @@ def test_imports_cleanly_without_numpy(monkeypatch):
     mod = importlib.import_module("brain.recall.intent")
     assert mod._HAS_NUMPY is False
     assert mod.classify("how do I install this").category == "procedural"
+
+
+# ---------------------------------------------------------------------------
+# The apply path (alignment-audit.md §F4) — opt-in only
+# ---------------------------------------------------------------------------
+
+def test_leg_multipliers_map_only_the_legs_the_donor_modelled():
+    from brain.recall import intent as intent_mod
+    from brain.recall import weights as weights_mod
+
+    mult = intent_mod.leg_multipliers(intent_mod.classify("when did we deploy last week"))
+    assert set(mult) == set(weights_mod.LEGS)
+    # temporal: keyword up, vectors down (INTENT_WEIGHTS).
+    assert mult["fts"] > 1.0 and mult["vec"] < 1.0
+    # graph/facts were never modelled by the donor — inventing a bias would be
+    # fabrication, so they stay neutral.
+    assert mult["graph"] == 1.0 and mult["facts"] == 1.0
+
+
+def test_leg_multipliers_of_none_is_neutral():
+    from brain.recall import intent as intent_mod
+
+    assert set(intent_mod.leg_multipliers(None).values()) == {1.0}
+
+
+def test_search_ignores_intent_unless_asked(conn):
+    """The default is shadow: nothing downstream may read the classifier."""
+    from brain.recall.search import search
+    from conftest import seed_memory
+
+    seed_memory(conn, "we deployed the release last week using buildkite")
+    seed_memory(conn, "the deployment guide explains how to configure buildkite")
+
+    default = [h.uid for h in search(conn, "when did we deploy", trust_tier="owner")]
+    same = [h.uid for h in search(conn, "when did we deploy", trust_tier="owner",
+                                  intent_bias=False)]
+    assert default == same
+
+
+def test_search_with_intent_bias_still_returns_results(conn):
+    """The apply path must not break retrieval — it reweights, it does not gate."""
+    from brain.recall.search import search
+    from conftest import seed_memory
+
+    seed_memory(conn, "we deployed the release last week using buildkite")
+    hits = search(conn, "when did we deploy", trust_tier="owner", intent_bias=True)
+    assert hits and all(h.uid for h in hits)

@@ -12,12 +12,30 @@ from collections.abc import Hashable, Sequence
 RRF_K = 60
 
 
-def rrf(rankings: Sequence[list[Hashable]], k: int = RRF_K) -> dict[Hashable, float]:
-    """score(item) = Σ_legs 1/(k + rank_in_leg), rank starting at 1."""
+def rrf(rankings: Sequence[list[Hashable]], k: int = RRF_K,
+        weights: Sequence[float] | None = None) -> dict[Hashable, float]:
+    """score(item) = Σ_legs w_leg / (k + rank_in_leg), rank starting at 1.
+
+    ``weights`` is aligned positionally with ``rankings``; omit it (or pass all
+    1.0) for the uniform behavior this function had before weights existed —
+    that equivalence is asserted in tests, because every existing caller
+    depends on it.
+
+    This parameter is the piece `dream/tune.py` was always missing: it fitted
+    per-leg weights from the injection→outcome labels, wrote them to a
+    proposal, let you approve it, and had nowhere to put them
+    (docs/design/alignment-audit.md §F4). Weights are still NEVER applied
+    automatically — see recall/weights.py.
+    """
     scores: dict[Hashable, float] = {}
-    for ranking in rankings:
+    for index, ranking in enumerate(rankings):
+        weight = 1.0
+        if weights is not None and index < len(weights):
+            weight = float(weights[index])
+        if weight == 0.0:
+            continue
         for rank, item in enumerate(ranking, start=1):
-            scores[item] = scores.get(item, 0.0) + 1.0 / (k + rank)
+            scores[item] = scores.get(item, 0.0) + weight / (k + rank)
     return scores
 
 

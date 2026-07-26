@@ -1014,14 +1014,18 @@ class BrainProvider(MemoryProvider):
         mmr_lambda = float(self._config.get("mmr_lambda", 0.7))
         facts_leg_on = bool(self._config.get("facts_leg", True))
 
-        # Query-intent weighting is SHADOW-ONLY and that is a hard invariant,
-        # exactly like the `tune` strategy: it records what the classifier
-        # WOULD propose for this query so the deltas can be analyzed offline,
-        # and nothing downstream reads the result. Do not feed `proposal` into
-        # fusion, ranking, or the cache key — a shadow lane that silently
-        # starts steering retrieval is the failure mode this guards against.
+        # Query-intent weighting: off | shadow (default) | active.
+        #
+        # In `shadow` it records what the classifier WOULD propose so the
+        # deltas can be analyzed offline, and NOTHING downstream reads the
+        # result — a shadow lane that silently starts steering retrieval is the
+        # failure mode this guards against. `active` is an explicit operator
+        # choice that feeds per-query multipliers into fusion on top of the
+        # approved base weights (see recall/weights.py). Never auto-promoted.
         # Runs on the brain-bg worker only; never the turn path.
-        if str(self._config.get("intent_weighting", "shadow")) == "shadow":
+        intent_mode = str(self._config.get("intent_weighting", "shadow"))
+        intent_bias = intent_mode == "active"
+        if intent_mode == "shadow":
             try:
                 from .recall import intent as intent_mod
 
@@ -1057,6 +1061,7 @@ class BrainProvider(MemoryProvider):
                     embedder=self._embedder,
                     reranker=self._reranker,
                     facts=facts_leg_on,
+                    intent_bias=intent_bias,
                 )
             hits = _diversify(hits, mmr_lambda, 8)
             if use_cache:
