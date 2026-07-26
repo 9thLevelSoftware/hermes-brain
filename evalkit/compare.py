@@ -196,8 +196,11 @@ def run_comparison(
         for r in results:
             if r.name != BASELINE and r.reciprocal_ranks:
                 paired[r.name] = _paired(base, r)
+    from .store import queryset_fingerprint
+
     return {
         "k": K,
+        "queryset": queryset_fingerprint(queries),
         "results": [
             {"name": r.name, "p_at_k": r.precision_at_k, "mrr": r.mrr,
              "n": r.n, "skipped": r.skipped}
@@ -212,9 +215,15 @@ def format_report(report: dict[str, Any], baseline: dict[str, Any] | None = None
     reading a mean without them is how noise gets mistaken for a finding."""
     k = report.get("k", K)
     prior = {}
+    mismatched = False
     if baseline:
-        prior = {r["name"]: r for r in baseline.get("results", [])
-                 if not r.get("skipped")}
+        # Only comparable when both runs scored the SAME queries.
+        same = (baseline.get("queryset") or "") == (report.get("queryset") or "")
+        if same:
+            prior = {r["name"]: r for r in baseline.get("results", [])
+                     if not r.get("skipped")}
+        else:
+            mismatched = True
     delta_head = "   ΔMRR vs saved" if prior else ""
     lines = [
         f"{'configuration':<16} {'P@' + str(k):>7} {'MRR':>7} {'n':>5}   "
@@ -236,6 +245,11 @@ def format_report(report: dict[str, Any], baseline: dict[str, Any] | None = None
             delta = f"   {row['mrr'] - was['mrr']:+.4f}"
         lines.append(f"{row['name']:<16} {row['p_at_k']:>7.3f} {row['mrr']:>7.3f} "
                      f"{row['n']:>5}   {cell:<26}{delta}")
+    if mismatched:
+        lines.append("")
+        lines.append("NOTE: the saved baseline was measured on a DIFFERENT query "
+                     "set, so no delta is shown. Re-save one with "
+                     "'--compare --save-baseline'.")
     n = next((r["n"] for r in report.get("results", []) if not r.get("skipped")), 0)
     if 0 < n < 100:
         lines.append("")

@@ -483,6 +483,20 @@ class BrainProvider(MemoryProvider):
         from . import tools
 
         schemas = tools.get_schemas()
+        if not self._initialized:
+            # ROUTING call. brain.yaml has not been read yet, so `self._config`
+            # is DEFAULTS — and gating on it here would omit any tool whose
+            # default is OFF. `ask_tool_agent` defaults False, so enabling it in
+            # brain.yaml produced a tool that was ADVERTISED post-init and
+            # unroutable, which is the §G6 bug again in the one tool it could
+            # still reach (PR #9 review round 2, P1).
+            #
+            # Return the UNION of everything that could ever be enabled. The
+            # routing map only needs names; `tools.dispatch` re-checks the real
+            # gates at call time, so a disabled tool is refused rather than
+            # served. This is what makes "offered ⊆ routable" true by
+            # construction instead of true by coincidence.
+            return [*schemas, tools.memories_schema(), tools.ask_schema()]
         # The Anthropic-shaped file interface over the same store. On by
         # default (it costs one schema and inherits trained behavior); the
         # gate is re-checked in tools.dispatch, so turning it off closes the
@@ -1020,6 +1034,16 @@ class BrainProvider(MemoryProvider):
         # when lane2_blend is off. MMR diversifies the final set so the block
         # isn't three near-identical facts.
         exclude_kinds = ("strategy", "guardrail", "case", "peer_card")
+        # Whether ANY link is registered — decided once, before the cache read,
+        # because it gates both the read and the write.
+        links_enabled = False
+        if self._config.get("link_lane2", False):
+            try:
+                from .store import links as links_mod
+
+                links_enabled = bool(links_mod.enabled(conn))
+            except Exception:
+                links_enabled = False
         # Cache key includes session_id so it can NEVER cross users. Two
         # concurrent unenrolled gateway users can share principal_id='',
         # source_author='' AND trust_tier='known_user' — keying on identity
@@ -1051,7 +1075,7 @@ class BrainProvider(MemoryProvider):
                 logger.debug("brain: intent shadow proposal failed", exc_info=True)
 
         hits = None
-        if use_cache:
+        if use_cache and not links_enabled:
             hits = self._query_cache.get(
                 conn, query_text, kinds=None, scope=cache_scope,
                 embedder=self._embedder)
@@ -1084,7 +1108,12 @@ class BrainProvider(MemoryProvider):
             # is the cache-safe hot path; a second database read on every turn
             # is latency and blast radius for a feature whose value is mostly
             # on-demand. Owner sessions only — enforced inside search_linked.
-            linked_used = False
+            # Any registered link means this result is not cacheable — not
+            # merely a result that HAPPENED to include a linked row. A remote
+            # write cannot bump the local mem_generation, so a cached local-only
+            # answer would keep winning and the new linked memory would never
+            # appear (review round 2, P2).
+            linked_used = links_enabled
             if self._config.get("link_lane2", False):
                 try:
                     from .recall.linked import search_linked

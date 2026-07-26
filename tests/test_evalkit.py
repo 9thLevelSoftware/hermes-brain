@@ -358,3 +358,48 @@ def test_corrupt_baseline_reads_as_absent(tmp_home):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("{not json", encoding="utf-8")
     assert load_baseline(tmp_home) is None
+
+
+def test_baseline_from_a_different_queryset_shows_no_delta(conn, tmp_home, capsys):
+    """Subtracting MRRs measured on different datasets produces a number that
+    looks like a retrieval delta and is an artifact (review round 2, P2)."""
+    from brain.evalkit import save_baseline
+    from brain.evalkit.compare import format_report
+
+    uids = _seed(conn, 6)
+    first = [{"query": "staging database number 0", "gold": [uids[0]],
+              "source_kind": "memory", "source_uid": uids[0]}]
+    save_baseline(tmp_home, run_comparison(conn, first, embedder=None))
+
+    # A DIFFERENT query set — e.g. after re-running eval --generate.
+    second = [{"query": "staging database number 1", "gold": [uids[1]],
+               "source_kind": "memory", "source_uid": uids[1]}]
+    report = run_comparison(conn, second, embedder=None)
+
+    from brain.evalkit import load_baseline
+
+    text = format_report(report, load_baseline(tmp_home))
+    assert "ΔMRR" not in text
+    assert "DIFFERENT query set" in text
+
+
+def test_baseline_from_the_same_queryset_does_show_a_delta(conn, tmp_home):
+    from brain.evalkit import load_baseline, save_baseline
+    from brain.evalkit.compare import format_report
+
+    uids = _seed(conn, 6)
+    queries = [{"query": "staging database number 0", "gold": [uids[0]],
+                "source_kind": "memory", "source_uid": uids[0]}]
+    save_baseline(tmp_home, run_comparison(conn, queries, embedder=None))
+    report = run_comparison(conn, queries, embedder=None)
+    assert "ΔMRR vs saved" in format_report(report, load_baseline(tmp_home))
+
+
+def test_queryset_fingerprint_is_order_and_content_sensitive():
+    from brain.evalkit import queryset_fingerprint
+
+    a = [{"query": "q1", "gold": ["A"]}, {"query": "q2", "gold": ["B"]}]
+    b = [{"query": "q1", "gold": ["A"]}, {"query": "q2", "gold": ["C"]}]
+    assert queryset_fingerprint(a) == queryset_fingerprint(list(a))
+    assert queryset_fingerprint(a) != queryset_fingerprint(b)
+    assert queryset_fingerprint([]) == ""

@@ -267,3 +267,35 @@ def test_context_recall_mode_only_hides_tools_after_initialize(synthetic_brain, 
         assert provider.get_tool_schemas() == []
     finally:
         provider.shutdown()
+
+
+def test_optional_tools_are_routable_even_when_default_off(synthetic_brain, tmp_path):
+    """`ask_tool_agent` defaults FALSE, so gating the PRE-INIT schema list on
+    config omitted brain_ask from the routing map — and enabling it in
+    brain.yaml then produced a tool that was advertised post-init and failed as
+    "Unknown tool". The §G6 bug again, in the one tool it could still reach
+    (PR #9 review round 2, P1).
+
+    The routing call must return the UNION of everything that could ever be
+    enabled; dispatch re-checks the real gates at call time.
+    """
+    from brain import config as brain_config
+
+    provider_mod = importlib.import_module(f"{_BRAIN}.provider")
+    routable = {s["function"]["name"]
+                for s in provider_mod.BrainProvider().get_tool_schemas()}
+    assert "brain_ask" in routable, "an optionally-enabled tool must be routable"
+
+    home = tmp_path / "askhome"
+    home.mkdir()
+    brain_config.save_config(home, {"ask_tool_agent": True, "ask_tool": True,
+                                    "mode": "fts-only"})
+    provider = provider_mod.BrainProvider()
+    provider.initialize("t", hermes_home=str(home), platform="replay",
+                        agent_context="primary")
+    try:
+        offered = {s["function"]["name"] for s in provider.get_tool_schemas()}
+    finally:
+        provider.shutdown()
+    assert "brain_ask" in offered, "sanity: the config enables it"
+    assert offered <= routable, f"offered but unroutable: {offered - routable}"
