@@ -65,9 +65,21 @@ RERANK_REGISTRY: dict[str, ModelSpec] = {
             "tokenizer.json": "tokenizer.json",
         },
     ),
+    "colbertv2.0": ModelSpec(
+        key="colbertv2.0",
+        repo="colbert-ir/colbertv2.0",
+        query_prefix="[Q] ",
+        doc_prefix="[D] ",
+        native_dim=128,
+        truncate_to=None,
+        files={
+            "model.onnx": "model.onnx",
+            "tokenizer.json": "tokenizer.json",
+        },
+    ),
 }
 # Primary first: get_reranker walks this order until one model resolves.
-_FALLBACK_ORDER = ("mxbai-edge-colbert-v0-32m", "answerai-colbert-small-v1")
+_FALLBACK_ORDER = ("colbertv2.0", "mxbai-edge-colbert-v0-32m", "answerai-colbert-small-v1")
 
 
 class ColbertReranker:

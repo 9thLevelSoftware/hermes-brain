@@ -433,9 +433,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         ).fetchall()
 
         print(f"brain.db          {db.db_path(home)}  ({size_mb:.1f} MB, schema v{schema})")
+        vec_live = vec_store.vec_available(conn)
         print(f"mode              {mode}   capabilities: "
               f"fts5={'yes' if caps.get('fts5') else 'NO'} "
-              f"vec={'yes' if caps.get('vec') else 'no'}")
+              f"vec={'yes' if vec_live else 'no'}")
         print(f"tier              {_tier_label(cfg, sysinfo.resolve_mode(str(mode)))}")
         # What retrieval will actually do — every leg degrades silently and
         # independently, so the configured stack and the live one can differ.
@@ -705,6 +706,7 @@ def _active_legs(conn, cfg: dict) -> dict[str, bool]:
     """
     from .recall import embed
     from .store import db, sysinfo
+    from .store import vec as vec_store
 
     resolved = sysinfo.resolve_mode(str(cfg.get("mode", "auto")))
     caps = {}
@@ -716,7 +718,7 @@ def _active_legs(conn, cfg: dict) -> dict[str, bool]:
     legs = {"fts": bool(caps.get("fts5"))}
 
     # vector: needs the extension, an embedder for the tier, AND a live index.
-    vec_ready = bool(caps.get("vec"))
+    vec_ready = vec_store.vec_available(conn)
     if vec_ready:
         try:
             vec_ready = db.get_meta(conn, "vec_dim") is not None
