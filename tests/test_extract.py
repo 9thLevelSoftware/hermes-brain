@@ -10,7 +10,8 @@ from brain import llm
 from brain.capture import extract
 from brain.capture.turns import TurnContext, capture_session_end, capture_turn
 from brain.config import DEFAULTS
-from brain.store import db
+from brain.store import db, facts
+from conftest import seed_memory
 
 
 @pytest.fixture(autouse=True)
@@ -107,7 +108,7 @@ def test_sweep_happy_path(conn):
     assert set(by_kind) == {"preference", "decision", "insight"}
     for row in rows:
         assert row["created_by"] == "extraction"
-        assert row["prompt_version"] == "extract-v2"
+        assert row["prompt_version"] == "extract-v3"
         assert row["epistemic"] == "observation"
         assert row["memory_type"] == "semantic"
         assert row["status"] == "active" and row["live"] == 1
@@ -135,15 +136,274 @@ def test_sweep_happy_path(conn):
     assert len(audits) == 3
 
 
-def test_sweep_time_sensitive_gets_30_day_half_life(conn):
+def test_sweep_legacy_time_sensitive_gets_enforced_30_day_ttl(conn):
     _seed_session(conn, "tts", [("Remember that the beta demo is next Friday",
                                  "Got it.")])
     llm.set_llm_for_tests(FakeLLM([json.dumps([
         _item("The beta demo is scheduled for next Friday", "fact",
               time_sensitive=True)])]))
     extract.sweep(conn, _cfg())
-    row = conn.execute("SELECT half_life_days FROM memories").fetchone()
+    row = conn.execute("SELECT half_life_days, ttl_at, meta FROM memories").fetchone()
     assert row["half_life_days"] == 30.0
+    assert row["ttl_at"] is not None
+    assert json.loads(row["meta"])["retention"] == "temporary"
+    assert json.loads(row["meta"])["expiry_source"] == "legacy_time_sensitive"
+
+
+def test_extract_prompt_v3_replaces_time_sensitive_contract():
+    assert '"retention": "episode_only|temporary|durable"' in extract._EXTRACT_SYSTEM
+    assert '"ttl_days"' in extract._EXTRACT_SYSTEM
+    assert '"supersedes_uid"' in extract._EXTRACT_SYSTEM
+    assert "time_sensitive" not in extract._EXTRACT_SYSTEM
+
+
+def test_commit_narration_stays_episode_only_even_if_model_says_durable(conn):
+    _seed_session(conn, "commit-narration", [
+        ("I created commit abc1234 and pushed it", "Done."),
+    ])
+    llm.set_llm_for_tests(FakeLLM([json.dumps([_item(
+        "Created commit abc1234 and pushed it",
+        "fact",
+        retention="durable",
+    )])]))
+
+    counts = extract.sweep(conn, _cfg())
+
+    assert counts["items"] == 1 and counts["inserted"] == 0
+    assert conn.execute("SELECT count(*) FROM memories").fetchone()[0] == 0
+    audit = conn.execute(
+        "SELECT detail FROM audit_log WHERE action='extract_episode_only'"
+    ).fetchone()
+    assert audit is not None
+    assert json.loads(audit["detail"])["retention"] == "episode_only"
+
+
+def test_operational_state_gets_seven_day_ttl_despite_durable_nomination(conn):
+    _seed_session(conn, "temporary-pr", [
+        ("PR #42 is currently waiting for CI", "Noted."),
+    ])
+    llm.set_llm_for_tests(FakeLLM([json.dumps([_item(
+        "PR #42 is currently waiting for CI",
+        "fact",
+        retention="durable",
+    )])]))
+
+    extract.sweep(conn, _cfg())
+
+    row = conn.execute("SELECT ttl_at, meta FROM memories").fetchone()
+    meta = json.loads(row["meta"])
+    assert row["ttl_at"] is not None
+    assert meta["retention"] == "temporary"
+    assert meta["expiry_source"] == "operational_default"
+
+
+def test_durable_preference_has_no_inferred_ttl(conn):
+    _seed_session(conn, "durable-pref", [
+        ("I always prefer terse answers", "Noted."),
+    ])
+    llm.set_llm_for_tests(FakeLLM([json.dumps([_item(
+        "User prefers terse answers",
+        "preference",
+        retention="durable",
+    )])]))
+
+    extract.sweep(conn, _cfg())
+
+    row = conn.execute("SELECT ttl_at, meta FROM memories").fetchone()
+    assert row["ttl_at"] is None
+    assert json.loads(row["meta"])["retention"] == "durable"
+
+
+@pytest.mark.parametrize("ttl_days", [0, 366, 1.5, "7", True])
+def test_invalid_extractor_ttl_is_rejected(conn, ttl_days):
+    _seed_session(conn, f"bad-ttl-{ttl_days!r}", [
+        ("The temporary rollout state changed", "Noted."),
+    ])
+    llm.set_llm_for_tests(FakeLLM([json.dumps([_item(
+        "The temporary rollout state changed",
+        "fact",
+        retention="temporary",
+        ttl_days=ttl_days,
+    )])]))
+
+    extract.sweep(conn, _cfg())
+
+    assert conn.execute("SELECT count(*) FROM memories").fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT count(*) FROM audit_log WHERE action='extract_retention_reject'"
+    ).fetchone()[0] == 1
+
+
+def test_explicit_end_date_expires_one_day_later(conn):
+    _seed_session(conn, "dated-state", [
+        ("The deployment freeze runs through 2099-08-12", "Noted."),
+    ])
+    llm.set_llm_for_tests(FakeLLM([json.dumps([_item(
+        "The deployment freeze runs through 2099-08-12",
+        "fact",
+        retention="durable",
+    )])]))
+
+    extract.sweep(conn, _cfg())
+
+    row = conn.execute("SELECT ttl_at, meta FROM memories").fetchone()
+    assert row["ttl_at"] == "2099-08-13T00:00:00.000Z"
+    assert json.loads(row["meta"])["expiry_source"] == "explicit_end_date"
+
+
+def test_extractor_receives_bounded_current_correction_candidates(conn):
+    old = "The Hermes service endpoint is alpha"
+    seed_memory(conn, old, kind="fact")
+    _seed_session(conn, "candidate-context", [
+        ("The Hermes service endpoint changed to beta", "Noted."),
+    ])
+
+    def inspect_prompt(prompt):
+        assert "Current correction candidates" in prompt
+        assert old in prompt
+        block = prompt.split("Current correction candidates", 1)[1]
+        assert len(block) <= 2500
+        return "[]"
+
+    llm.set_llm_for_tests(FakeLLM([inspect_prompt]))
+    extract.sweep(conn, _cfg())
+
+
+def test_semantic_correction_requires_nomination_and_independent_agreement(conn):
+    old_id = seed_memory(conn, "The Hermes service endpoint is alpha", kind="fact")
+    old = conn.execute("SELECT * FROM memories WHERE id=?", (old_id,)).fetchone()
+    _seed_session(conn, "semantic-correct", [
+        ("Correction: the Hermes service endpoint is beta, not alpha", "Noted."),
+    ])
+    item = _item(
+        "The Hermes service endpoint is beta, not alpha",
+        "fact",
+        retention="durable",
+        supersedes_uid=old["uid"],
+    )
+    llm.set_llm_for_tests(FakeLLM([
+        json.dumps([item]),
+        json.dumps({"contradicts": True, "winner": "a", "why": "new endpoint"}),
+    ]))
+
+    extract.sweep(conn, _cfg())
+
+    retired = conn.execute("SELECT * FROM memories WHERE id=?", (old_id,)).fetchone()
+    current = conn.execute(
+        "SELECT * FROM memories WHERE valid_to IS NULL AND id != ?", (old_id,),
+    ).fetchone()
+    assert retired["valid_to"] is not None and retired["superseded_by"] == current["id"]
+    assert current["supersedes_id"] == old_id and current["version"] == 2
+    audit = conn.execute(
+        "SELECT detail FROM audit_log WHERE action='memory_corrected'",
+    ).fetchone()
+    detail = json.loads(audit["detail"])
+    assert detail["evidence"] == "semantic_two_stage"
+    assert detail["adjudication"]["winner"] == "a"
+    assert any(ref.startswith("session:") for ref in detail["source_episodes"])
+
+
+def test_fact_layer_update_supersedes_without_llm_adjudication(conn):
+    old_id = seed_memory(conn, "The Hermes service endpoint is alpha", kind="fact")
+    facts.add_fact(conn, "Hermes service", "endpoint", "alpha", memory_id=old_id)
+    conn.commit()
+    old = conn.execute("SELECT * FROM memories WHERE id=?", (old_id,)).fetchone()
+    _seed_session(conn, "fact-correct", [
+        ("Correction: the Hermes service endpoint is beta", "Noted."),
+    ])
+    fake = FakeLLM([json.dumps([_item(
+        "The Hermes service endpoint is beta",
+        "fact",
+        retention="durable",
+        supersedes_uid=old["uid"],
+        triples=[{"s": "Hermes service", "p": "endpoint", "o": "beta"}],
+    )])])
+    llm.set_llm_for_tests(fake)
+
+    extract.sweep(conn, _cfg())
+
+    assert len(fake.calls) == 1
+    retired = conn.execute("SELECT * FROM memories WHERE id=?", (old_id,)).fetchone()
+    current = conn.execute(
+        "SELECT * FROM memories WHERE supersedes_id=?", (old_id,),
+    ).fetchone()
+    assert retired["valid_to"] is not None and current is not None
+    detail = json.loads(conn.execute(
+        "SELECT detail FROM audit_log WHERE action='memory_corrected'",
+    ).fetchone()[0])
+    assert detail["evidence"] == "fact_layer_update"
+    assert detail["adjudication"]["type"] == "same_subject_predicate"
+
+
+def test_semantic_nomination_without_adjudicator_agreement_keeps_both(conn):
+    old_id = seed_memory(conn, "The Hermes service endpoint is alpha", kind="fact")
+    old = conn.execute("SELECT * FROM memories WHERE id=?", (old_id,)).fetchone()
+    _seed_session(conn, "semantic-disagree", [
+        ("The Hermes service endpoint might be beta", "Noted."),
+    ])
+    llm.set_llm_for_tests(FakeLLM([
+        json.dumps([_item(
+            "The Hermes service endpoint might be beta", "fact",
+            retention="durable", supersedes_uid=old["uid"],
+        )]),
+        json.dumps({"contradicts": False, "winner": "neither", "why": "unclear"}),
+    ]))
+
+    extract.sweep(conn, _cfg())
+
+    rows = conn.execute("SELECT * FROM memories ORDER BY id").fetchall()
+    assert len(rows) == 2
+    assert all(r["valid_to"] is None and r["supersedes_id"] is None for r in rows)
+
+
+def test_semantic_correction_rejects_lower_trust_and_pinned_target(conn):
+    old_id = seed_memory(
+        conn, "The Hermes service endpoint is alpha", kind="warning",
+        pinned=1, trust_tier="owner",
+    )
+    old = conn.execute("SELECT * FROM memories WHERE id=?", (old_id,)).fetchone()
+    _seed_session(conn, "semantic-peer", [
+        ("The Hermes service endpoint is beta", "Noted."),
+    ], trust="known_user", principal="peer-1")
+    llm.set_llm_for_tests(FakeLLM([
+        json.dumps([_item(
+            "The Hermes service endpoint is beta", "warning",
+            retention="durable", supersedes_uid=old["uid"],
+        )]),
+    ]))
+
+    extract.sweep(conn, _cfg())
+
+    target = conn.execute("SELECT * FROM memories WHERE id=?", (old_id,)).fetchone()
+    assert target["valid_to"] is None
+    reject = conn.execute(
+        "SELECT detail FROM audit_log WHERE action='semantic_correction_rejected'",
+    ).fetchone()
+    assert json.loads(reject["detail"])["reason"] in {"lower_trust", "pinned_owner_only"}
+
+
+def test_semantic_correction_rejects_scope_mismatch(conn):
+    old_id = seed_memory(conn, "The global service endpoint is alpha", kind="fact")
+    old = conn.execute("SELECT * FROM memories WHERE id=?", (old_id,)).fetchone()
+    _seed_session(conn, "semantic-scoped", [
+        ("My service endpoint is beta", "Noted."),
+    ], trust="owner", principal="owner-p")
+    llm.set_llm_for_tests(FakeLLM([json.dumps([_item(
+        "Owner's service endpoint is beta",
+        "fact",
+        retention="durable",
+        supersedes_uid=old["uid"],
+        about_user=True,
+    )])]))
+
+    extract.sweep(conn, _cfg())
+
+    target = conn.execute("SELECT * FROM memories WHERE id=?", (old_id,)).fetchone()
+    assert target["valid_to"] is None
+    reject = conn.execute(
+        "SELECT detail FROM audit_log WHERE action='semantic_correction_rejected'",
+    ).fetchone()
+    assert json.loads(reject["detail"])["reason"] == "scope_mismatch"
 
 
 def test_sweep_dedup_noop_on_resweep(conn):
@@ -322,7 +582,7 @@ def test_guards_drop_bad_items(conn):
         _item("too short", "fact"),                       # < 10 chars
         _item("x" * 401, "fact"),                          # > 400 chars
         _item("A plausible fact with an invalid kind", "note"),
-        _item("NO items for chit-chat, pleasantries, or process narration.",
+        _item("NO durable items for chit-chat, pleasantries, commit/status narration",
               "insight"),                                  # prompt echo
         _item("User favors explicit code over implicit magic", "preference"),
     ])]))

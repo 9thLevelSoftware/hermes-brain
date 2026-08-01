@@ -40,6 +40,7 @@ from datetime import UTC, datetime
 from ..capture.symbols import expand_query
 from ..store import db
 from ..store import vec as vec_store
+from ..store.lifecycle import current_memory_predicate
 from . import fusion, mmr, rerank
 from . import graph as graph_leg
 
@@ -457,7 +458,7 @@ def _memories_by_ids(conn, ids, kinds, scope_project, principal_id, trust_tier,
         return {}
     sql = (
         f"SELECT m.* FROM memories m WHERE m.id IN ({','.join('?' * len(ids))}) "
-        "AND m.valid_to IS NULL AND m.status = 'active' AND m.live = 1"
+        f"AND {current_memory_predicate('m')}"
     )
     params: list = list(ids)
     if kinds:
@@ -544,7 +545,7 @@ def _memories_rows(
         f"SELECT m.*, {_MEM_BM25} AS bm25_score "
         "FROM memory_fts JOIN memories m ON m.id = memory_fts.rowid "
         "WHERE memory_fts MATCH ? "
-        "AND m.valid_to IS NULL AND m.status = 'active' AND m.live = 1"
+        f"AND {current_memory_predicate('m')}"
     )
     params: list = [match]
     if kinds:
@@ -634,7 +635,7 @@ def _like_search(
     sql = (
         "SELECT m.* FROM memories m "
         f"WHERE ({like_clause}) "
-        "AND m.valid_to IS NULL AND m.status = 'active' AND m.live = 1"
+        f"AND {current_memory_predicate('m')}"
     )
     params: list = [f"%{_like_escape(t)}%" for t in toks]
     if kinds:

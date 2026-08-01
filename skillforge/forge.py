@@ -41,6 +41,7 @@ import struct
 
 from ..store import db
 from ..store import vec as vec_store
+from ..store.lifecycle import current_memory_predicate
 from . import skilltree
 
 logger = logging.getLogger(__name__)
@@ -250,7 +251,7 @@ def _detect(conn, embedder, home) -> list[dict]:
     {members, successes, failures, gold, centroid_uid}."""
     cases = conn.execute(
         "SELECT id, uid, summary, content, meta FROM memories"
-        " WHERE kind='case' AND status='active' AND valid_to IS NULL AND live=1"
+        f" WHERE kind='case' AND {current_memory_predicate()}"
         " ORDER BY id DESC LIMIT ?", (_MAX_CASES,)).fetchall()
     if len(cases) < _MIN_CLUSTER:
         return []

@@ -136,11 +136,24 @@ def test_is_syncable_denies_private(conn, cols):
     assert is_syncable(row) is False
 
 
+def test_is_syncable_denies_due_ttl_even_before_lifecycle_pass(conn):
+    _uid, row_id = _seed(conn, "expired operational state")
+    conn.execute(
+        "UPDATE memories SET ttl_at='2000-01-01T00:00:00.000Z' WHERE id=?",
+        (row_id,),
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM memories WHERE id=?", (row_id,)).fetchone()
+    assert row["status"] == "active"  # proves query-time TTL is the rejecting gate
+    assert is_syncable(row) is False
+
+
 def test_serialize_never_leaks_scope():
     row = {
         "uid": "U1", "content": "c", "kind": "fact", "epistemic": "observation",
         "memory_type": "semantic", "status": "active", "version": 1,
         "valid_from": "t", "valid_to": None, "recorded_at": "t",
+        "ttl_at": "2999-01-01T00:00:00.000Z",
         "half_life_days": None, "source_platform": "cli", "trust_tier": "owner",
         "supersedes_uid": None, "scope_user": "owner", "scope_session": "s",
     }
@@ -148,6 +161,7 @@ def test_serialize_never_leaks_scope():
     assert "scope_user" not in out
     assert "scope_session" not in out
     assert out["uid"] == "U1"
+    assert out["ttl_at"] == "2999-01-01T00:00:00.000Z"
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +189,24 @@ def test_round_trip_global_memory(tmp_path):
     assert row["status"] == "active"
     assert row["scope_user"] is None and row["scope_session"] is None  # GLOBAL
     assert row["created_by"] == "sync"
+    a.close()
+    b.close()
+
+
+def test_round_trip_preserves_future_ttl(tmp_path):
+    a = _open(tmp_path, "A")
+    b = _open(tmp_path, "B")
+    relay = FakeRelay()
+    crypto = _crypto()
+
+    uid, row_id = _seed(a, "temporary release state", origin="dev-a")
+    ttl_at = "2999-01-01T00:00:00.000Z"
+    a.execute("UPDATE memories SET ttl_at=? WHERE id=?", (ttl_at, row_id))
+    a.commit()
+
+    assert push(a, crypto, relay, origin="dev-a")["pushed"] == 1
+    assert pull(b, crypto, relay, origin="dev-b")["applied"] == 1
+    assert _current(b, uid)["ttl_at"] == ttl_at
     a.close()
     b.close()
 

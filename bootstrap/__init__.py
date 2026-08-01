@@ -51,6 +51,15 @@ def run_bootstrap(
         counts["memory_md"] = mem["memory"]
         counts["user_md"] = mem["user"]
         counts["memory_skipped"] = mem["skipped"]
+        # Once both flat-memory sources have been inspected and imported (or
+        # found empty), Brain may safely replace their prompt copies. Session
+        # history backfill is independent and may continue after this marker.
+        from ..store import db
+
+        completed_at = db.iso_now()
+        db.set_meta(conn, "builtin_import_complete_at", completed_at)
+        conn.commit()
+        counts["builtin_import_complete_at"] = completed_at
     except Exception as e:
         logger.warning("bootstrap: memory file import failed: %s", e, exc_info=True)
         counts["error"] = f"memory files: {e}"

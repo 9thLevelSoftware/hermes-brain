@@ -46,9 +46,11 @@ def _sample_sources(conn: sqlite3.Connection, limit: int) -> list[dict[str, Any]
     """
     rows: list[dict[str, Any]] = []
     try:
+        from ..store.lifecycle import current_memory_predicate
+
         for r in conn.execute(
             "SELECT uid, content FROM memories"
-            " WHERE valid_to IS NULL AND status='active' AND live=1"
+            f" WHERE {current_memory_predicate()}"
             "   AND kind NOT IN ('peer_card','strategy','guardrail','case')"
             "   AND length(content) > 80"
             " ORDER BY RANDOM() LIMIT ?", (limit,)

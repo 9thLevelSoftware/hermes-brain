@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import sqlite3
 import struct
 
@@ -29,6 +30,7 @@ from .. import llm
 from ..capture.symbols import symbols_field
 from ..store import db, entities
 from ..store import vec as vec_store
+from ..store.lifecycle import current_memory_predicate
 from .shift import Shift
 
 logger = logging.getLogger(__name__)
@@ -45,6 +47,12 @@ _IMPORTANCE_BOOST = 0.2
 _DEMOTE_FACTOR = 0.7
 _PATTERN_HALF_LIFE_DAYS = 180.0
 _PROMPT_VERSION = "consolidate-v1"
+_OPERATIONAL_NARRATION_RE = re.compile(
+    r"\b(?:created|made|pushed|amended|rebased|squashed)\s+(?:the\s+)?commit\b"
+    r"|\b(?:branch|deployment|pull request|pr\s*#?\d+|ci)\b.{0,100}"
+    r"\b(?:is|was|are|were|waiting|blocked|open|closed|passed|failed|green|red)\b",
+    re.IGNORECASE,
+)
 
 # owner > agent > known_user > tool > untrusted (same ranking as extract).
 _TRUST_RANK = {"owner": 0, "agent": 1, "known_user": 2, "tool": 3, "untrusted": 4}
@@ -72,6 +80,8 @@ Rules:
 - actionable: true only if the lesson would change future behavior. If you
   cannot honestly set actionable true, still return the object with
   actionable false.
+- Reject commit narration and branch/deployment/PR/CI status updates. A lesson
+  must generalize beyond one run, commit, branch, check, or current task.
 Return ONLY the JSON object."""
 
 
@@ -186,8 +196,8 @@ def _candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT m.* FROM memories m"
         " WHERE m.created_by='extraction' AND m.memory_type='semantic'"
-        " AND m.epistemic='observation' AND m.status='active' AND m.live=1"
-        " AND m.valid_to IS NULL AND m.superseded_by IS NULL"
+        f" AND m.epistemic='observation' AND {current_memory_predicate('m')}"
+        " AND m.superseded_by IS NULL"
         " AND NOT EXISTS (SELECT 1 FROM audit_log a"
         "                 WHERE a.action='consolidated' AND a.target=m.uid)"
         " ORDER BY m.id DESC LIMIT ?",
@@ -244,8 +254,8 @@ def _already_distilled(conn: sqlite3.Connection, member_ids: list[int]) -> bool:
         row = conn.execute(
             "SELECT 1 FROM edges e JOIN memories s ON s.id = e.src_id"
             " WHERE e.dst_id=? AND e.edge_type='related_to' AND e.valid_to IS NULL"
-            " AND s.epistemic='inference' AND s.status='active'"
-            " AND s.valid_to IS NULL LIMIT 1",
+            f" AND s.epistemic='inference' AND {current_memory_predicate('s')}"
+            " LIMIT 1",
             (mid,),
         ).fetchone()
         if row is None:
@@ -356,6 +366,8 @@ def _validate(conn: sqlite3.Connection, proposal, members) -> dict | None:
         return None
     content = str(proposal.get("content") or "").strip()
     if not content or len(content.split()) > _MAX_LESSON_WORDS:
+        return None
+    if _OPERATIONAL_NARRATION_RE.search(content):
         return None
     if not proposal.get("actionable"):
         return None

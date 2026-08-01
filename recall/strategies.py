@@ -33,6 +33,7 @@ from dataclasses import dataclass
 
 from ..dream.stats import wilson_lower_bound
 from ..store import vec as vec_store
+from ..store.lifecycle import current_memory_predicate
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +149,7 @@ def _fetch(conn, ids, scope_user, trust_tier) -> list[sqlite3.Row]:
         f" m.harmful_count, m.importance, m.meta, v.emb"
         f" FROM memories m LEFT JOIN mem_vec v ON v.id = m.id"
         f" WHERE m.id IN ({','.join('?' * len(ids))})"
-        " AND m.valid_to IS NULL AND m.status='active' AND m.live=1"
+        f" AND {current_memory_predicate('m')}"
         f" AND m.kind IN ({kind_ph})"
     )
     params: list = list(ids) + kinds

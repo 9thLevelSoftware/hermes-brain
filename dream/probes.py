@@ -31,6 +31,7 @@ import time
 from dataclasses import dataclass, field
 
 from ..recall.search import search
+from ..store.lifecycle import current_memory_predicate
 from .shift import Shift
 
 logger = logging.getLogger(__name__)
@@ -94,7 +95,7 @@ def _retrieval_probes(conn, config, embedder, report) -> None:
     """A high-value memory must retrieve itself by its own words."""
     rows = conn.execute(
         "SELECT id, uid, content, summary FROM memories"
-        " WHERE valid_to IS NULL AND status='active' AND live=1"
+        f" WHERE {current_memory_predicate()}"
         " AND (pinned=1 OR helpful_count>0 OR importance>=0.6)"
         " AND content IS NOT NULL"
         " ORDER BY pinned DESC, helpful_count DESC, importance DESC"

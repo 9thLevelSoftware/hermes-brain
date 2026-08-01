@@ -146,9 +146,10 @@ def test_new_text_wins_supersedes_and_carries_counters(conn):
     assert new_row["recall_count"] == 3
 
     # audit trail for the supersede
-    assert conn.execute(
-        "SELECT COUNT(*) FROM audit_log WHERE action='extract_contest_supersede'"
-    ).fetchone()[0] == 1
+    audit = conn.execute(
+        "SELECT detail FROM audit_log WHERE action='memory_corrected'"
+    ).fetchone()
+    assert json.loads(audit["detail"])["evidence"] == "dedup_information_contest"
 
     # the stale vector was moved onto the new row: a re-run of the SAME rich
     # text now finds the NEW version (exact hash) and merges it, not a 3rd row.
@@ -204,7 +205,7 @@ def test_instruction_shaped_near_dup_never_contests(conn):
     assert rows[0]["content"] == _OLD
     assert rows[0]["verification_count"] == 2    # reinforced, not superseded
     assert conn.execute(
-        "SELECT COUNT(*) FROM audit_log WHERE action='extract_contest_supersede'"
+        "SELECT COUNT(*) FROM audit_log WHERE action='memory_corrected'"
     ).fetchone()[0] == 0
 
 

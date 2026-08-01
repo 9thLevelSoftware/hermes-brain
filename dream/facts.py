@@ -31,6 +31,7 @@ import sqlite3
 
 from .. import llm
 from ..store import facts as facts_store
+from ..store.lifecycle import current_memory_predicate
 from .shift import Shift
 
 logger = logging.getLogger(__name__)
@@ -164,8 +165,8 @@ def _candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT m.* FROM memories m"
         " WHERE (m.kind='fact' OR m.epistemic='observation')"
-        " AND m.status='active' AND m.live=1"
-        " AND m.valid_to IS NULL AND m.superseded_by IS NULL"
+        f" AND {current_memory_predicate('m')}"
+        " AND m.superseded_by IS NULL"
         " AND m.content IS NOT NULL"
         " AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.memory_id = m.id)"
         " ORDER BY m.id DESC LIMIT ?",

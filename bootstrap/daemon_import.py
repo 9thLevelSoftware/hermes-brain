@@ -34,6 +34,7 @@ from urllib.parse import quote
 
 from ..capture.symbols import symbols_field
 from ..store import db
+from ..store.lifecycle import current_memory_predicate
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +120,8 @@ def import_daemon_db(conn: sqlite3.Connection, daemon_db_path: str | Path) -> di
 
         chash = db.content_hash(content)
         if conn.execute(
-            "SELECT 1 FROM memories WHERE content_hash=? AND valid_to IS NULL LIMIT 1",
+            f"SELECT 1 FROM memories WHERE content_hash=? AND "
+            f"{current_memory_predicate()} LIMIT 1",
             (chash,),
         ).fetchone():
             counts["skipped"] += 1

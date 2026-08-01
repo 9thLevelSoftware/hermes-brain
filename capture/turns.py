@@ -20,6 +20,7 @@ import sqlite3
 from dataclasses import dataclass
 
 from ..store import db
+from ..store.lifecycle import current_memory_predicate
 from .salience import score_turn
 from .symbols import symbols_field
 
@@ -200,6 +201,20 @@ def capture_memory_write(
                 if old_text:
                     old_row = _current_by_hash(conn, db.content_hash(old_text))
 
+            if action == "replace" and old_row is not None:
+                from ..store.supersession import create_successor
+
+                full_old = conn.execute(
+                    "SELECT * FROM memories WHERE id=?", (old_row["id"],),
+                ).fetchone()
+                result = create_successor(
+                    conn, full_old, text, actor="provider",
+                    reason=f"Hermes built-in memory replacement ({target})",
+                    mode="correct", evidence="builtin_memory_mirror",
+                    source_episodes=[f"session:{ctx.session_id}"], commit=True,
+                )
+                return result.new_id
+
             uid = db.new_ulid()
             cur = conn.execute(
                 "INSERT INTO memories (uid, epistemic, memory_type, kind, status, live,"
@@ -300,7 +315,7 @@ def capture_delegation(
 def _current_by_hash(conn: sqlite3.Connection, chash: str):
     return conn.execute(
         "SELECT id, uid, status, live, version FROM memories"
-        " WHERE content_hash=? AND valid_to IS NULL",
+        f" WHERE content_hash=? AND {current_memory_predicate()}",
         (chash,),
     ).fetchone()
 

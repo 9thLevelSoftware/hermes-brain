@@ -36,7 +36,10 @@ _KINDS = ("fact", "decision", "preference", "warning", "insight")
 # alias: the schema stores 'partial').
 _OUTCOMES = {"worked": "worked", "failed": "failed", "mixed": "partial"}
 
-_ACTIONS = ("forget", "pin", "unpin", "incognito_on", "incognito_off")
+_ACTIONS = (
+    "forget", "pin", "unpin", "correct", "restore",
+    "incognito_on", "incognito_off",
+)
 
 # The `memories` tool's command grammar — the Anthropic memory-tool shape.
 # Duplicated here (rather than imported from memfs) to keep module level
@@ -170,7 +173,9 @@ def get_schemas() -> list[dict]:
                             "description": "project scope (omit for global)",
                         },
                         "ttl_days": {
-                            "type": "number",
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 365,
                             "description": "expire after N days (known-transient "
                                            "facts); also sets decay half-life, "
                                            "capped at 30 days",
@@ -215,8 +220,9 @@ def get_schemas() -> list[dict]:
                 "name": "brain_manage",
                 "description": (
                     "Manage memory: forget (soft, reversible), pin/unpin "
-                    "(recall boost), incognito_on/incognito_off (pause/resume "
-                    "capture for future sessions)."
+                    "(recall boost), correct (append corrected content), restore "
+                    "(append a historical version as current), or "
+                    "incognito_on/incognito_off (pause/resume capture)."
                 ),
                 "parameters": {
                     "type": "object",
@@ -234,6 +240,10 @@ def get_schemas() -> list[dict]:
                         "reason": {
                             "type": "string",
                             "description": "why (stored as provenance)",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "replacement text; required for correct",
                         },
                     },
                     "required": ["action"],
@@ -532,7 +542,9 @@ def resolve_uid(conn: sqlite3.Connection, prefix: Any, *,
     sql = "SELECT * FROM memories WHERE uid LIKE ? ESCAPE '\\'"
     params: list = [like + "%"]
     if current_only:
-        sql += " AND valid_to IS NULL"
+        from .store.lifecycle import current_memory_predicate
+
+        sql += f" AND {current_memory_predicate()}"
     # Scope-filter INSIDE the resolver (finding #2): a non-owner must never
     # see another principal's uids surface in the ambiguity listing, and an
     # out-of-scope collision must be indistinguishable from a miss.
@@ -792,12 +804,14 @@ def _recall(conn: sqlite3.Connection, args: dict, ctx: ToolContext) -> dict:
 
 
 def _recall_by_id(conn: sqlite3.Connection, mem_id: Any, ctx: ToolContext) -> dict:
-    row = resolve_uid(conn, mem_id, current_only=True, ctx=ctx)
+    row = resolve_uid(conn, mem_id, current_only=False, ctx=ctx)
     _check_visible(row, ctx, str(mem_id))
     try:
         tags = json.loads(row["tags"] or "[]")
     except json.JSONDecodeError:
         tags = []
+    from .store.lifecycle import lifecycle_fields
+
     envelope = {
         "id": row["uid"][:8],
         "uid": row["uid"],
@@ -811,7 +825,11 @@ def _recall_by_id(conn: sqlite3.Connection, mem_id: Any, ctx: ToolContext) -> di
         "tags": tags,
         "project": row["scope_project"],
         "valid_from": row["valid_from"],
+        "valid_to": row["valid_to"],
         "recorded_at": row["recorded_at"],
+        "version": row["version"],
+        "supersedes_id": row["supersedes_id"],
+        "superseded_by": row["superseded_by"],
         "outcome": row["outcome"],
         "outcome_note": row["outcome_note"],
         "counts": {
@@ -822,12 +840,18 @@ def _recall_by_id(conn: sqlite3.Connection, mem_id: Any, ctx: ToolContext) -> di
         },
         "summary": row["summary"],
         "content": row["content"],
+        **lifecycle_fields(row),
     }
     return {
         "results": [envelope],
         "total": 1,
-        "hint": 'record how it turned out with brain_outcome(id="'
-                + row["uid"][:8] + '", outcome="worked"|"failed"|"mixed")',
+        "hint": (
+            'restore this historical content with brain_manage(action="restore", id="'
+            + row["uid"][:8] + '", reason="...")'
+            if row["valid_to"] is not None or row["status"] != "active"
+            else 'record how it turned out with brain_outcome(id="'
+                 + row["uid"][:8] + '", outcome="worked"|"failed"|"mixed")'
+        ),
     }
 
 
@@ -860,11 +884,11 @@ def _remember(conn: sqlite3.Connection, args: dict, ctx: ToolContext) -> dict:
 
     ttl_days = args.get("ttl_days")
     if ttl_days is not None and (
-        isinstance(ttl_days, bool) or not isinstance(ttl_days, (int, float))
-        or ttl_days <= 0
+        isinstance(ttl_days, bool) or not isinstance(ttl_days, int)
+        or not 1 <= ttl_days <= 365
     ):
         raise _ToolError(
-            f"ttl_days must be a positive number, got {ttl_days!r}",
+            f"ttl_days must be an integer from 1 through 365, got {ttl_days!r}",
             'e.g. brain_remember(content="...", ttl_days=14)',
         )
 
@@ -892,10 +916,13 @@ def _remember(conn: sqlite3.Connection, args: dict, ctx: ToolContext) -> dict:
     # Dedup: report the merge instead of creating a duplicate — but only
     # against a row in the SAME scope (a peer must not learn of, or bump,
     # the owner's memories).
+    from .store.lifecycle import current_memory_predicate
+
     scope_pred = "scope_user IS ?" if scope_user is None else "scope_user = ?"
     existing = conn.execute(
-        f"SELECT id, uid FROM memories WHERE content_hash=? AND valid_to IS NULL"
-        f" AND status='active' AND live=1 AND {scope_pred}",
+        f"SELECT id, uid FROM memories WHERE content_hash=? AND "
+        f"{current_memory_predicate()} "
+        f"AND {scope_pred}",
         (chash, scope_user),
     ).fetchone()
     if existing is not None and not quarantine:
@@ -916,6 +943,14 @@ def _remember(conn: sqlite3.Connection, args: dict, ctx: ToolContext) -> dict:
     # write-then-restamp two-step that a crash could leave inconsistent).
     ttl_at = _iso_in_days(float(ttl_days)) if ttl_days is not None else None
     half_life = min(float(ttl_days), 30.0) if ttl_days is not None else None
+    from .capture.retention import RetentionPolicy, lifecycle_meta
+
+    retention = RetentionPolicy(
+        "temporary" if ttl_days is not None else "durable",
+        ttl_days=ttl_days, ttl_at=ttl_at,
+        expiry_source="explicit_tool_ttl" if ttl_days is not None else None,
+    )
+    meta_json = lifecycle_meta(None, retention)
     uid = db.new_ulid()
     from .capture.symbols import symbols_field
 
@@ -925,15 +960,15 @@ def _remember(conn: sqlite3.Connection, args: dict, ctx: ToolContext) -> dict:
             " content, content_hash, symbols, tags, token_len, source_platform,"
             " source_author, source_session, source_refs, trust_tier, created_by,"
             " instruction_shaped, scope_user, scope_project, ttl_at,"
-            " half_life_days, valid_from, recorded_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " half_life_days, valid_from, recorded_at, meta)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 uid, "observation", "semantic", kind, status, 1,
                 text, chash, symbols_field(text), json.dumps(tags),
                 db.approx_tokens(text), ctx.platform, ctx.source_author,
                 ctx.session_id, json.dumps([f"session:{ctx.session_id}"]),
                 trust, "memory_tool", 1 if quarantine else 0,
-                scope_user, project, ttl_at, half_life, now, now,
+                scope_user, project, ttl_at, half_life, now, now, meta_json,
             ),
         )
         row_id = cur.lastrowid
@@ -946,7 +981,9 @@ def _remember(conn: sqlite3.Connection, args: dict, ctx: ToolContext) -> dict:
                              enabled=_events.recording_enabled(ctx.config),
                              payload={"kind": kind, "quarantined": quarantine})
         _audit(conn, "brain_remember", uid,
-               {"kind": kind, "trust_tier": trust, "status": status}, now)
+               {"kind": kind, "trust_tier": trust, "status": status,
+                "retention": retention.retention, "ttl_at": ttl_at,
+                "expiry_source": retention.expiry_source}, now)
         conn.commit()
     except sqlite3.Error as e:
         _rollback(conn)
@@ -1058,8 +1095,12 @@ def _manage(conn: sqlite3.Connection, args: dict, ctx: ToolContext) -> dict:
             f'e.g. brain_manage(action="{action}", id="01ABC234") — ids come '
             "from brain_recall results",
         )
-    row = resolve_uid(conn, args.get("id"), current_only=True, ctx=ctx)
+    historical = action == "restore"
+    row = resolve_uid(conn, args.get("id"), current_only=not historical, ctx=ctx)
     _check_visible(row, ctx, str(args.get("id")))
+
+    if action in ("correct", "restore"):
+        return _manage_supersession(conn, action, row, args, reason, ctx)
 
     from .store import db
 
@@ -1100,6 +1141,65 @@ def _manage(conn: sqlite3.Connection, args: dict, ctx: ToolContext) -> dict:
     db.bump_generation(conn, "mem")
     conn.commit()
     return {"id": uid8, "action": action, "pinned": bool(pinned)}
+
+
+def _manage_supersession(conn, action, row, args, reason, ctx) -> dict:
+    from .store.supersession import create_successor
+
+    if action == "correct":
+        content = args.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise _ToolError(
+                "content is required for correct",
+                f'brain_manage(action="correct", id="{row["uid"][:8]}", '
+                'content="corrected memory", reason="...")',
+            )
+        content = content.strip()
+        if len(content) > 10_000:
+            raise _ToolError("content is too long (max 10000 characters)",
+                             "store one self-contained correction")
+
+    incoming_rank = _TRUST_ORDER.index(
+        ctx.trust_tier if ctx.trust_tier in _TRUST_ORDER else "untrusted"
+    )
+    target_tier = row["trust_tier"] if row["trust_tier"] in _TRUST_ORDER else "untrusted"
+    target_rank = _TRUST_ORDER.index(target_tier)
+    if row["pinned"] and ctx.trust_tier != "owner":
+        raise _ToolError(
+            f"pinned memories require owner evidence to {action}",
+            "ask the owner to confirm or unpin the memory first",
+        )
+    if incoming_rank > target_rank:
+        raise _ToolError(
+            f"{action} evidence has lower trust than the target memory",
+            f"ask the owner to confirm the {action}",
+        )
+
+    if action == "correct":
+        result = create_successor(
+            conn, row, content, actor="provider", reason=reason,
+            mode="correct", evidence="explicit_manage", embedder=ctx.embedder,
+        )
+        return {
+            "action": "correct",
+            "old_id": result.old_uid,
+            "new_id": result.new_uid,
+            "restore_call": result.restore_call,
+            "note": "corrected by appending a new current version; history preserved",
+        }
+
+    result = create_successor(
+        conn, row, row["content"] or "", actor="provider", reason=reason,
+        mode="restore", evidence="explicit_manage", embedder=ctx.embedder,
+    )
+    return {
+        "action": "restore",
+        "restored_from": row["uid"],
+        "old_id": result.old_uid,
+        "new_id": result.new_uid,
+        "restore_call": result.restore_call,
+        "note": "restored as a new current version; no historical row was reopened",
+    }
 
 
 def _manage_incognito(conn: sqlite3.Connection, action: str,

@@ -17,8 +17,12 @@ DEFAULTS: dict[str, Any] = {
     "embed_model": "modernbert-embed-base",  # or embeddinggemma-300m (gated; needs HF_TOKEN)
     "rerank": "auto",            # auto | off — late-interaction ColBERT rerank (full tier)
     "rerank_model": "",          # '' = mxbai-edge-colbert default (fallback answerai); 'stub' for tests
-    "lane1_tokens": 1200,        # 800-1500; hard-truncated by the renderer
-    "lane2_tokens": 600,         # 0 disables lane 2
+    # Authoritative wall for stable lane 1 plus per-turn lane 2.  The lane
+    # settings remain compatible with older brain.yaml files but are
+    # subordinate to this combined budget.
+    "context_budget_tokens": 800,
+    "lane1_tokens": 400,
+    "lane2_tokens": 400,         # 0 disables lane 2
     # How the AGENT reaches memory. Mirrors the cross-provider convention
     # (Honcho recallMode, Hindsight memory_mode) so a user migrating from
     # either finds the knob where they expect it:
@@ -103,6 +107,42 @@ DEFAULTS: dict[str, Any] = {
     "sync_account": "",          # shared relay namespace across a user's devices
     "sync_salt": "",             # base64 KDF salt (shared across devices; set at init)
 }
+
+
+def effective_context_budgets(
+    config: dict[str, Any], *, actual_lane1_tokens: int | None = None
+) -> dict[str, Any]:
+    """Clamp legacy lane settings under the combined context wall.
+
+    Lane 1 is reserved first because it is the stable prompt prefix.  At
+    render time its measured token use can be supplied so unused capacity
+    rolls forward to lane 2.
+    """
+    def _integer(key: str, default: int) -> int:
+        try:
+            return int(config.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    requested_total = _integer("context_budget_tokens", 800)
+    requested_lane1 = _integer("lane1_tokens", 400)
+    requested_lane2 = _integer("lane2_tokens", 400)
+    total = max(0, requested_total)
+    lane1_cap = min(max(0, requested_lane1), total)
+    lane1_used = lane1_cap if actual_lane1_tokens is None else min(
+        max(0, int(actual_lane1_tokens)), lane1_cap
+    )
+    lane2 = min(max(0, requested_lane2), max(0, total - lane1_used))
+    return {
+        "context_budget_tokens": total,
+        "lane1_tokens": lane1_cap,
+        "lane2_tokens": lane2,
+        "clamped": (
+            total != requested_total
+            or lane1_cap != requested_lane1
+            or lane2 != requested_lane2
+        ),
+    }
 
 
 def config_path(hermes_home: str | Path) -> Path:

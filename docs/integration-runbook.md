@@ -32,6 +32,15 @@ hermes brain bootstrap         # first-run import (MEMORY.md/USER.md + state.db 
 hermes brain doctor            # PASS/WARN/FAIL health checks
 ```
 
+On a current Hermes host, leave `memory_enabled`, `user_profile_enabled`, and the
+built-in nudge setting enabled. After bootstrap, `status` should say `automatic handoff
+ready` and doctor should PASS `ownership-bootstrap`. Start a new session (or use a safe
+reset/compression prompt rebuild): MEMORY.md/USER.md prompt text and the memory-review
+nudge disappear, while the built-in `memory` tool and flat files still work and mirror
+writes into Brain. Before that marker—or if Brain cannot open—Hermes must retain its
+built-in prompt. `hermes brain adopt-memory` is only a compatibility path for older
+Hermes versions without `MemoryProvider.owns_builtin_memory()`.
+
 ## 1. Capture + retrieval (turn path)
 
 - Start a session; hold a short conversation with a durable fact ("my staging DB
@@ -42,6 +51,14 @@ hermes brain doctor            # PASS/WARN/FAIL health checks
 - Ask a paraphrased question next turn ("what's my staging database?") and confirm
   lane-2 recall surfaces it — validates the reranker + write-time rewriting (D2).
 - Confirm lane-1 is byte-stable within the session (no mid-session churn).
+- Confirm `context budget` reports 800 total and the combined lane-1 + lane-2 injection
+  never exceeds it. Oversized legacy lane settings must show `CLAMPED`.
+- Create a temporary operational memory and verify `brain_recall(id=...)` and
+  `hermes brain why <id>` show retention, expiry, and expiry source. After forcing it
+  due, confirm normal search excludes it before dream runs, lifecycle marks it expired,
+  and direct history lookup can still restore it.
+- Correct a memory with `brain_manage(action="correct", ...)`, use the returned exact
+  restore call, and confirm each operation appends a version rather than reopening one.
 
 ## 2. Real LLM extraction + the dream (learning active by default)
 

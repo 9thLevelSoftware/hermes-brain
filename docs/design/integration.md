@@ -115,7 +115,9 @@ This is the direct fix-pattern for hermes-agent issue #13631, and it maps 1:1 on
 - Refresh points, exactly: (a) `initialize()` (new session/process); (b) `on_session_switch(reset=True)` (a genuinely new conversation — `/new`, `/reset`); the refreshed block applies because Hermes rebuilds the system prompt for the new session. On `on_session_switch` with `reset=False` (resume/branch/**compression**) the cached block is **kept byte-identical** — compression must not change the prefix.
 - Golden test in the repo: run 50 simulated turns incl. a compression event; assert `system_prompt_block()` returned one distinct string.
 
-**Content & budget** (default 1,200 tokens ≈ 4,800 chars; config `lane1_tokens` 800–1500, hard-truncated by the renderer with deterministic ellipsis so the budget is a guarantee, not a hope):
+**Content & budget** (default 400 tokens; subordinate to the combined
+`context_budget_tokens: 800` cap and hard-truncated by the renderer so the budget is a
+guarantee, not a hope):
 
 ```
 ## Brain (persistent memory) — session index
@@ -130,14 +132,10 @@ brain_recall before acting on stale or truncated items.
 - [d-0521] Chose LanceDB fallback threshold 1M vecs (2026-07-10) — outcome unrecorded.
   If resolved, call brain_outcome(id, worked|failed).
 
-### ● Standing facts & preferences                     [~450 tok]
-- [u-0007] User: Devil; timezone America/Chicago; prefers terse answers, no emojis.
-- [p-0102] Project Hermes-Brain: single SQLite, no Qdrant. …
+### ● Pinned profile & preferences
+- [u-0007] User timezone is America/Chicago; prefers terse answers.
 
-### Index stats & drill-down                           [~100 tok]
-1,204 memories (312 facts, 87 procedures, 41 warnings) across 5 projects.
-brain_recall(query) searches all of it; depth:"deep" for graph traversal.
-Recent context arrives automatically each turn in <memory-context>.
+Use hermes brain search or brain_recall for facts, history, and full episodes.
 ```
 
 Ordering inside each section is deterministic (salience desc, then id) so re-renders are stable when content hasn't changed. IDs are short and stable — they are the drill-down handles and the vocabulary the nudges use (Daem0n's briefing-as-index lesson, minus its recency-only selection: selection is salience-scored by the dream cycle, failures pinned first).
@@ -146,7 +144,9 @@ Ordering inside each section is deterministic (salience desc, then id) so re-ren
 
 **Mechanics:** `queue_prefetch(query)` (called post-turn on the serialized worker) runs the real retrieval — RRF over FTS5 + sqlite-vec top-50, optional rerank — and caches the rendered string. `prefetch(query)` computes a fresh retrieval only if the cache is missing/stale for the query (first turn of a session), else returns the cache; either way it must comfortably beat 8s (target p95 < 300ms full mode, < 80ms lite). Return **plain text** (F3: the manager fences it and strips any fence we add). If nothing clears the relevance floor, return `""` — an empty lane 2 is cache-free by construction (no fence is injected at all).
 
-**Format** (stable, parse-friendly, budget default `lane2_tokens: 600`, configurable 0–2000; 0 disables lane 2 entirely):
+**Format** (stable, parse-friendly, budget default `lane2_tokens: 400`; effective
+lane 2 is `min(lane2_tokens, context_budget_tokens - actual_lane1_tokens)`, and 0
+disables it):
 
 ```
 Recalled for this turn (top 4 of 23 matches; not new user input):
@@ -157,7 +157,11 @@ Recalled for this turn (top 4 of 23 matches; not new user input):
 Nudge: open loop d-0521 matches this topic — record outcome if known.
 ```
 
-Line grammar: `[id | kind | age | confidence ★ | source-platform] one-line verbatim-or-summary`. Verbatim bodies only for `warning`/`decision` kinds (they must not be paraphrased); episodes get one-line summaries + drill-down id. At most **one** nudge line per turn, and the same nudge id at most twice per session (anti-nag cap, Daem0n lesson). Provenance tier gates content: memories whose source is quarantined (untrusted platform author, §4.5) are **never** rendered into lane 1 or lane 2 — tool-recall only, flagged.
+Line grammar: `[id | kind | age | confidence ★ | source-platform] one compact body`.
+The memory body is never repeated as both snippet and body. Automatic episode injection
+is limited to one compact summary; full episodes require `brain_recall`. Guidance/nudges
+consume at most 25% of effective lane 2. Provenance tier gates content: memories whose
+source is quarantined are never rendered into lane 1 or lane 2.
 
 **Update timing summary:** Lane 1 changes only at session boundaries; everything volatile — retrieval, freshness, nudges, outcome prompts — rides lane 2, which is injected into a copy of the user message at API-call time and never persisted (F3). This is exactly the #13631 contract; there is no third channel and we must never want one (`pre_llm_call` is unavailable to us anyway, F1).
 
@@ -172,7 +176,7 @@ Daem0n's lesson: 8 verb tools beat 67, but flat 28-param unions inside a verb ar
 1. **`brain_recall`** — `query` (req), `depth` (`"quick"`|`"deep"`, default quick: quick = RRF top-k index lines; deep = +graph neighbors, +episode bodies, slower), `kind` (optional filter enum), `project` (optional scope), `limit` (default 8, max 25). Returns index-format lines (same grammar as lane 2) + `total_matches` + `hint` ("refine with kind=… / drill with id=…"). Also accepts `id` for direct drill-down (mutually exclusive with `query`; the schema documents this and the error teaches it).
 2. **`brain_remember`** — `content` (req), `kind` (`fact|decision|preference|warning|insight`, req), `tags` (array, opt), `project` (opt), `ttl_days` (opt — explicit expiry for known-transient facts). Returns `{id, deduped_against?}` — write-time dedup happens silently and reports what it merged with.
 3. **`brain_outcome`** — `id` (req), `outcome` (`worked|failed|mixed`, req), `note` (opt). Closes open loops; feeds self-tuning. This is the only "learning" verb the model sees.
-4. **`brain_manage`** — `action` (`forget|pin|unpin|incognito_on|incognito_off`, req), `id` (req for forget/pin/unpin), `reason` (opt, stored as provenance). `forget` is soft (tombstone; excluded from all retrieval; purged by dream after `forget_grace_days`, default 30 — distill-don't-delete, reversible via CLI). `incognito_on` suspends all capture for the session and is announced in the tool result so the model can confirm to the user. This tool exists because gateway users manage memory *through chat* ("forget that"); the richer audit UX is CLI-only (§5.3).
+4. **`brain_manage`** — `action` (`forget|pin|unpin|correct|restore|incognito_on|incognito_off`, req), `id` (req for row actions), `content` (req only for `correct`), and `reason` (opt, stored as provenance). `correct` appends a successor that inherits the target's scope/trust/type envelope and returns both full IDs plus an exact restore call. `restore` appends a new current version from selected historical content; it never reopens the old row. `forget` remains soft, and incognito suspends capture for the session.
 5. **`memories`** — the Anthropic-memory-tool-shaped file interface: `command` (`view|create|str_replace|insert|delete|rename`), `path` (under `/memories`), plus the standard per-command params (`file_text`, `old_str`/`new_str`, `insert_line`/`insert_text`). Named `memories` because `memory` is reserved (F6). It maps onto **virtual views** of brain storage, not real files: `/memories/profile.md` (lane-1 standing facts, editable — edits become `brain_remember`/supersede operations), `/memories/index.md` (read-only rendered index), `/memories/topics/<tag>.md` (materialized per-tag digests; `create`/`str_replace` translate to remember/edit with `tags=[tag]`). On Claude models this inherits trained memory-tool behavior nearly for free (the trained shape is the command grammar + path convention more than the exact tool name); on other models it's a harmless secondary interface. Ship in phase 3, gated by config `memories_tool: true`.
 
 **Deliberately NOT exposed to the model:** graph surgery (edges are dream-owned), embedding/index admin, forgetting policy knobs, config, export/import, dream triggers, Daem0n-style `consult(action=…, 28 params)` anything, and no "search the raw episodic log" tool (that's `brain_recall depth:"deep"`'s job with sane defaults). The model surface is: *recall, remember, record outcome, manage, files*. Everything else is CLI or automatic.
@@ -203,7 +207,7 @@ Daem0n enforced memory with client hooks + hard gates. Hermes gives us something
 - **`sync_turn(user, assistant, messages=…)`** — the workhorse. Appends an episodic turn record (user text, assistant text, tool-call digest extracted from `messages` per F2: tool name, args hash, ok/error, duration if present), computes cheap salience heuristics inline (<5ms: error markers, correction phrases, decision verbs, user-emphasis markers), and queues embedding on the brain worker. Runs on the manager's serialized worker already (F5) — must stay well under a second per turn.
 - **`on_pre_compress(messages)`** — archives the about-to-be-discarded messages verbatim into the episodic store (append-only; cheap disk is the point of distill-don't-delete), returns a ≤300-token string of brain-extracted insights for the compression summary prompt (the hook's return contract, `memory_provider.py:220–230`).
 - **`on_delegation(task, result, child_session_id)`** — capture the pair as an episode of kind `delegation`; this is the only visibility into subagent work (cron/subagents are `skip_memory=True`).
-- **`on_memory_write(action, target, content, metadata)`** — during the transition period (built-in memory still on), mirror every built-in write into the brain with provenance `builtin-mirror` so nothing is lost when the built-in is later disabled.
+- **`on_memory_write(action, target, content, metadata)`** — mirror every built-in write into the brain with provenance `builtin-mirror`. Flat files remain operational even while Brain owns prompt context.
 - **Incognito:** when active (via `brain_manage` or `hermes brain incognito`), `sync_turn`/`on_pre_compress`/`on_session_end` write nothing; a session-scoped marker with hard TTL guarantees it can't leak into the dream sweep (table-stakes UX per products research; provably bypasses capture because capture is one code path).
 
 ### 4.2 Session-end extraction — designed around the 5s drain (F5)
@@ -223,17 +227,21 @@ The dream/sweep mines `state.db` **read-only**: `turn_outcomes` (outcome, retrie
 
 Every memory row carries `source` (platform, author id, session), `trust` (`operator` > `agent` > `external-mcp` > `untrusted-platform-peer`). Instruction-shaped content ("ignore previous…", imperative-to-the-assistant heuristics) from non-operator sources is quarantined at write time: stored, never rendered into lane 1/lane 2, tool-recall returns it flagged `⚠ quarantined`. Group-chat peers get per-peer write isolation (their statements become facts *about them*, never global preferences). This is day-one schema, not a later phase (SpAIware/ZombieAgent lesson).
 
-### 4.6 Hermes built-ins: disable/keep matrix (locked decision 4)
+### 4.6 Hermes built-ins: automatic ownership handoff
 
-| Built-in | Setting | Phase 1–2 (transition) | Phase 3+ (brain owns memory) |
+| Surface | Configuration | Before healthy bootstrap | After healthy bootstrap on capable Hermes |
 |---|---|---|---|
-| Built-in MEMORY.md/USER.md + `memory` tool | `memory.memory_enabled`, `memory.user_profile_enabled` | **Keep on**; brain mirrors via `on_memory_write` | **Off** (`false`/`false`) after `hermes brain bootstrap` imports both files; brain's lane 1 replaces the frozen blocks |
-| Memory nudge → background-review fork | `memory.nudge_interval` | Keep default (10) | **`0`** — the brain's sweep replaces cadence-driven memory review |
-| Honcho / any external provider | `memory.provider` | n/a | **`"brain"`** (the slot is exclusive — setting it *is* the Honcho off-switch) |
-| Skill nudges, `reflection_triggers` → background review for skills, curator, skills telemetry | skills/curator config | **Keep, untouched** | **Keep, untouched** — the brain *feeds* this loop (drafts SKILL.md candidates with provenance frontmatter, §6 P5); curator remains the janitor |
-| `session_search` core tool | — | Keep | Keep (harmless; brain_recall is better but session_search costs nothing) |
+| MEMORY.md/USER.md prompt blocks | built-in memory/profile enabled | Included as fallback | Omitted by provider ownership capability |
+| Built-in `memory` tool and flat files | enabled | Operational; writes mirror to Brain | Still operational; writes continue to mirror |
+| Built-in memory-review nudge | configured normally | Active | Suppressed while ownership is active |
+| External provider slot | `memory.provider: "brain"` | Brain active but does not claim ownership | Brain owns prompt context |
+| Skills/curator/session search | existing settings | Unchanged | Unchanged |
 
-`hermes brain setup` prints this matrix and offers to apply the phase-appropriate column; `hermes brain doctor` warns on drift (e.g. brain active but nudge_interval still 10 in phase 3+).
+Brain returns ownership only after its DB opens and the persisted
+`builtin_import_complete_at` marker confirms MEMORY.md/USER.md bootstrap. Hermes checks
+again at initialization and safe prompt rebuild boundaries. Failure is fail-safe: built-in
+prompt context remains. `hermes brain adopt-memory` remains only for older Hermes versions
+without this capability; it is not the preferred setup on a capable host.
 
 ---
 
@@ -269,8 +277,9 @@ Pip-install path (secondary): `pip install hermes-brain` + `hermes-brain init-pl
 
 ```
 mode              choices [auto, full, lite, fts-only]   default auto     (auto = RAM/platform detect)
-lane1_tokens      default 1200                                            (800–1500)
-lane2_tokens      default 600                                             (0 disables lane 2)
+context_budget_tokens default 800                                         (combined injection cap)
+lane1_tokens      default 400                                             (subordinate to total cap)
+lane2_tokens      default 400                                             (remaining budget; 0 disables lane 2)
 dream_schedule    choices [cron, on-idle, manual]        default auto     (cron if gateway detected)
 dream_time        default "03:30"
 dream_model       default ""                                              (auxiliary override — stronger model; empty = active model)
@@ -282,7 +291,7 @@ NOTE (2026-07-25): the `memories` tool shipped (alignment-audit.md C4), so
 now collects `recall_mode` (`hybrid|context|tools`, the cross-provider
 convention) and `query_rewrite` (off by default).
 
-No secrets → nothing to `.env`; `save_config()` writes `~/.hermes/brain/brain.yaml`. `post_setup(hermes_home, config)` (F9) then: creates dirs, downloads/validates the embedding model with a progress bar and an explicit skip option (skip → fts-only until `hermes brain doctor --fix`), runs bootstrap if accepted, offers the cron job (§1.3), sets `memory.provider: "brain"`, and prints the built-ins matrix (§4.6).
+No secrets → nothing to `.env`; `save_config()` writes `~/.hermes/brain/brain.yaml`. `post_setup(hermes_home, config)` (F9) then: creates dirs, downloads/validates the embedding model with a progress bar and an explicit skip option (skip → fts-only until `hermes brain doctor --fix`), runs bootstrap if accepted, offers the cron job (§1.3), sets `memory.provider: "brain"`, and reports ownership readiness (§4.6).
 
 Model files live in a **shared, non-backed-up cache**: `~/.cache/hermes-brain/models/` (Windows `%LOCALAPPDATA%\hermes-brain\models`), shared across profiles, re-downloadable — deliberately outside HERMES_HOME so `hermes backup` archives memories, not 300MB of ONNX (F15). `backup_paths()` returns `[]`; all state is under HERMES_HOME already.
 
@@ -305,6 +314,8 @@ Model files live in a **shared, non-backed-up cache**: `~/.cache/hermes-brain/mo
 First `initialize()` with an empty DB (or `hermes brain bootstrap`):
 
 1. **MEMORY.md / USER.md import** — parse the §-delimited entries (`~/.hermes/memories/` per built-in layout; re-verify exact paths in `agent/` at build time), each becomes a memory (`kind` inferred, `source=builtin-import`, trust `operator`). USER.md entries seed the lane-1 profile section.
+   The successful import persists `builtin_import_complete_at`; this marker, not an
+   in-memory assumption, gates automatic ownership.
 2. **state.db backfill** — read-only walk of `sessions`/`messages`/`turn_outcomes` (F14; open with `mode=ro` URI + its own busy_timeout), oldest→newest, writing episodic rows + salience tags and setting `sweep_state` watermarks; extraction of old sessions is then just normal sweep work the next dreams chew through (rate-limited: `dream.backfill_sessions_per_run`, default 20, so a 2-year history doesn't produce a 4-hour first dream).
 
    > **AMENDED 2026-07-26 (alignment-audit.md §F1).** Measured against a real

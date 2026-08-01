@@ -34,6 +34,7 @@ from .. import llm
 from ..capture.symbols import symbols_field
 from ..store import db
 from ..store import vec as vec_store
+from ..store.lifecycle import current_memory_predicate
 from . import mine_state
 from .shift import Shift
 
@@ -322,7 +323,7 @@ def _novelty_dup(shift: Shift, item) -> int | None:
             for mid, _dist in vec_store.knn(conn, "mem_vec", qvec, 8):
                 row = conn.execute(
                     "SELECT kind FROM memories WHERE id=? AND memory_type='procedural'"
-                    " AND status='active' AND valid_to IS NULL", (mid,)).fetchone()
+                    f" AND {current_memory_predicate()}", (mid,)).fetchone()
                 if row is None:
                     continue
                 # sqlite-vec returns L2 distance on normalized int8 vectors;
@@ -334,8 +335,8 @@ def _novelty_dup(shift: Shift, item) -> int | None:
         except Exception as e:
             logger.warning("distill: novelty check failed: %s", e)
     dup = conn.execute(
-        "SELECT id FROM memories WHERE memory_type='procedural' AND status='active'"
-        " AND valid_to IS NULL AND content_hash=?",
+        f"SELECT id FROM memories WHERE memory_type='procedural' AND "
+        f"{current_memory_predicate()} AND content_hash=?",
         (db.content_hash(item["title"]),)).fetchone()
     return dup["id"] if dup else None
 

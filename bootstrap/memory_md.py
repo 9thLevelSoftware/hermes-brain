@@ -11,7 +11,7 @@ writes each entry as a current ``memories`` row:
     trust_tier='owner'  created_by='bootstrap'  tags=['builtin-import']
     scope_user='owner' for USER.md rows (profile facts are about the owner)
 
-Idempotency is content_hash dedup against current rows (valid_to IS NULL) —
+Idempotency is content_hash dedup against the centralized current-truth predicate —
 re-running adds nothing; the source files are only ever READ.
 """
 
@@ -24,6 +24,7 @@ from pathlib import Path
 
 from ..capture.symbols import symbols_field
 from ..store import db
+from ..store.lifecycle import current_memory_predicate
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +45,11 @@ def _parse_entries(path: Path) -> list[str]:
     try:
         raw = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as e:
-        logger.warning("bootstrap: cannot read %s (%s); skipping", path, e)
-        return []
+        # Ownership may activate only after BOTH files were successfully
+        # inspected. Treating an unreadable file like an absent/empty file
+        # would set the bootstrap marker while silently dropping its content.
+        logger.warning("bootstrap: cannot read %s (%s)", path, e)
+        raise RuntimeError(f"cannot read {path.name}: {e}") from e
     if not raw.strip():
         return []
     entries = [e.strip() for e in raw.split(ENTRY_DELIMITER)]
@@ -54,7 +58,8 @@ def _parse_entries(path: Path) -> list[str]:
 
 def _hash_exists(conn: sqlite3.Connection, chash: str) -> bool:
     return conn.execute(
-        "SELECT 1 FROM memories WHERE content_hash=? AND valid_to IS NULL LIMIT 1",
+        f"SELECT 1 FROM memories WHERE content_hash=? AND "
+        f"{current_memory_predicate()} LIMIT 1",
         (chash,),
     ).fetchone() is not None
 
