@@ -63,16 +63,27 @@ def test_fifty_turns_lane1_stable_capture_complete_and_fast(tmp_home):
     assert isinstance(baseline, str)
 
     latencies = []
+    active_session = "sess-50"
     for i in range(1, 51):
         start = time.perf_counter()
         provider.sync_turn(
             f"user turn {i} poking widget_{i} in the deploy pipeline",
             f"assistant reply {i}: adjusted widget_{i}",
-            session_id="sess-50",
+            session_id=active_session,
             messages=[],
         )
         latencies.append(time.perf_counter() - start)
         assert provider.system_prompt_block() == baseline, f"lane 1 changed at turn {i}"
+        if i == 25:
+            # Hermes represents compression as a logical session-id rotation,
+            # not a reset. The stable prefix must survive it byte-for-byte.
+            provider.on_session_switch(
+                "sess-50-compressed",
+                parent_session_id=active_session,
+                reset=False,
+            )
+            active_session = "sess-50-compressed"
+            assert provider.system_prompt_block() == baseline
 
     start = time.perf_counter()
     provider.shutdown()
@@ -88,8 +99,8 @@ def test_fifty_turns_lane1_stable_capture_complete_and_fast(tmp_home):
     assert statistics.fmean(latencies) < 0.005, (
         f"sync_turn must be queue-only; mean {statistics.fmean(latencies) * 1000:.2f}ms")
 
-    assert poll_until(lambda: _episode_count(tmp_home, "sess-50") == 50, timeout=5.0), (
-        f"expected 50 episodes after drain, got {_episode_count(tmp_home, 'sess-50')}")
+    assert poll_until(lambda: _episode_count(tmp_home) == 50, timeout=5.0), (
+        f"expected 50 episodes after drain, got {_episode_count(tmp_home)}")
 
 
 def test_prefetch_empty_query_never_raises(tmp_home):

@@ -38,6 +38,7 @@ from .. import llm
 from ..store import db
 from ..store import facts as facts_store
 from ..store import vec as vec_store
+from ..store.lifecycle import current_memory_predicate
 from .consolidate import _blob_cosine, _dequantize
 from .shift import Shift
 
@@ -85,6 +86,35 @@ Rules:
 Return ONLY the JSON object."""
 
 
+def adjudicate_pair(conn, config, newer_text: str, older_text: str) -> dict | None:
+    """Bounded independent contradiction judgment for extraction corrections.
+
+    Unavailable budget/model or malformed output means "defer", never guess.
+    """
+    prompt = (
+        f"A (new evidence): {newer_text[:2000]}\n"
+        f"B (current memory): {older_text[:2000]}\n\n"
+        "Do these contradict, and if so which should stand as current truth?"
+    )
+    try:
+        verdict = llm.call_json(
+            conn, config, prompt, system=_CONTRADICT_SYSTEM, tier="consolidate",
+        )
+    except Exception as exc:
+        logger.info("contradiction adjudication unavailable: %s", exc)
+        return None
+    if not isinstance(verdict, dict):
+        return None
+    winner = str(verdict.get("winner") or "neither").lower()
+    if winner not in ("a", "b", "neither"):
+        return None
+    return {
+        "contradicts": bool(verdict.get("contradicts")),
+        "winner": winner,
+        "why": str(verdict.get("why") or "")[:500],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Entry point (Strategy protocol)
 # ---------------------------------------------------------------------------
@@ -122,7 +152,7 @@ def _run(shift: Shift) -> dict:
     # unprocessed same-recorded_at candidate forever. Row-value comparison.
     candidates = conn.execute(
         "SELECT * FROM memories WHERE memory_type='semantic'"
-        " AND status='active' AND live=1 AND valid_to IS NULL"
+        f" AND {current_memory_predicate()}"
         " AND (recorded_at, id) > (?, ?) ORDER BY recorded_at, id LIMIT ?",
         (wm_ra, wm_id, _MAX_CANDIDATES),
     ).fetchall()
@@ -142,7 +172,7 @@ def _run(shift: Shift) -> dict:
             aborted = True
             break
         still = conn.execute(
-            "SELECT 1 FROM memories WHERE id=? AND valid_to IS NULL",
+            f"SELECT 1 FROM memories WHERE id=? AND {current_memory_predicate()}",
             (cand["id"],)).fetchone()
         if still is None:
             # Invalidated earlier in this very loop — no longer current truth.
@@ -225,7 +255,7 @@ def _neighbors(conn: sqlite3.Connection, cand: sqlite3.Row) -> list[sqlite3.Row]
             continue
         row = conn.execute(
             "SELECT * FROM memories WHERE id=? AND memory_type='semantic'"
-            " AND status='active' AND live=1 AND valid_to IS NULL",
+            f" AND {current_memory_predicate()}",
             (nid,),
         ).fetchone()
         if row is None or row["scope_user"] != cand["scope_user"]:

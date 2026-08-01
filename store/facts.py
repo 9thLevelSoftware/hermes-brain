@@ -24,6 +24,7 @@ import sqlite3
 from dataclasses import dataclass
 
 from . import db
+from .lifecycle import current_memory_predicate
 
 # Column list shared by every SELECT; order MUST match the ``Fact`` fields so
 # ``Fact(*row)`` maps positionally regardless of the connection row_factory.
@@ -127,9 +128,17 @@ def add_fact(
                 (old_mem,),
             ).fetchone()
             if still_used is None:
-                conn.execute(
-                    "UPDATE memories SET valid_to=?, superseded_by=? WHERE id=?",
-                    (now, memory_id, old_mem),
+                from .supersession import link_existing_successor
+
+                link_existing_successor(
+                    conn, int(old_mem), int(memory_id), actor="facts",
+                    reason=f"deterministic fact update: {subject}.{predicate}",
+                    evidence={
+                        "type": "same_subject_predicate",
+                        "subject": subject,
+                        "predicate": predicate,
+                        "new_object": object,
+                    },
                 )
 
     # NOTE: no conn.commit() here — the CALLER owns the transaction. add_fact
@@ -184,26 +193,31 @@ def query_facts(
     conditions: list[str] = []
     params: list[object] = []
     if subject is not None:
-        conditions.append("subject=?")
+        conditions.append("f.subject=?")
         params.append(subject)
     if predicate is not None:
-        conditions.append("predicate=?")
+        conditions.append("f.predicate=?")
         params.append(predicate)
     if object is not None:
-        conditions.append("object=?")
+        conditions.append("f.object=?")
         params.append(object)
 
     if as_of is None:
-        conditions.append("valid_until IS NULL")
+        conditions.append("f.valid_until IS NULL")
+        conditions.append(
+            f"(f.memory_id IS NULL OR {current_memory_predicate('m')})"
+        )
     else:
-        conditions.append("valid_from <= ?")
+        conditions.append("f.valid_from <= ?")
         params.append(as_of)
-        conditions.append("(valid_until IS NULL OR valid_until > ?)")
+        conditions.append("(f.valid_until IS NULL OR f.valid_until > ?)")
         params.append(as_of)
 
     where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+    cols = ", ".join(f"f.{col.strip()}" for col in _COLS.split(","))
     rows = conn.execute(
-        f"SELECT {_COLS} FROM facts{where} ORDER BY valid_from DESC, id DESC",
+        f"SELECT {cols} FROM facts f LEFT JOIN memories m ON m.id=f.memory_id"
+        f"{where} ORDER BY f.valid_from DESC, f.id DESC",
         params,
     ).fetchall()
     return [_row_to_fact(r) for r in rows]

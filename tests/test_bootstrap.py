@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from pathlib import Path
 
 import pytest
 from brain.bootstrap import run_bootstrap
@@ -172,6 +173,26 @@ def test_memory_md_idempotent(conn, tmp_home):
 def test_memory_md_missing_files(conn, tmp_home):
     assert import_memory_files(conn, tmp_home) == {"memory": 0, "user": 0, "skipped": 0}
     assert _count(conn, "memories") == 0
+
+
+def test_unreadable_flat_memory_never_sets_ownership_marker(
+        conn, tmp_home, monkeypatch):
+    from brain.store import db
+
+    write_memory_files(tmp_home, memory_entries=["must not be silently skipped"])
+    real_read_text = Path.read_text
+
+    def unreadable_memory(self, *args, **kwargs):
+        if self.name == "MEMORY.md":
+            raise PermissionError("denied")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", unreadable_memory)
+
+    result = run_bootstrap(conn, tmp_home, {"bootstrap_import": True})
+
+    assert "memory files" in result["error"]
+    assert db.get_meta(conn, "builtin_import_complete_at") is None
 
 
 # ---------------------------------------------------------------------------

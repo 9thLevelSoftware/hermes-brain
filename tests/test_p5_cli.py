@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+import types
 
 import pytest
 from brain import cli
@@ -226,3 +228,37 @@ def test_adopt_memory_dry_run(home_env, capsys):
     assert "memory.memory_enabled" in out
     assert "Dry-run" in out
     assert 'provider' in out
+    assert "compatibility" in out.lower()
+    assert "automatic ownership" in out.lower()
+
+
+def test_doctor_prefers_automatic_handoff_on_capable_hermes(
+        home_env, monkeypatch):
+    hermes_pkg = types.ModuleType("hermes_cli")
+    hermes_config = types.ModuleType("hermes_cli.config")
+    hermes_config.load_config = lambda: {"memory": {
+        "provider": "brain",
+        "memory_enabled": True,
+        "user_profile_enabled": True,
+        "nudge_interval": 12,
+    }}
+    agent_pkg = types.ModuleType("agent")
+    memory_provider = types.ModuleType("agent.memory_provider")
+
+    class ModernProvider:
+        def owns_builtin_memory(self):
+            return False
+
+    memory_provider.MemoryProvider = ModernProvider
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_pkg)
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", hermes_config)
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.memory_provider", memory_provider)
+
+    reports = []
+    cli._doctor_host_config_checks(home_env, lambda *parts: reports.append(parts))
+
+    builtins = next(parts for parts in reports if parts[1] == "host-builtins")
+    assert builtins[0] == "PASS"
+    assert "automatic ownership" in builtins[2].lower()
+    assert "recoverable" in builtins[2].lower()

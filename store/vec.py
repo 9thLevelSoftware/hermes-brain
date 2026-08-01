@@ -155,7 +155,13 @@ def missing_ids(conn: sqlite3.Connection, table: str, limit: int = 500) -> list[
     """Base-table rows (current truth) that have no vector yet — backfill feed."""
     assert table in _TABLES, table
     base = _TABLES[table]
-    where = "m.valid_to IS NULL AND m.status='active' AND m.live=1" if base == "memories" else "1=1"
+    if base == "memories":
+        # Local import avoids lifecycle -> vec -> lifecycle at module import.
+        from .lifecycle import current_memory_predicate
+
+        where = current_memory_predicate("m")
+    else:
+        where = "1=1"
     rows = conn.execute(
         f"SELECT m.id FROM {base} m LEFT JOIN {table} v ON v.id = m.id "
         f"WHERE v.id IS NULL AND {where} ORDER BY m.id DESC LIMIT ?",

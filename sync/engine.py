@@ -36,6 +36,7 @@ import sqlite3
 from typing import Any
 
 from ..store import db, events
+from ..store.lifecycle import current_memory_predicate
 
 # meta keys — the two resumable cursors.
 logger = logging.getLogger(__name__)
@@ -75,6 +76,11 @@ def is_syncable(row: Any) -> bool:
     """
     if _rowget(row, "status") != "active":
         return False  # excludes quarantined / tombstone / summarized / expired
+    if _rowget(row, "valid_to") is not None or not bool(_rowget(row, "live", 1)):
+        return False
+    ttl_at = _rowget(row, "ttl_at")
+    if ttl_at and ttl_at <= db.iso_now():
+        return False
     return _scope_public(row)
 
 
@@ -119,6 +125,7 @@ def serialize_memory(row: Any) -> dict:
         "valid_from": _rowget(row, "valid_from"),
         "valid_to": _rowget(row, "valid_to"),
         "recorded_at": _rowget(row, "recorded_at"),
+        "ttl_at": _rowget(row, "ttl_at"),
         "half_life_days": _rowget(row, "half_life_days"),
         "source_platform": _rowget(row, "source_platform"),
         "trust_tier": _rowget(row, "trust_tier"),
@@ -324,8 +331,8 @@ def _insert_memory(
         "INSERT INTO memories (uid, epistemic, memory_type, kind, status, live,"
         " content, content_hash, trust_tier, created_by, instruction_shaped,"
         " version, supersedes_id, superseded_by, valid_from, valid_to,"
-        " recorded_at, half_life_days, source_platform)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " recorded_at, ttl_at, half_life_days, source_platform)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             mem.get("uid"),
             mem.get("epistemic") or "observation",
@@ -344,6 +351,7 @@ def _insert_memory(
             mem.get("valid_from") or now,
             valid_to,
             mem.get("recorded_at") or now,
+            mem.get("ttl_at"),
             mem.get("half_life_days"),
             mem.get("source_platform"),
         ),
@@ -421,7 +429,11 @@ def apply_remote(conn: sqlite3.Connection, env: dict) -> str:
     if supersedes_uid:
         parent = _by_uid(conn, supersedes_uid)
         if parent is not None:
-            if parent["valid_to"] is None and parent["status"] == "active":
+            if conn.execute(
+                f"SELECT 1 FROM memories WHERE id=? AND "
+                f"{current_memory_predicate()}",
+                (parent["id"],),
+            ).fetchone():
                 # Clean causal supersede: remote directly follows a live local row.
                 new_id = _insert_memory(conn, mem, supersedes_id=parent["id"])
                 conn.execute(
@@ -431,8 +443,8 @@ def apply_remote(conn: sqlite3.Connection, env: dict) -> str:
                 return "superseded"
             # Parent already superseded locally → a concurrent branch exists.
             competitor = conn.execute(
-                "SELECT * FROM memories WHERE supersedes_id=? AND valid_to IS NULL "
-                "AND status='active'",
+                f"SELECT * FROM memories WHERE supersedes_id=? AND "
+                f"{current_memory_predicate()}",
                 (parent["id"],),
             ).fetchone()
             if competitor is not None:

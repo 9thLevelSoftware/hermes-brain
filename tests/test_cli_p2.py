@@ -209,6 +209,26 @@ def test_why_prints_provenance(home, capsys):
     assert "recalled" in out
 
 
+def test_why_prints_retention_and_expiry_source(home, capsys):
+    _run(["remember", "temporary", "launch", "state"])
+    row = _one_row(home)
+    conn = db.connect(home)
+    conn.execute(
+        "UPDATE memories SET ttl_at='2099-01-01T00:00:00.000Z', meta=? WHERE id=?",
+        (json.dumps({"retention": "temporary",
+                     "expiry_source": "operational_default"}), row["id"]),
+    )
+    conn.commit()
+    conn.close()
+    capsys.readouterr()
+
+    assert _run(["why", row["uid"]]) == 0
+    out = capsys.readouterr().out
+    assert "retention" in out and "temporary" in out
+    assert "2099-01-01T00:00:00.000Z" in out
+    assert "operational_default" in out
+
+
 # ---------------------------------------------------------------------------
 # identity
 # ---------------------------------------------------------------------------
@@ -418,6 +438,50 @@ def test_status_shows_tier_and_vectors(home, capsys):
     out = capsys.readouterr().out
     assert "tier " in out
     assert "vectors " in out
+
+
+def test_status_and_doctor_report_combined_budget_clamping(home, capsys):
+    brain_config.save_config(home, {
+        "context_budget_tokens": 800,
+        "lane1_tokens": 1200,
+        "lane2_tokens": 600,
+    })
+
+    assert _run(["status"]) == 0
+    status = capsys.readouterr().out
+    assert "context budget" in status
+    assert "800 total" in status
+    assert "lane1=800" in status and "lane2=0" in status
+    assert "CLAMPED" in status
+
+    _run(["doctor"])
+    doctor = capsys.readouterr().out
+    assert "context-budget" in doctor
+    assert "clamped" in doctor.lower()
+
+
+def test_status_and_doctor_report_ownership_bootstrap_readiness(home, capsys):
+    assert _run(["status"]) == 0
+    status = capsys.readouterr().out
+    assert "memory ownership" in status
+    assert "bootstrap incomplete" in status
+
+    _run(["doctor"])
+    doctor = capsys.readouterr().out
+    assert "ownership-bootstrap" in doctor
+    assert "built-ins retained" in doctor
+
+    conn = db.connect(home)
+    try:
+        db.set_meta(conn, "builtin_import_complete_at", db.iso_now())
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert _run(["status"]) == 0
+    assert "bootstrap complete" in capsys.readouterr().out
+    _run(["doctor"])
+    assert "automatic ownership handoff ready" in capsys.readouterr().out
 
 
 def test_doctor_warns_without_owner_identity(home, capsys):

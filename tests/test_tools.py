@@ -62,7 +62,9 @@ def test_schema_documents_query_id_exclusivity_and_enums():
     assert by_name["brain_outcome"]["parameters"]["properties"]["outcome"]["enum"] \
         == ["worked", "failed", "mixed"]
     assert set(by_name["brain_manage"]["parameters"]["properties"]["action"]["enum"]) \
-        == {"forget", "pin", "unpin", "incognito_on", "incognito_off"}
+        == {"forget", "pin", "unpin", "correct", "restore",
+            "incognito_on", "incognito_off"}
+    assert "content" in by_name["brain_manage"]["parameters"]["properties"]
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +196,8 @@ def test_remember_applies_kind_tags_project_ttl_and_caps_trust(conn):
     assert row["scope_project"] == "hermes"
     assert row["ttl_at"] is not None and row["ttl_at"] > db.iso_now()
     assert row["half_life_days"] == 7.0
+    assert json.loads(row["meta"])["retention"] == "temporary"
+    assert json.loads(row["meta"])["expiry_source"] == "explicit_tool_ttl"
     assert row["trust_tier"] == "agent"  # model writes are 'agent' at most
     assert row["created_by"] == "memory_tool"
 
@@ -240,6 +244,9 @@ def test_remember_errors_teach(conn):
     assert 'tags=["deploy", "ci"]' in out["recovery_hint"]
     out = call(conn, "brain_remember", {"content": "x", "ttl_days": -3})
     assert "ttl_days" in out["error"]
+    for bad in (366, 1.5):
+        out = call(conn, "brain_remember", {"content": "x", "ttl_days": bad})
+        assert "1 through 365" in out["error"]
 
 
 def test_remember_embeds_when_embedder_present(conn):

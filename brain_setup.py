@@ -35,11 +35,14 @@ def config_schema() -> list[dict[str, Any]]:
          "description": "Retrieval tier (auto = detect RAM and installed deps)",
          "choices": ["auto", "full", "lite", "fts-only"],
          "default": DEFAULTS["mode"]},
+        {"key": "context_budget_tokens",
+         "description": "Combined Brain injection cap across stable + per-turn lanes",
+         "default": DEFAULTS["context_budget_tokens"]},
         {"key": "lane1_tokens",
-         "description": "System-prompt brain index budget, 800-1500 tokens",
+         "description": "Stable system-prompt index request (clamped under total cap)",
          "default": DEFAULTS["lane1_tokens"]},
         {"key": "lane2_tokens",
-         "description": "Per-turn recall injection budget (0 disables lane 2)",
+         "description": "Per-turn recall request (uses remaining total; 0 disables)",
          "default": DEFAULTS["lane2_tokens"]},
         {"key": "recall_mode",
          "description": "How the agent reaches memory (hybrid = inject + tools, "
@@ -86,25 +89,27 @@ def config_schema() -> list[dict[str, Any]]:
     ]
 
 
-# §4.6 built-ins matrix, printed verbatim — P2 never auto-edits Hermes config.
+# §4.6 ownership contract, printed verbatim — setup never disables built-ins.
 _TRANSITION_MATRIX = """
-  Built-ins transition matrix (docs/design/integration.md §4.6) — what to
-  flip when. Nothing below is changed automatically; edit config.yaml when
-  you reach the right-hand phase:
+  Automatic ownership handoff (docs/design/integration.md §4.6):
 
-    setting                        now (P1-P2 transition)   P3+ (brain owns memory)
-    memory.memory_enabled          keep on (brain mirrors)  false
-    memory.user_profile_enabled    keep on (brain mirrors)  false
-    memory.nudge_interval          keep default (10)        0 (sweep replaces nudges)
-    memory.provider                "brain"                  "brain"
-    skills / curator settings      keep untouched           keep untouched
-    session_search core tool       keep                     keep
+    memory.provider                "brain"
+    MEMORY.md / USER.md prompt     retained until bootstrap marker is healthy;
+                                    then suppressed at a safe prompt rebuild
+    memory tool stays operational; built-in writes keep mirroring
+    flat memory files              stay enabled as recoverable mirrors/fallback
+    built-in memory review nudge   suppressed only while Brain owns context
+    skills / curator / search      untouched
+
+  If Brain cannot open or bootstrap is incomplete, Hermes retains its built-in
+  prompt automatically. `hermes brain adopt-memory` is a compatibility path
+  only for older Hermes versions without the ownership capability.
 """
 
 
 def post_setup(hermes_home: str, config: dict[str, Any]) -> None:
     """Wizard finish: field prompts, dirs, optional model download, bootstrap,
-    lane 1, activation, transition matrix, identity reminder. Never raises.
+    lane 1, activation, ownership summary, identity reminder. Never raises.
 
     The field walk lives HERE, not in the wizard: hermes memory_setup
     delegates entirely to post_setup when the attribute exists, so the

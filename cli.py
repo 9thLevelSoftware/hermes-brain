@@ -36,8 +36,9 @@ _LANE1_STALE_DAYS = 7
 
 # Documented budget ranges (config.py DEFAULTS comments): lane 1 is
 # 800-1500 hard-truncated by the renderer; lane 2 is 0 (disabled) to 1500.
-_LANE1_RANGE = (800, 1500)
-_LANE2_RANGE = (0, 1500)
+_CONTEXT_RANGE = (1, 10_000)
+_LANE1_RANGE = (0, 10_000)
+_LANE2_RANGE = (0, 10_000)
 
 
 def _hermes_home() -> Path:
@@ -333,7 +334,9 @@ def _resolve_uid(conn, prefix: str, *, current_only: bool = True):
         return None
     sql = "SELECT * FROM memories WHERE uid LIKE ?"
     if current_only:
-        sql += " AND valid_to IS NULL"
+        from .store.lifecycle import current_memory_predicate
+
+        sql += f" AND {current_memory_predicate()}"
     rows = conn.execute(sql + " LIMIT 5", (prefix + "%",)).fetchall()
     if not rows:
         print(f"No {'current ' if current_only else ''}memory matches id '{prefix}'.\n"
@@ -387,6 +390,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     from . import config
     from .store import db, sysinfo
     from .store import vec as vec_store
+    from .store.lifecycle import current_memory_predicate
 
     home = _hermes_home()
     try:
@@ -409,7 +413,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
         by_type = conn.execute(
             "SELECT memory_type, count(*) AS n FROM memories "
-            "WHERE valid_to IS NULL AND status='active' "
+            f"WHERE {current_memory_predicate()} "
             "GROUP BY memory_type ORDER BY memory_type"
         ).fetchall()
         quarantined = conn.execute(
@@ -417,6 +421,14 @@ def cmd_status(args: argparse.Namespace) -> int:
         ).fetchone()["n"]
         pending = conn.execute(
             "SELECT count(*) AS n FROM ingest_buffer WHERE promoted_at IS NULL"
+        ).fetchone()["n"]
+        expired = conn.execute(
+            "SELECT count(*) AS n FROM memories WHERE status='expired'"
+        ).fetchone()["n"]
+        due = conn.execute(
+            "SELECT count(*) AS n FROM memories WHERE valid_to IS NULL "
+            "AND status='active' AND live=1 AND ttl_at IS NOT NULL "
+            "AND ttl_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')"
         ).fetchone()["n"]
 
         size_mb = db.db_path(home).stat().st_size / (1024 * 1024)
@@ -438,6 +450,17 @@ def cmd_status(args: argparse.Namespace) -> int:
               f"fts5={'yes' if caps.get('fts5') else 'NO'} "
               f"vec={'yes' if vec_live else 'no'}")
         print(f"tier              {_tier_label(cfg, sysinfo.resolve_mode(str(mode)))}")
+        budgets = config.effective_context_budgets(cfg)
+        clamp = " CLAMPED" if budgets["clamped"] else ""
+        print(f"context budget    {budgets['context_budget_tokens']} total; "
+              f"lane1={budgets['lane1_tokens']} lane2={budgets['lane2_tokens']}"
+              f"{clamp}")
+        bootstrap_at = db.get_meta(conn, "builtin_import_complete_at")
+        if bootstrap_at:
+            print(f"memory ownership  bootstrap complete {bootstrap_at}; "
+                  "automatic handoff ready")
+        else:
+            print("memory ownership  bootstrap incomplete; Hermes built-ins retained")
         # What retrieval will actually do — every leg degrades silently and
         # independently, so the configured stack and the live one can differ.
         try:
@@ -457,6 +480,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         else:
             print("memories          0")
         print(f"quarantined       {quarantined}")
+        print(f"expired           {expired}  ({due} due for lifecycle pass)")
         print(f"buffer pending    {pending}")
         for row in leases:
             state = f"held by {row['holder']} until {row['expires_at']}" if row["holder"] else "free"
@@ -663,6 +687,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             cfg = dict(config.DEFAULTS)
         _doctor_p2_checks(conn, cfg, report)
         _doctor_dream_freshness(conn, cfg, report)
+        _doctor_ownership_bootstrap(conn, report)
 
         conn.close()
     elif future_schema_msg:
@@ -671,8 +696,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # 6. config (independent of the DB)
     try:
         cfg = config.load_config(home)
-        l1, l2 = cfg["lane1_tokens"], cfg["lane2_tokens"]
+        total, l1, l2 = (cfg["context_budget_tokens"], cfg["lane1_tokens"],
+                         cfg["lane2_tokens"])
         problems = []
+        if not _CONTEXT_RANGE[0] <= total <= _CONTEXT_RANGE[1]:
+            problems.append(
+                f"context_budget_tokens={total} outside "
+                f"{_CONTEXT_RANGE[0]}-{_CONTEXT_RANGE[1]}"
+            )
         if not _LANE1_RANGE[0] <= l1 <= _LANE1_RANGE[1]:
             problems.append(f"lane1_tokens={l1} outside {_LANE1_RANGE[0]}-{_LANE1_RANGE[1]}")
         if not _LANE2_RANGE[0] <= l2 <= _LANE2_RANGE[1]:
@@ -682,6 +713,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                    f" — edit {config.config_path(home)}")
         else:
             report("PASS", "config", "parses; lane budgets within documented ranges")
+        effective = config.effective_context_budgets(cfg)
+        if effective["clamped"]:
+            report(
+                "WARN", "context-budget",
+                f"configured lane1={l1}, lane2={l2} is clamped under total={total} "
+                f"to lane1={effective['lane1_tokens']}, "
+                f"lane2={effective['lane2_tokens']}",
+            )
+        else:
+            report(
+                "PASS", "context-budget",
+                f"total={total}; lane1={effective['lane1_tokens']}, "
+                f"lane2={effective['lane2_tokens']}",
+            )
     except Exception as e:
         report("FAIL", "config", f"load failed: {e} — fix or delete "
                f"{config.config_path(home)} (defaults apply when absent)")
@@ -755,8 +800,12 @@ def _active_legs(conn, cfg: dict) -> dict[str, bool]:
     facts_on = bool(cfg.get("facts_leg", True))
     if facts_on:
         try:
+            from .store.lifecycle import current_memory_predicate
+
             facts_on = conn.execute(
-                "SELECT EXISTS(SELECT 1 FROM facts WHERE valid_to IS NULL)"
+                "SELECT EXISTS(SELECT 1 FROM facts f JOIN memories m "
+                "ON m.id=f.memory_id WHERE f.valid_until IS NULL AND "
+                f"{current_memory_predicate('m')})"
             ).fetchone()[0] == 1
         except Exception:
             facts_on = False
@@ -781,10 +830,11 @@ def _doctor_host_config_checks(home: Path, report) -> None:
       `hermes brain doctor` usually means the brain already is active. It
       earns its keep on the other entry points (a dev/`python -m` invocation,
       a config edited mid-session) and costs one config read.
-    * the rest of the matrix is INFO-only. Keeping the built-ins on during the
-      transition phase is a supported configuration, not a defect — the WARN
-      only fires once the user has adopted the brain-owns-memory phase
-      partially, which is the genuinely inconsistent state.
+    * capable Hermes versions keep the flat-memory switches ON. The provider's
+      ownership capability suppresses their prompt blocks and review nudges
+      only after Brain bootstrap is complete, while preserving the files and
+      write tool as mirrors. The old disable-matrix remains a compatibility
+      path for Hermes versions without that capability.
     """
     try:
         from hermes_cli.config import load_config as h_load  # type: ignore
@@ -814,18 +864,77 @@ def _doctor_host_config_checks(home: Path, report) -> None:
         for key in _ADOPT_MATRIX if key != "memory.provider"
     }
     matches = [k for k, v in adopted.items() if v == _ADOPT_MATRIX[k]]
-    if not matches:
-        report("PASS", "host-builtins",
-               "built-in memory still on (transition phase) — "
-               "'hermes brain adopt-memory' hands ownership to the brain")
+    try:
+        from agent.memory_provider import MemoryProvider  # type: ignore
+
+        automatic_handoff = callable(
+            getattr(MemoryProvider, "owns_builtin_memory", None)
+        )
+    except (ImportError, AttributeError):
+        automatic_handoff = False
+
+    if automatic_handoff:
+        if not matches:
+            report(
+                "PASS", "host-builtins",
+                "automatic ownership handoff supported; flat files and the memory "
+                "tool stay enabled as recoverable mirrors/fallbacks",
+            )
+        elif len(matches) == len(adopted):
+            report(
+                "WARN", "host-builtins",
+                "legacy compatibility matrix is applied on a capable Hermes; "
+                "automatic ownership is preferred so flat-memory tools remain "
+                "operational — re-enable built-in memory/profile/nudges",
+            )
+        else:
+            report(
+                "WARN", "host-builtins",
+                "partially disabled built-ins on a capable Hermes; automatic "
+                "ownership is preferred — re-enable built-in memory/profile/nudges",
+            )
+    elif not matches:
+        report(
+            "PASS", "host-builtins",
+            "older Hermes has no automatic ownership capability; built-ins remain "
+            "additive (use 'hermes brain adopt-memory' only after bootstrap to "
+            "avoid duplicate prompt context)",
+        )
     elif len(matches) == len(adopted):
-        report("PASS", "host-builtins", "brain owns memory (§4.6 matrix applied)")
+        report("PASS", "host-builtins",
+               "legacy compatibility ownership matrix applied")
     else:
         missing = [f"{k}={adopted[k]!r} (want {_ADOPT_MATRIX[k]!r})"
                    for k in adopted if k not in matches]
         report("WARN", "host-builtins",
-               "partially adopted: " + "; ".join(missing) +
-               " — run 'hermes brain adopt-memory --apply' to finish")
+               "partially applied compatibility matrix: " + "; ".join(missing) +
+               " — either revert it or run 'hermes brain adopt-memory --apply'")
+
+
+def _doctor_ownership_bootstrap(conn, report) -> None:
+    """Report whether Brain may safely suppress Hermes's built-in prompt."""
+    from .store import db
+
+    try:
+        completed_at = db.get_meta(conn, "builtin_import_complete_at")
+        if completed_at:
+            report(
+                "PASS", "ownership-bootstrap",
+                f"automatic ownership handoff ready (flat-memory import completed "
+                f"{completed_at})",
+            )
+        else:
+            report(
+                "WARN", "ownership-bootstrap",
+                "bootstrap incomplete; Hermes built-ins retained — run "
+                "'hermes brain bootstrap' and rebuild the prompt at a session/reset "
+                "boundary",
+            )
+    except Exception as e:
+        report(
+            "WARN", "ownership-bootstrap",
+            f"could not read bootstrap marker ({e}); Hermes built-ins retained",
+        )
 
 
 def _doctor_dream_freshness(conn, cfg: dict, report) -> None:
@@ -1639,6 +1748,12 @@ def cmd_why(args: argparse.Namespace) -> int:
               f"author={row['source_author'] or '-'}")
         print(f"valid             {row['valid_from']} -> {row['valid_to'] or '(current)'}"
               f"   recorded {row['recorded_at']}")
+        from .store.lifecycle import lifecycle_fields
+
+        lifecycle = lifecycle_fields(row)
+        print(f"retention         {lifecycle['retention']}   "
+              f"expires={lifecycle['ttl_at'] or '-'}   "
+              f"source={lifecycle['expiry_source'] or '-'}")
         if row["source_refs"] and row["source_refs"] != "[]":
             print(f"source_refs       {row['source_refs']}")
         if row["tags"] and row["tags"] != "[]":
@@ -2271,6 +2386,7 @@ def cmd_reindex(args: argparse.Namespace) -> int:
     from .recall.embed import get_embedder
     from .store import db, sysinfo
     from .store import vec as vec_store
+    from .store.lifecycle import current_memory_predicate, expire_due
 
     home = _hermes_home()
     cfg = config.load_config(home)
@@ -2285,6 +2401,7 @@ def cmd_reindex(args: argparse.Namespace) -> int:
     if conn is None:
         return 1
     try:
+        expire_due(conn, actor="cli:reindex")
         prev_name = db.get_meta(conn, "vec_embedder")
         prev_dim = db.get_meta(conn, "vec_dim")
         if not vec_store.ensure_tables(conn, embedder.dim, embedder.name,
@@ -2321,8 +2438,8 @@ def cmd_reindex(args: argparse.Namespace) -> int:
         n_stale = 0
         if all_rows:
             stale_ids = [r["id"] for r in conn.execute(
-                "SELECT id FROM memories WHERE valid_to IS NULL AND status='active' "
-                "AND live=1 AND (embedded_with IS NULL OR embedded_with != ?) "
+                f"SELECT id FROM memories WHERE {current_memory_predicate()} "
+                "AND (embedded_with IS NULL OR embedded_with != ?) "
                 "ORDER BY id DESC LIMIT ?", (embedder.name, args.limit)).fetchall()]
             n_stale = _embed_batch(conn, embedder, "mem_vec", stale_ids)
         line = f"embedded          {n_mem} memories, {n_epi} episodes ({embedder.name})"
@@ -2561,6 +2678,7 @@ def _export_full(conn, out_dir: Path) -> dict[str, int]:
 
 def cmd_export(args: argparse.Namespace) -> int:
     from .store import db
+    from .store.lifecycle import current_memory_predicate
 
     home = _hermes_home()
     conn = _open_db(home)
@@ -2571,7 +2689,7 @@ def cmd_export(args: argparse.Namespace) -> int:
             db.brain_dir(home) / "exports" / time.strftime("%Y-%m-%d")
         out_dir.mkdir(parents=True, exist_ok=True)
         rows = conn.execute(
-            "SELECT * FROM memories WHERE valid_to IS NULL AND status='active' "
+            f"SELECT * FROM memories WHERE {current_memory_predicate()} "
             "ORDER BY id"
         ).fetchall()
 
@@ -2793,6 +2911,7 @@ def _import_full(conn, manifest_path: Path, *, trust_owner: bool = False) -> dic
 
 def cmd_import(args: argparse.Namespace) -> int:
     from .store import db
+    from .store.lifecycle import current_memory_predicate
 
     path = Path(args.file)
     if not path.exists():
@@ -2844,7 +2963,8 @@ def cmd_import(args: argparse.Namespace) -> int:
             # could defeat dedup or mislabel the row (import hardening).
             chash = db.content_hash(content)
             dup = conn.execute(
-                "SELECT 1 FROM memories WHERE content_hash=? AND valid_to IS NULL",
+                f"SELECT 1 FROM memories WHERE content_hash=? AND "
+                f"{current_memory_predicate()}",
                 (chash,),
             ).fetchone()
             if dup:
@@ -3059,6 +3179,7 @@ def cmd_insights(args: argparse.Namespace) -> int:
     from . import config
     from .dream import mine_state
     from .store import db
+    from .store.lifecycle import current_memory_predicate
 
     home = _hermes_home()
     cfg = {**config.load_config(home), "hermes_home": str(home)}
@@ -3115,7 +3236,7 @@ def cmd_insights(args: argparse.Namespace) -> int:
         learned = conn.execute(
             "SELECT kind, count(*) AS n FROM memories WHERE memory_type IN "
             "('procedural','episodic') AND kind IN ('strategy','guardrail','case') "
-            "AND valid_to IS NULL AND status='active' GROUP BY kind").fetchall()
+            f"AND {current_memory_predicate()} GROUP BY kind").fetchall()
         if learned:
             print("  learned so far    " + ", ".join(f"{r['n']} {r['kind']}" for r in learned))
         forged = conn.execute(
@@ -3127,7 +3248,7 @@ def cmd_insights(args: argparse.Namespace) -> int:
         print(f"  skills            {forged} forged, {drafts} in review")
         top = conn.execute(
             "SELECT summary, content, helpful_count, harmful_count FROM memories "
-            "WHERE memory_type='procedural' AND valid_to IS NULL AND status='active' "
+            f"WHERE memory_type='procedural' AND {current_memory_predicate()} "
             "AND (helpful_count + harmful_count) > 0 "
             "ORDER BY helpful_count DESC LIMIT 5").fetchall()
         if top:
@@ -3265,7 +3386,10 @@ def _review_decide(conn, args) -> int:
         return 0
 
     # Else a quarantined memory: release it (approve) or tombstone (reject).
-    mem = _resolve_uid(conn, uid, current_only=True)
+    # Quarantine is deliberately outside the centralized current-truth
+    # predicate. Review is a management/history surface, so resolve the row
+    # without that filter and then require the precise quarantined state below.
+    mem = _resolve_uid(conn, uid, current_only=False)
     if mem is None:
         return 1
     if mem["status"] != "quarantined":
@@ -3402,11 +3526,18 @@ def cmd_mcp(args: argparse.Namespace) -> int:
 
 
 def cmd_adopt_memory(args: argparse.Namespace) -> int:
-    """Apply the 'brain owns memory' matrix to Hermes config.yaml (§4.6):
-    turn OFF the built-in memory/profile/nudges so the brain is authoritative.
-    Dry-run by default; --apply writes."""
+    """Legacy compatibility path for hosts without automatic ownership.
+
+    Modern Hermes keeps its flat files and memory tool enabled. It asks Brain's
+    ``owns_builtin_memory()`` capability at safe prompt rebuilds and suppresses
+    duplicate prompt context only after bootstrap is confirmed complete.
+    """
     target = dict(_ADOPT_MATRIX)
-    print("Brain-owns-memory matrix (skills loop + curator + session_search untouched):")
+    print("Compatibility path for older Hermes versions without automatic ownership.")
+    print("Modern Hermes should keep built-ins enabled: Brain suppresses duplicate "
+          "prompt context after bootstrap while flat files and tools remain live.")
+    print("\nLegacy brain-owns-memory matrix "
+          "(skills loop + curator + session_search untouched):")
     for key, val in target.items():
         print(f"  {key:32} -> {val}")
 

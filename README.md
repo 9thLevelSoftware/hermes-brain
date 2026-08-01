@@ -37,7 +37,7 @@ profile to draw on another.
 
 - **Remembers** every turn across every platform; recalls by hybrid keyword + vector
   search (fused with RRF), with cache-safe two-lane injection (a byte-stable
-  system-prompt block + a per-turn ephemeral fence).
+  system-prompt block + a per-turn ephemeral fence) capped at **800 tokens total**.
 - **Learns** during idle/nightly *dream* cycles: consolidates repeated observations into
   cited lessons, distills reusable **strategy** and **guardrail** items from Hermes's own
   successes *and* failures (ReasoningBank), banks task **cases** (Memento), and mines the
@@ -45,9 +45,12 @@ profile to draw on another.
 - **Forges skills**: clusters of proven task patterns become agentskills.io `SKILL.md`
   drafts, validated (replay + statistical + capability-regression probes) and — per your
   setting — auto-approved into Hermes's skills tree, curator-safe.
-- **Forgets** by tiered demotion, never destructive deletion; contradictions supersede
-  (versions-are-rows), and instruction-shaped/untrusted content is quarantined out of the
-  lanes.
+- **Forgets** transient operational state through enforced TTLs and tiered demotion,
+  never destructive lifecycle deletion. Expired and corrected content remains auditable
+  and restorable; current truth is filtered consistently across every recall path.
+- **Corrects** stale truth by appending a successor version. Explicit corrections,
+  deterministic fact updates, mirrored file edits, and high-confidence semantic
+  contradictions share one reversible supersession path.
 - **Shares** across agents via a stdio **MCP server**: Claude Code can recall a memory the
   owner wrote from Telegram.
 
@@ -75,6 +78,19 @@ warns when nothing has consolidated in a while.
 `recall_mode` (`hybrid` \| `context` \| `tools`) matches the convention used by Honcho
 (`recallMode`) and Hindsight (`memory_mode`): `hybrid` injects *and* exposes tools,
 `context` injects only, `tools` exposes tools only.
+
+The default context budget is one combined cap: `context_budget_tokens: 800`, split
+between `lane1_tokens: 400` and `lane2_tokens: 400`. Larger legacy lane settings are
+clamped under the combined cap and reported by `hermes brain status` and `doctor`.
+Lane 1 contains only prioritized warnings, pinned profile/preferences, open decisions,
+and one drill-down hint. Lane 2 renders each memory once, includes at most one compact
+episode, and limits guidance to one quarter of its effective budget.
+
+On a Hermes version that supports provider ownership, Brain suppresses duplicate
+MEMORY.md/USER.md prompt blocks and built-in review nudges only after its database opens
+and bootstrap records `builtin_import_complete_at`. The flat files and built-in memory
+tool stay enabled as recoverable mirrors. If Brain is unavailable or bootstrap is
+incomplete, Hermes automatically retains its built-in prompt.
 
 ## One brain, many profiles
 
@@ -150,8 +166,13 @@ hermes brain insights                                # longitudinal learning met
 hermes brain review [--approve/--reject <uid>]       # proposals + quarantine queue
 hermes brain skills list|forge|approve|reject        # forged-skill lifecycle
 hermes brain mcp                                      # stdio MCP server for external agents
-hermes brain adopt-memory [--apply]                  # hand memory ownership to the brain
+hermes brain adopt-memory [--apply]                  # compatibility path for older Hermes
 ```
+
+In chat, `brain_manage(action="correct", id="...", content="...", reason="...")`
+appends a corrected current version and returns the exact restore call. Calling
+`brain_manage(action="restore", id="historical-id", reason="...")` appends another
+current version from historical content; it never rewrites or reopens history.
 
 ## Status
 

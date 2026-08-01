@@ -43,6 +43,7 @@ from .. import llm
 from ..capture.symbols import symbols_field
 from ..store import db
 from ..store import vec as vec_store
+from ..store.lifecycle import current_memory_predicate
 from .shift import Shift
 
 logger = logging.getLogger(__name__)
@@ -262,8 +263,8 @@ def _peer_episodes(conn: sqlite3.Connection, principal_id: str,
 def _current_card(conn: sqlite3.Connection, principal_id: str) -> sqlite3.Row | None:
     return conn.execute(
         "SELECT id, uid, version, content_hash, meta FROM memories"
-        " WHERE kind='peer_card' AND scope_user=? AND valid_to IS NULL"
-        " AND status='active' AND live=1 ORDER BY version DESC LIMIT 1",
+        f" WHERE kind='peer_card' AND scope_user=? AND {current_memory_predicate()}"
+        " ORDER BY version DESC LIMIT 1",
         (principal_id,),
     ).fetchone()
 

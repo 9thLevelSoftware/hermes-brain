@@ -32,6 +32,7 @@ import logging
 import sqlite3
 
 from ..store import db
+from ..store.lifecycle import current_memory_predicate
 from .shift import Shift
 from .stats import wilson_diff_lower_bound
 
@@ -91,7 +92,7 @@ def _run(shift: Shift) -> dict:
     rows = conn.execute(
         "SELECT m.id, m.pinned, m.kind, m.outcome, m.helpful_count AS h,"
         " m.harmful_count AS harm FROM memories m"
-        " WHERE m.valid_to IS NULL AND m.status='active'"
+        f" WHERE {current_memory_predicate('m')}"
         " AND (m.helpful_count + m.harmful_count) >= ?", (_MIN_SAMPLES,),
     ).fetchall()
     proposals = _feature_contrasts(rows) if len(rows) >= 2 * _MIN_BUCKET else []

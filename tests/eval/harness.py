@@ -114,7 +114,12 @@ class ScriptedEvalLLM:
         return "[]"
 
     def _extract_reply(self, prompt: str) -> str:
-        low = prompt.lower()
+        # Prompt v3 appends current correction candidates after the source
+        # digest. Those candidates may contain another fixture session's match
+        # token; dispatch only on source turns or the fake can replay old
+        # extraction output instead of processing the current session.
+        source_prompt = prompt.split("Current correction candidates", 1)[0]
+        low = source_prompt.lower()
         for session in self._sessions:
             match = str(session.get("match", "")).lower()
             if match and match in low:

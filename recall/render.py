@@ -37,9 +37,13 @@ _GUIDANCE_GLYPH = {"strategy": "→ strategy", "guardrail": "⚑ guardrail"}
 _GUIDANCE_SNIPPET = 200
 
 
-def lane1_static() -> str:
+def lane1_static(budget_tokens: int | None = None) -> str:
     """P1's byte-stable lane 1 block. MUST stay free of dynamic content."""
-    return _LANE1
+    if budget_tokens is None or db.approx_tokens(_LANE1) <= budget_tokens:
+        return _LANE1
+    if budget_tokens <= 0:
+        return ""
+    return _LANE1[: budget_tokens * 4].rstrip()
 
 
 def index_line(hit) -> str:
@@ -59,6 +63,17 @@ def index_line(hit) -> str:
     return f"[{hit.uid[:8]} · {label} · {date} · {where}] {snippet}"
 
 
+def _index_prefix(hit) -> str:
+    """Index metadata without a snippet, for non-duplicating lane-2 rows."""
+    label = hit.mkind or hit.kind
+    date = (hit.ts or "")[:10]
+    where = f"{hit.platform or '-'}"
+    origin = getattr(hit, "profile", None)
+    if origin:
+        where += f" @{origin}"
+    return f"[{hit.uid[:8]} · {label} · {date} · {where}]"
+
+
 def lane2_block(hits: list, budget_tokens: int) -> str:
     """Budget-packed lane 2. '' when nothing to inject; otherwise header +
     per-hit index line (+ verbatim text for memory hits), packed top-down
@@ -68,20 +83,26 @@ def lane2_block(hits: list, budget_tokens: int) -> str:
         return ""
     parts = [LANE2_HEADER]
     used = db.approx_tokens(LANE2_HEADER)
-    for i, hit in enumerate(hits):
-        line = index_line(hit)
-        chunk = f"{line}\n{hit.text}" if (hit.kind == "memory" and hit.text) else line
+    episode_seen = False
+    for hit in hits:
+        if hit.kind == "episode":
+            if episode_seen:
+                continue
+            episode_seen = True
+            # Full raw turns remain available through brain_recall.
+            chunk = index_line(hit)
+        else:
+            body = _WS.sub(" ", (hit.text or hit.summary or "")).strip()
+            chunk = f"{_index_prefix(hit)} {body}".rstrip()
         cost = db.approx_tokens(chunk)
         if used + cost > budget_tokens:
-            if i == 0:
-                parts.append(line)  # guarantee at least the first index line
             break
         parts.append(chunk)
         used += cost
-    return "\n".join(parts)
+    return "\n".join(parts) if len(parts) > 1 else ""
 
 
-def guidance_block(items: list, budget_tokens: int) -> str:
+def guidance_block(items: list, budget_tokens: int, *, max_fraction: float = 1.0) -> str:
     """Lane-2 learned-guidance subsection (strategy/guardrail items + cases).
 
     Rendered ABOVE the recalled-context section within the shared lane-2
@@ -91,9 +112,13 @@ def guidance_block(items: list, budget_tokens: int) -> str:
     """
     if not items or budget_tokens <= 0:
         return ""
+    fraction = min(1.0, max(0.0, float(max_fraction)))
+    budget_tokens = int(budget_tokens * fraction)
+    if budget_tokens <= 0:
+        return ""
     parts = [GUIDANCE_HEADER]
     used = db.approx_tokens(GUIDANCE_HEADER)
-    for i, g in enumerate(items):
+    for g in items:
         title = _WS.sub(" ", (g.title or "")).strip()[:_GUIDANCE_SNIPPET]
         if not title:
             continue
@@ -105,8 +130,6 @@ def guidance_block(items: list, budget_tokens: int) -> str:
         line = f"[{g.uid[:8]}] {line}"
         cost = db.approx_tokens(line)
         if used + cost > budget_tokens:
-            if i == 0:
-                parts.append(line)
             break
         parts.append(line)
         used += cost

@@ -164,6 +164,12 @@ def run_dream(
     shift_id: str | None = None
     summary: dict[str, Any] = {"strategies": {}}
     try:
+        from ..store.lifecycle import apply_legacy_retention, expire_due
+
+        summary["lifecycle"] = {
+            **apply_legacy_retention(conn, actor=f"{actor}:legacy"),
+            **expire_due(conn, actor=f"{actor}:expiry"),
+        }
         strategies = (phase,) if phase else PIPELINE
         if phase and phase not in PIPELINE:
             return {"error": f"unknown phase '{phase}'",

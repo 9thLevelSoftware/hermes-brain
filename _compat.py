@@ -35,6 +35,9 @@ except ImportError:  # standalone: tests, MCP server, CI
         def system_prompt_block(self) -> str:
             return ""
 
+        def owns_builtin_memory(self) -> bool:
+            return False
+
         def prefetch(self, query: str, *, session_id: str = "") -> str:
             return ""
 

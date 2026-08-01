@@ -103,8 +103,7 @@ def _fake_llm(synthetic_brain):
 # ---------------------------------------------------------------------------
 
 def test_lane1_materialize_survives_synthetic_shell(synthetic_brain, tmp_path):
-    """Importing + running the lane1 materialize path under the empty-shell
-    parent must NOT raise the ``__version__`` ImportError.
+    """Importing + running lane 1 under an empty synthetic parent must work.
 
     Before the fix, ``importlib.import_module`` below raised at module import:
     ``cannot import name '__version__' from '_hermes_user_memory.brain'
@@ -119,7 +118,8 @@ def test_lane1_materialize_survives_synthetic_shell(synthetic_brain, tmp_path):
     home.mkdir()
     conn = db.connect(home)
     try:
-        # One current-truth fact so the facts section (not just stats) renders.
+        # Any current row is enough to exercise materialization. Compact lane 1
+        # intentionally omits standing facts and corpus/version statistics.
         from conftest import seed_memory
 
         seed_memory(conn, "the staging DB lives on host neptune", kind="fact")
@@ -128,10 +128,8 @@ def test_lane1_materialize_survives_synthetic_shell(synthetic_brain, tmp_path):
         assert rows >= 1
 
         rendered = lane1.render(conn, 1200)
-        # The version stamp is emitted; under the shell it degrades to the
-        # fallback rather than crashing.
-        assert "brain v" in rendered
-        assert isinstance(lane1._BRAIN_VERSION, str) and lane1._BRAIN_VERSION
+        assert "hermes brain search" in rendered
+        assert "brain v" not in rendered
     finally:
         conn.close()
 

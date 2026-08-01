@@ -50,7 +50,7 @@ from .capture.turns import (
     capture_session_end,
     capture_turn,
 )
-from .config import DEFAULTS, load_config, save_config
+from .config import DEFAULTS, effective_context_budgets, load_config, save_config
 from .recall.blend import blend
 from .recall.query_cache import QueryCache
 from .recall.render import guidance_block, lane1_static, lane2_block
@@ -121,6 +121,7 @@ class BrainProvider(MemoryProvider):
         self._lane1 = ""
         self._lane1_staged = ""   # marker-job re-render, swapped at reset switch
         self._lane2_cache: dict[str, str] = {}
+        self._db_opened = False
         # Single-consumer recall cache (brain-bg worker only), invalidated on
         # the memories generation counter. Never touches the turn path.
         self._query_cache = QueryCache()
@@ -148,6 +149,7 @@ class BrainProvider(MemoryProvider):
     # -- lifecycle -----------------------------------------------------------
 
     def initialize(self, session_id: str, **kwargs) -> None:
+        self._db_opened = False
         self._session_id = session_id
         self._platform = kwargs.get("platform") or "cli"
         agent_context = kwargs.get("agent_context") or "primary"
@@ -215,14 +217,15 @@ class BrainProvider(MemoryProvider):
                 if identity[1] == "owner" and self._recall_mode != "tools":
                     from .recall import lane1 as lane1_mod
 
-                    lane1_block = lane1_mod.render(
-                        conn, int(self._config.get("lane1_tokens", 1200)))
+                    budgets = effective_context_budgets(self._config)
+                    lane1_block = lane1_mod.render(conn, budgets["lane1_tokens"])
                 if bool(self._config.get("bootstrap_import", True)):
                     empty = conn.execute(
                         "SELECT NOT EXISTS(SELECT 1 FROM episodes) "
                         "AND NOT EXISTS(SELECT 1 FROM memories)"
                     ).fetchone()[0]
                     needs_bootstrap = bool(empty)
+                self._db_opened = True
             finally:
                 conn.close()
         except Exception:
@@ -231,7 +234,8 @@ class BrainProvider(MemoryProvider):
         self._session_identity[session_id] = identity
 
         # Lane 1: rendered once, byte-stable for the session (invariant #1).
-        self._lane1 = lane1_block or lane1_static()
+        lane1_budget = effective_context_budgets(self._config)["lane1_tokens"]
+        self._lane1 = lane1_block or lane1_static(lane1_budget)
 
         # A thread-start failure (RuntimeError under thread exhaustion) must
         # not leave _initialized False and silently disable every hook for the
@@ -298,6 +302,25 @@ class BrainProvider(MemoryProvider):
 
     def system_prompt_block(self) -> str:
         return self._lane1
+
+    def owns_builtin_memory(self) -> bool:
+        """True only after the Brain DB and flat-memory bootstrap are healthy.
+
+        Hermes asks again whenever it safely rebuilds a prompt.  Reading the
+        persisted marker here lets a first-run asynchronous bootstrap hand
+        ownership over at the next reset/compression boundary without ever
+        dropping the built-in fallback during the incomplete interval.
+        """
+        if not self._initialized or not self._db_opened or not self._hermes_home:
+            return False
+        try:
+            conn = store_db.connect(self._hermes_home, create=False, read_only=True)
+            try:
+                return bool(store_db.get_meta(conn, "builtin_import_complete_at"))
+            finally:
+                conn.close()
+        except Exception:
+            return False
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         # Serve cached only — the real retrieval ran post-turn on the worker.
@@ -380,7 +403,8 @@ class BrainProvider(MemoryProvider):
                 if self._recall_mode == "tools":
                     # Tools-only: drop any staged snapshot and fall back to the
                     # static block, matching what initialize() would render.
-                    self._lane1 = lane1_static()
+                    budget = effective_context_budgets(self._config)["lane1_tokens"]
+                    self._lane1 = lane1_static(budget)
                 elif self._lane1_staged and self._session_identity.get(
                         new_session_id, _DEFAULT_IDENTITY)[1] == "owner":
                     self._lane1 = self._lane1_staged
@@ -594,6 +618,7 @@ class BrainProvider(MemoryProvider):
             "recall_mode": cfg.get("recall_mode"),
             "lane1_tokens": cfg.get("lane1_tokens"),
             "lane2_tokens": cfg.get("lane2_tokens"),
+            "context_budget_tokens": cfg.get("context_budget_tokens"),
             "dream_schedule": cfg.get("dream_schedule"),
             "dream_time": cfg.get("dream_time"),
             "incognito": cfg.get("incognito"),
@@ -603,15 +628,35 @@ class BrainProvider(MemoryProvider):
             out["db"] = "(no profile — run 'hermes memory setup')"
             return out
         try:
+            rendered_l1 = self._lane1 if self._initialized else ""
+            actual_l1 = approx_tokens(rendered_l1) if rendered_l1 else None
+            budgets = effective_context_budgets(
+                cfg, actual_lane1_tokens=actual_l1)
+            out["effective_lane1_tokens"] = (
+                min(budgets["lane1_tokens"], actual_l1)
+                if actual_l1 is not None else budgets["lane1_tokens"]
+            )
+            out["effective_lane2_tokens"] = budgets["lane2_tokens"]
+            out["context_budget_clamped"] = budgets["clamped"]
             out["db"] = str(store_db.db_path(home))
             conn = store_db.connect(home)
         except Exception as e:
             out["db_error"] = str(e)
             return out
         try:
+            from .store.lifecycle import current_memory_predicate
+
             out["memories"] = conn.execute(
                 "SELECT count(*) AS n FROM memories "
-                "WHERE valid_to IS NULL AND status='active' AND live=1"
+                f"WHERE {current_memory_predicate()}"
+            ).fetchone()["n"]
+            out["expired_memories"] = conn.execute(
+                "SELECT count(*) AS n FROM memories WHERE status='expired'"
+            ).fetchone()["n"]
+            out["due_memories"] = conn.execute(
+                "SELECT count(*) AS n FROM memories WHERE valid_to IS NULL "
+                "AND status='active' AND live=1 AND ttl_at IS NOT NULL "
+                "AND ttl_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')"
             ).fetchone()["n"]
             out["episodes"] = conn.execute(
                 "SELECT count(*) AS n FROM episodes").fetchone()["n"]
@@ -689,6 +734,15 @@ class BrainProvider(MemoryProvider):
         (or a missing model) never touches turn latency. Model files are
         NEVER downloaded here (embed.py download=False path) — that is
         setup/doctor's job; until then the vector legs are simply absent."""
+        # Hard TTLs are enforced before any vector/backfill maintenance.  The
+        # query predicate remains authoritative if this best-effort pass fails.
+        try:
+            from .store.lifecycle import expire_due
+
+            expire_due(conn, actor="provider:retrieval_setup")
+        except Exception:
+            logger.warning("brain: TTL expiry maintenance deferred", exc_info=True)
+
         self._embedder = None
         self._reranker = None
         mode = sysinfo.resolve_mode(str(self._config.get("mode", "auto")))
@@ -791,8 +845,8 @@ class BrainProvider(MemoryProvider):
                         from .recall import lane1 as lane1_mod
 
                         lane1_mod.materialize(conn, self._config)
-                        staged = lane1_mod.render(
-                            conn, int(self._config.get("lane1_tokens", 1200)))
+                        budgets = effective_context_budgets(self._config)
+                        staged = lane1_mod.render(conn, budgets["lane1_tokens"])
                         with self._lock:
                             self._lane1_staged = staged
                     except Exception:
@@ -990,7 +1044,9 @@ class BrainProvider(MemoryProvider):
         if session_id != self._session_id and not known:
             return
 
-        budget = int(self._config.get("lane2_tokens", 600))
+        lane1_used = approx_tokens(self._lane1) if self._lane1 else 0
+        budget = effective_context_budgets(
+            self._config, actual_lane1_tokens=lane1_used)["lane2_tokens"]
         if budget <= 0:
             self._lane2_cache[session_id] = ""
             return
@@ -1017,12 +1073,12 @@ class BrainProvider(MemoryProvider):
 
         # Lane 2 has two subsections within one budget: learned guidance
         # (strategy/guardrail items + cases, retrieved by similarity × proven
-        # usefulness) on top, then recalled facts. Guidance takes at most half
+        # usefulness) on top, then recalled facts. Guidance takes at most 25%
         # so it can never crowd out the facts a turn actually asked for.
         guidance = retrieve_guidance(
             conn, query_text, embedder=self._embedder,
             scope_user=principal_id, trust_tier=trust_tier)
-        gblock = guidance_block(guidance, budget // 2)
+        gblock = guidance_block(guidance, budget, max_fraction=0.25)
         remaining = max(0, budget - approx_tokens(gblock)) if gblock else budget
 
         # Lane-2 fact candidates. Two config-gated upgrades over the plain
@@ -1089,6 +1145,7 @@ class BrainProvider(MemoryProvider):
                     recent_days=int(self._config.get("lane2_blend_recent_days", 14)),
                     exclude_kinds=exclude_kinds,
                     exclude_session=session_id,
+                    episode_limit=1,
                     facts=facts_leg_on,
                 )
             else:
@@ -1101,6 +1158,7 @@ class BrainProvider(MemoryProvider):
                     trust_tier=trust_tier,
                     embedder=self._embedder,
                     reranker=self._reranker,
+                    episode_limit=1,
                     facts=facts_leg_on,
                     intent_bias=intent_bias,
                 )

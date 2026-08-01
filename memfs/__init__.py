@@ -38,6 +38,8 @@ import logging
 import sqlite3
 from typing import Any
 
+from ..store.lifecycle import current_memory_predicate
+
 logger = logging.getLogger(__name__)
 
 ROOT = "/memories"
@@ -124,7 +126,7 @@ def _scope_sql(ctx) -> tuple[str, list]:
     rows scoped to their own principal. Quarantined and non-live rows are
     excluded for EVERY caller — the lanes and this surface agree.
     """
-    sql = (" AND valid_to IS NULL AND status='active' AND live=1"
+    sql = (f" AND {current_memory_predicate()}"
            " AND kind IN (" + ",".join("?" * len(_VISIBLE_KINDS)) + ")")
     params: list = list(_VISIBLE_KINDS)
     if ctx.trust_tier != "owner":
@@ -284,7 +286,8 @@ def _write_memory(conn: sqlite3.Connection, text: str, view: str, tag: str,
 
 def _add_tag(conn: sqlite3.Connection, uid_prefix: str, tag: str) -> None:
     row = conn.execute(
-        "SELECT id, tags FROM memories WHERE uid LIKE ? AND valid_to IS NULL",
+        f"SELECT id, tags FROM memories WHERE uid LIKE ? AND "
+        f"{current_memory_predicate()}",
         (uid_prefix + "%",)).fetchone()
     if row is None:
         return
@@ -386,13 +389,20 @@ def _str_replace(conn: sqlite3.Connection, args: dict, ctx) -> dict:
             'to remove it entirely use brain_manage(action="forget", '
             f'id="{row["uid"][:8]}", reason="...")',
         )
-    # Supersede-don't-mutate: the old version is tombstoned and a new row
-    # carries the edit, so `hermes brain why` can still show what changed.
-    result = _write_memory(conn, updated, view, tag, ctx)
-    _tombstone(conn, row, ctx, reason=f"superseded via memories str_replace "
-                                      f"-> {result['id']}")
+    # Supersede-don't-mutate through the same service as brain_manage and
+    # deterministic fact updates.  The old file version remains a tombstone
+    # for compatibility with the existing virtual-file contract.
+    from ..store.supersession import create_successor
+
+    full = conn.execute("SELECT * FROM memories WHERE id=?", (row["id"],)).fetchone()
+    result = create_successor(
+        conn, full, updated, actor="provider",
+        reason="superseded via memories str_replace", mode="correct",
+        evidence="memory_file_replacement", embedder=ctx.embedder,
+        retired_status="tombstone",
+    )
     return {"path": args.get("path"), "replaced": row["uid"][:8],
-            "id": result["id"],
+            "id": result.new_uid,
             "note": "superseded — the previous version is tombstoned, not erased"}
 
 

@@ -217,6 +217,19 @@ def test_consolidate_specificity_gate_rejects_vague(conn, embedder):
     assert _audit_actions(conn, "consolidate_reject_vague")
 
 
+def test_consolidate_rejects_operational_status_as_a_lesson(conn):
+    mid = seed_memory(conn, "PR #42 is currently waiting for CI", kind="fact")
+    member = conn.execute("SELECT * FROM memories WHERE id=?", (mid,)).fetchone()
+    proposal = {
+        "content": "PR #42 is currently waiting for CI",
+        "cites": [member["uid"]],
+        "entity": "PR #42",
+        "actionable": True,
+    }
+
+    assert consolidate._validate(conn, proposal, [member]) is None
+
+
 def test_consolidate_preemption_stops_before_llm(conn, embedder):
     _seed_cluster(conn, embedder)
     fake = ConsolidateFake()

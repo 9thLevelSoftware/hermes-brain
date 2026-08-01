@@ -26,7 +26,7 @@ Access scoping is the same invariant search enforces (review finding #17): a
 non-owner caller sees only unscoped or their-own-principal rows and NEVER a
 peer_card (the owner's private theory-of-mind of a person, which must not leak
 to the very peer it describes). Every query is read-only, current-truth
-(``valid_to IS NULL AND status='active' AND live=1``), and LIMIT-bounded.
+(including the authoritative TTL boundary), and LIMIT-bounded.
 """
 
 from __future__ import annotations
@@ -36,12 +36,13 @@ import re
 
 from ..capture.salience import score_turn
 from ..store import db
+from ..store.lifecycle import current_memory_predicate
 
 logger = logging.getLogger(__name__)
 
 # Current-truth predicate (store/schema.sql is law): supersede-don't-delete
 # means "live now" = not superseded, active, and not demoted.
-_CURRENT = "valid_to IS NULL AND status = 'active' AND live = 1"
+_CURRENT = current_memory_predicate()
 
 # Internal, non-fact kinds never belong in a generic summary block (they are
 # planning guidance or the owner's private peer models) — same exclusion set

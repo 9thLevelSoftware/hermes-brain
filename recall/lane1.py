@@ -18,7 +18,7 @@ wording can evolve without a re-materialize.
 
 Budget: ``render`` hard-truncates to ``lane1_tokens`` (db.approx_tokens)
 by dropping whole lines from the END of sections in the order
-facts -> open_loops -> stats -> warnings. Warnings are sacred: they are
+hint -> open_loops -> pinned -> warnings. Warnings are sacred: they are
 sacrificed last, and only because the budget is a guarantee, not a hope.
 An emptied section loses its header too.
 
@@ -34,42 +34,27 @@ from types import SimpleNamespace
 from typing import Any
 
 from ..store import db
+from ..store.lifecycle import current_memory_predicate, expire_due
 from .render import index_line
 
 logger = logging.getLogger(__name__)
 
-# Plugin version for the lane-1 stats line, resolved defensively. On the
-# ``hermes brain dream-now`` CLI path the host registers the parent package
-# (``_hermes_user_memory.brain``) as an EMPTY synthetic shell — see
-# hermes-agent plugins/memory/__init__.py:_register_synthetic_package — whose
-# ``__init__.py`` is never executed, so the package exposes no ``__version__``
-# attribute and ``__file__ is None``. A hard ``from .. import __version__``
-# then raises ``ImportError: cannot import name '__version__' from
-# '_hermes_user_memory.brain' (unknown location)`` and kills the lane1
-# strategy. getattr-with-fallback works under BOTH the real synthetic package
-# and standalone ``brain`` (where ``__init__.py`` defines it).
-try:
-    from .. import __version__ as _BRAIN_VERSION
-except ImportError:  # synthetic-shell parent with no executed __init__
-    _BRAIN_VERSION = "0"
-
 # Live current-truth predicate — the only rows lane 1 may ever index.
-_CURRENT = "valid_to IS NULL AND status = 'active' AND live = 1"
+_CURRENT = current_memory_predicate()
 
 _CAP_WARNINGS = 8
 _CAP_OPEN_LOOPS = 5
-_CAP_FACTS = 12
+_CAP_PINNED = 8
 
 _HEADER = "## Brain (persistent memory) — session index"
 _SECTION_HEADERS: dict[str, str] = {
     "warnings": "### ⚠ Failures & warnings (avoid repeating)",
     "open_loops": "### ◔ Open loops — outcomes unknown",
-    "facts": "### ● Standing facts & preferences",
-    "stats": "",  # stats lines are self-framing (counts + drill-down hint)
+    "pinned": "### ● Pinned profile & preferences",
+    "hint": "",
 }
-_SECTION_ORDER = ("warnings", "open_loops", "facts", "stats")
-# Truncation sacrifice order: facts first, warnings last (sacred).
-_DROP_ORDER = ("facts", "open_loops", "stats", "warnings")
+_SECTION_ORDER = ("warnings", "pinned", "open_loops", "hint")
+_DROP_ORDER = ("hint", "open_loops", "pinned", "warnings")
 
 _STATS_HINT = "deep recall: ask, or hermes brain search <query>"
 
@@ -105,17 +90,16 @@ def _section_rows(conn: sqlite3.Connection) -> list[tuple[str, int, int, str]]:
         "AND kind = 'decision' AND outcome IS NULL "
         "ORDER BY valid_from DESC LIMIT ?"
     )
-    facts_sql = (
+    pinned_sql = (
         f"SELECT * FROM memories WHERE {_CURRENT} "
-        "AND memory_type IN ('core','semantic') "
-        "AND kind IN ('fact','preference','profile') "
-        "ORDER BY pinned DESC, recall_count + verification_count DESC, "
+        "AND pinned = 1 AND kind IN ('preference','profile') "
+        "ORDER BY recall_count + verification_count DESC, "
         "valid_from DESC LIMIT ?"
     )
     for section, sql, cap in (
         ("warnings", warnings_sql, _CAP_WARNINGS),
         ("open_loops", open_loops_sql, _CAP_OPEN_LOOPS),
-        ("facts", facts_sql, _CAP_FACTS),
+        ("pinned", pinned_sql, _CAP_PINNED),
     ):
         for rank, row in enumerate(conn.execute(sql, (cap,)).fetchall()):
             out.append((section, rank, row["id"], index_line(_as_hit(row))))
@@ -127,17 +111,10 @@ def materialize(conn: sqlite3.Connection, config: dict[str, Any]) -> int:
     + INSERT); returns rows written. Dream/CLI-side: exceptions propagate to
     the caller — this is never on the capture path.
     """
+    expire_due(conn, actor="lane1")
     rows = _section_rows(conn)
 
-    mem_count = conn.execute(
-        f"SELECT COUNT(*) AS n FROM memories WHERE {_CURRENT}"
-    ).fetchone()["n"]
-    epi_count = conn.execute("SELECT COUNT(*) AS n FROM episodes").fetchone()["n"]
-    rows.append((
-        "stats", 0, None,
-        f"{mem_count} memories · {epi_count} episodes · brain v{_BRAIN_VERSION}",
-    ))
-    rows.append(("stats", 1, None, _STATS_HINT))
+    rows.append(("hint", 0, None, _STATS_HINT))
 
     now = db.iso_now()
     with conn:  # one transaction: readers see old snapshot or new, never half
@@ -172,7 +149,7 @@ def _compose(lines_by_section: dict[str, list[str]]) -> str:
 def render(conn: sqlite3.Connection, lane1_tokens: int) -> str:
     """Deterministic lane 1 from the snapshot ONLY. '' when the snapshot is
     empty (caller falls back to render.lane1_static()). Hard-truncated to
-    ``lane1_tokens`` by dropping trailing lines, facts first, warnings last.
+    ``lane1_tokens`` by dropping trailing lines, hints first, warnings last.
     """
     rows = conn.execute(
         "SELECT section, line FROM lane1_snapshot ORDER BY section, rank"

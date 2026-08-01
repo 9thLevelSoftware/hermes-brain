@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 
+from ..store.lifecycle import current_memory_predicate
 from .search import _age_days, _like_escape, _tokens
 
 logger = logging.getLogger(__name__)
@@ -66,16 +67,18 @@ def _facts_leg(conn, query, limit) -> list[int]:
     # subject or the object. Groups are OR-joined (recall-oriented — any token
     # match surfaces the fact), always filtered to current truth and a present
     # backing memory. All token text is bound, never interpolated.
-    group = "(subject LIKE ? ESCAPE '\\' OR object LIKE ? ESCAPE '\\')"
+    group = "(f.subject LIKE ? ESCAPE '\\' OR f.object LIKE ? ESCAPE '\\')"
     where = " OR ".join(group for _ in toks)
     params: list = []
     for t in toks:
         pat = f"%{_like_escape(t)}%"
         params.extend([pat, pat])
     sql = (
-        "SELECT memory_id, confidence, valid_from FROM facts "
-        f"WHERE valid_until IS NULL AND memory_id IS NOT NULL AND ({where}) "
-        "ORDER BY valid_from DESC LIMIT ?"
+        "SELECT f.memory_id, f.confidence, f.valid_from FROM facts f "
+        "JOIN memories m ON m.id=f.memory_id "
+        f"WHERE f.valid_until IS NULL AND f.memory_id IS NOT NULL "
+        f"AND {current_memory_predicate('m')} AND ({where}) "
+        "ORDER BY f.valid_from DESC LIMIT ?"
     )
     params.append(_POOL_CAP)
 

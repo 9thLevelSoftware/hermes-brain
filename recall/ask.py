@@ -380,9 +380,11 @@ def _resolve_memory_scoped(conn, uid_prefix, principal_id, trust_tier):
         return None
     like = uid_prefix.strip().upper().replace("\\", "\\\\") \
         .replace("%", "\\%").replace("_", "\\_")
+    from ..store.lifecycle import current_memory_predicate
+
     sql = (
         "SELECT id, uid FROM memories WHERE uid LIKE ? ESCAPE '\\' "
-        "AND valid_to IS NULL AND status='active' AND live=1"
+        f"AND {current_memory_predicate()}"
     )
     params: list = [like + "%"]
     if trust_tier != "owner":

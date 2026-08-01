@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 
+from ..store.lifecycle import current_memory_predicate
 from . import fusion
 from . import search as search_mod
 
@@ -45,7 +46,7 @@ Hit = search_mod.Hit
 DEFAULT_EXCLUDE_KINDS: tuple[str, ...] = ("strategy", "guardrail", "case", "peer_card")
 
 # Current-truth predicate (store/schema.sql §5; mirrors recall/search.py).
-_CURRENT_TRUTH = "m.valid_to IS NULL AND m.status = 'active' AND m.live = 1"
+_CURRENT_TRUTH = current_memory_predicate("m")
 
 
 def blend(
