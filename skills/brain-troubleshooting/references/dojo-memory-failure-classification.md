@@ -31,7 +31,7 @@ These error patterns are in hermes-brain:
 ### Config issues (user's config.yaml)
 - "Memory at N/N chars" → increase memory.memory_char_limit
 - Provider not loading → ensure memory.provider: brain
-- Brain context too small → adjust brain.yaml lane1_budget/lane2_budget
+Brain budget too low → adjust brain.yaml lane1_tokens/lane2_tokens
 
 ## How to Distinguish MEMORY.md vs brain.db Errors
 

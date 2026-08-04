@@ -37,7 +37,7 @@ Memory failure detected
   │
   ├─ Brain context not appearing in prompts
   │   → hermes-brain: provider.py (lane1/lane2)
-  │   → Check brain.yaml lane1_budget/lane2_budget
+  │   → Check brain.yaml lane1_tokens/lane2_tokens
   │
   ├─ Dream/consolidation failures
   │   → hermes-brain: dream/
@@ -116,8 +116,8 @@ never from live data. See `tests/test_provider.py` golden test.
 **Symptom:** Memories not being consolidated, brain.db growing unbounded
 
 **Cause:** The `hermes brain dream --if-due` command not executing on
-schedule. The cron job uses a shell wrapper script; verify it exists
-and the cron job references it correctly.
+schedule. The cron job uses a Python script (`brain-dream.py`); verify
+it exists and the cron job references it correctly.
 
 **Fix:** Check `hermes brain status` for `lease.dream` and `last dream`
 fields. Run `hermes brain dream --if-due` manually to test. Verify the

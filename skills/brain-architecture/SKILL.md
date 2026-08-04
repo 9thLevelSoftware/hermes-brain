@@ -89,8 +89,8 @@ memory:
 
 Brain's own config lives in `brain.yaml` (separate file, flat keys):
 ```yaml
-lane1_budget: 400
-lane2_budget: 400
+lane1_tokens: 400
+lane2_tokens: 400
 # ... brain-specific settings (flat key-value, not nested)
 ```
 
@@ -109,7 +109,8 @@ lane2_budget: 400
 
 ## Skill Installation
 
-These skills ship inside the brain plugin (`plugins/brain/skills/`) and are
-NOT automatically installed into `~/.hermes/skills/`. They are loaded when
-the brain plugin is active and a session references them. To install
-globally, copy or symlink into `~/.hermes/skills/`.
+**Installation required:** These skills ship inside the brain plugin repo
+(`plugins/brain/skills/`) but the Hermes skill loader only walks
+`$HERMES_HOME/skills/`. They must be copied or symlinked into
+`~/.hermes/skills/` to be discoverable. The brain plugin does NOT
+auto-install them — this is a manual step after cloning the repo.
