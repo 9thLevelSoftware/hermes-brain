@@ -6,28 +6,42 @@ fix to the correct repository.
 ## Classification Rules
 
 ### hermes-agent fixes (the host)
-These error patterns are ALWAYS in hermes-agent:
+These error patterns are in hermes-agent when they involve MEMORY.md/USER.md:
 - "Unknown action" — tools/memory_tool.py handler
-- "chars" / "limit" / "overflow" — tools/memory_tool.py capacity check
-- "staged" / "pending" / "approval" — tools/write_approval.py
-- "threat" / "blocked" / "injection" — tools/threat_patterns.py
-- "drift" / "round-trip" — tools/memory_tool.py drift guard
-- Schema issues — MEMORY_SCHEMA in tools/memory_tool.py
+- "Memory at N/N chars" (with MEMORY.md entries) — tools/memory_tool.py
+- "Replacement would put memory at N/N chars" — tools/memory_tool.py
+- "Staged for approval" — tools/write_approval.py
+- "content contained threat pattern" — tools/threat_patterns.py
+- "external drift" / "round-trip" — tools/memory_tool.py drift guard
+- "action is missing" — tools/memory_tool.py (PR #47)
+- MEMORY_SCHEMA validation — tools/memory_tool.py
 - Config defaults — hermes_cli/config_defaults.py
 
 ### hermes-brain fixes (the plugin)
 These error patterns are in hermes-brain:
-- Brain context not appearing — provider.py lane1/lane2
+- Brain context not appearing in system prompt — provider.py lane1
+- Brain context not appearing in user message — provider.py lane2
+- "database is locked" on brain.db — store/db.py
 - Dream/consolidation failures — dream/
-- Retrieval quality — recall/
+- Retrieval quality (wrong memories recalled) — recall/
 - Vector/embedding errors — store/db.py, recall/
-- Plugin loading — brain.yaml, __init__.py
-- brain.db locks — store/db.py WAL/locking
+- Plugin load failure (missing plugin.yaml, Python version) — __init__.py
+- Quarantine gate blocking valid memories — store/db.py
 
 ### Config issues (user's config.yaml)
-- Char limits too low — increase memory.memory_char_limit
-- Provider not set — ensure memory.provider: brain
-- Brain budget too low — adjust brain.yaml lane1/lane2_budget
+- "Memory at N/N chars" → increase memory.memory_char_limit
+- Provider not loading → ensure memory.provider: brain
+- Brain context too small → adjust brain.yaml lane1_budget/lane2_budget
+
+## How to Distinguish MEMORY.md vs brain.db Errors
+
+The key question: does the error involve a char limit?
+- MEMORY.md has a configurable char limit (default 4000)
+- brain.db has NO char limit — it stores unlimited memories
+
+If the error mentions "chars" or "limit" with a specific N/N ratio,
+it's almost always MEMORY.md (hermes-agent). If it mentions "database",
+"sqlite", "WAL", or "quarantine", it's brain.db (hermes-brain).
 
 ## Updating This Reference
 

@@ -1,7 +1,7 @@
 ---
 name: brain-troubleshooting
 description: "Debug memory system failures: trace errors to the right repo and fix."
-version: 1.0.0
+version: 1.0.1
 metadata:
   hermes:
     tags: [brain, memory, debugging, troubleshooting]
@@ -18,17 +18,21 @@ Memory failure detected
   ├─ Error mentions "Unknown action" or "action is missing"
   │   → hermes-agent: tools/memory_tool.py
   │
-  ├─ Error mentions "chars" or "limit" or "overflow"
+  ├─ Error mentions "chars" / "limit" / "overflow" in MEMORY.md context
   │   → hermes-agent: tools/memory_tool.py (char limits)
   │   → Check config.yaml memory.memory_char_limit
+  │   NOTE: brain.db has NO char limit — if the error involves brain.db
+  │   memories, it's in hermes-brain (store/db.py)
   │
-  ├─ Error mentions "staged" or "pending" or "approval"
+  ├─ Error mentions "staged" / "pending" / "approval"
   │   → hermes-agent: tools/write_approval.py
   │
-  ├─ Error mentions "threat" or "blocked" or "injection"
+  ├─ Error mentions "threat" / "blocked" / "injection" from memory writes
   │   → hermes-agent: tools/threat_patterns.py
+  │   NOTE: brain-side content filtering (quarantine gate) is in
+  │   hermes-brain: store/db.py status='quarantined'
   │
-  ├─ Error mentions "drift" or "round-trip" or "corrupt"
+  ├─ Error mentions "drift" / "round-trip" / "corrupt"
   │   → hermes-agent: tools/memory_tool.py (_reload_target)
   │
   ├─ Brain context not appearing in prompts
@@ -45,10 +49,10 @@ Memory failure detected
   │   → hermes-brain: store/db.py, recall/
   │   → Check if sqlite-vec extension loaded
   │
-  └─ Brain plugin not loading at all
+  └─ Brain plugin not loading
       → Check hermes brain status
-      → Check brain.yaml exists
       → Check Python >=3.11
+      → Check plugin.yaml exists
 ```
 
 ## Common Failure Patterns
@@ -72,13 +76,17 @@ Dojo analysis, the fix is in hermes-agent, not brain.
 
 **Cause:** MEMORY.md has hit the configured char limit. Default is 4000
 (raised from 2200 in PR #47). The `add` operation hard-fails when the
-new total would exceed the limit.
+new total would exceed the limit. This limit applies ONLY to MEMORY.md
+— brain.db has no char limit.
 
 **Fix options:**
 - Increase `memory.memory_char_limit` in config.yaml
 - Use `operations` array to batch remove+add atomically
 - Consolidate entries manually via `replace`
-- Brain's dream process can help identify stale entries
+
+**Note:** Brain's dream process operates on brain.db, NOT on MEMORY.md.
+It cannot compact or consolidate MEMORY.md entries. MEMORY.md compaction
+must be done manually via the `memory` tool or by the agent itself.
 
 ### 3. brain.db Locked / WAL Errors (hermes-brain)
 
@@ -107,11 +115,13 @@ never from live data. See `tests/test_provider.py` golden test.
 
 **Symptom:** Memories not being consolidated, brain.db growing unbounded
 
-**Cause:** The `brain-dream.sh` cron script or `hermes brain dream --if-due`
-not executing. Check `hermes brain status` for last dream timestamp.
+**Cause:** The `hermes brain dream --if-due` command not executing on
+schedule. The cron job uses a shell wrapper script; verify it exists
+and the cron job references it correctly.
 
-**Fix:** Verify cron job exists and script is executable. Check
-`lease.dream` in brain status — should be `free` or show last run.
+**Fix:** Check `hermes brain status` for `lease.dream` and `last dream`
+fields. Run `hermes brain dream --if-due` manually to test. Verify the
+cron job is enabled (`hermes cron list`).
 
 ## Debugging Commands
 
@@ -137,7 +147,8 @@ hermes plugins list
 When the nightly Dojo reports memory tool failures, classify by origin:
 
 1. Parse the error message from the Dojo's `weakest_tools` output
-2. Match against the decision tree above
+2. Match against the decision tree above (be specific — generic tokens
+   like "chars" can appear in brain.db errors too)
 3. File the fix in the correct repo (hermes-agent vs hermes-brain)
 4. Update `references/memory-tool-persistent-failure.md` in the Dojo skill
    with the new error class and fix reference

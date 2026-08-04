@@ -1,7 +1,7 @@
 ---
 name: brain-architecture
 description: "Memory system architecture: brain↔agent boundary, ownership model, and data flow."
-version: 1.0.0
+version: 1.0.1
 metadata:
   hermes:
     tags: [brain, memory, architecture, debugging]
@@ -24,9 +24,13 @@ Owns:
 - System prompt injection of memory blocks
 - MemoryManager (`agent/memory_manager.py`) — the provider orchestrator
 
-The agent core is the **only** code path for memory mutations. Even when
-brain is the provider, a `memory(action="add")` call goes through
-`memory_tool.py` first, then brain's `on_memory_write()` hook is notified.
+The agent core is the **only** code path for MEMORY.md/USER.md mutations.
+A `memory(action="add")` call always goes through `memory_tool.py` first.
+Brain's `on_memory_write()` hook is then notified asynchronously.
+
+Brain also writes DIRECTLY to brain.db via its own capture pipeline
+(episode logging, extraction, skill forge) — these writes bypass
+`memory_tool.py` entirely and are NOT subject to the MEMORY.md char limit.
 
 ### Layer 2: hermes-brain (the plugin)
 Owns:
@@ -36,7 +40,7 @@ Owns:
 - Skill forge (skillforge/)
 - Two-lane context injection:
   - Lane 1: `system_prompt_block()` — static, rendered once at init
-  - Lane 2: `prefetch()` — per-turn, dynamic, budget-capped
+  - Lane 2: `prefetch()` — per-turn, budget-capped, serves cached results
 - Episode capture and sync (capture/, sync/)
 - `memories` tool (file view, pin/forget, correct, etc.)
 
@@ -50,20 +54,27 @@ MEMORY.md/USER.md files. It plugs into the agent via the
 Model calls memory(action="add", content="User prefers dark mode")
   → tools/memory_tool.py: validate, check capacity, write MEMORY.md
   → agent/memory_manager.py: notify_memory_tool_write()
-  → BrainProvider.on_memory_write("add", "memory", "User prefers dark mode")
-    → brain stores in brain.db with provenance "builtin-mirror"
+  → BrainProvider.on_memory_write() enqueues to brain-bg worker thread
+    → (async) brain-bg stores in brain.db with provenance "builtin-mirror"
 ```
+
+Note: `on_memory_write()` returns immediately (microseconds). The actual
+brain.db write happens on the dedicated "brain-bg" daemon thread. This
+keeps the agent turn path non-blocking.
 
 ## Data Flow: Brain Context Injection
 
 ```
 Session start:
   → BrainProvider.initialize()
-    → render lane1 (static facts) → system prompt
-  → Per turn:
-    → BrainProvider.prefetch(query=user_message)
-      → search brain.db → return <memory-context> fence
-      → injected into current user message (NOT system prompt)
+    → render lane1 from materialized lane1_snapshot table → system prompt
+    → (byte-stable for entire session — cache-safety invariant #1)
+
+Per turn:
+  → BrainProvider.prefetch(query=user_message)
+    → returns cached lane2 results (not an immediate DB search)
+    → budget-capped, injected as <memory-context> fence in user message
+    → NOT injected into system prompt (that would break prefix cache)
 ```
 
 ## Config Boundary
@@ -76,12 +87,11 @@ memory:
   provider: brain            # ← agent loads BrainProvider
 ```
 
-Brain's own config lives in `brain.yaml` (separate file):
+Brain's own config lives in `brain.yaml` (separate file, flat keys):
 ```yaml
-brain:
-  lane1_budget: 400
-  lane2_budget: 400
-  # ... brain-specific settings
+lane1_budget: 400
+lane2_budget: 400
+# ... brain-specific settings (flat key-value, not nested)
 ```
 
 ## Key Files
@@ -96,3 +106,10 @@ brain:
 | `store/db.py` | hermes-brain | SQLite storage |
 | `recall/` | hermes-brain | Retrieval pipeline |
 | `dream/` | hermes-brain | Consolidation |
+
+## Skill Installation
+
+These skills ship inside the brain plugin (`plugins/brain/skills/`) and are
+NOT automatically installed into `~/.hermes/skills/`. They are loaded when
+the brain plugin is active and a session references them. To install
+globally, copy or symlink into `~/.hermes/skills/`.
